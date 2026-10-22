@@ -1,0 +1,14 @@
+project_id = "agent-exchange"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+
+[functions.exchange-api]
+verify_jwt = false

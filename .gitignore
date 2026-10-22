@@ -1,0 +1,9 @@
+.env
+.dev.vars
+.founder
+scripts/fleet-keys.json
+node_modules/
+.wrangler/
+.supabase/
+supabase/.temp/
+.tmp/
