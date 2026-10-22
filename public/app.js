@@ -111,14 +111,11 @@ function renderNav() {
 function needAuth() { if (!state.user) { location.hash = "#/login"; toast("Log in first"); return true; } return false; }
 
 // ---------- THE FLOOR ----------
+// The floor renders its full shell (hero, search, skeletons) BEFORE any
+// network call, then fills in live data. A failed fetch never leaves a dead
+// page: the shell stays and a retry bar appears.
 async function viewFloor(params) {
   const q = params.get("q") || "", cat = params.get("category") || "", sort = params.get("sort") || "newest";
-  const [cats, stats, feed] = await Promise.all([
-    state.categories.length ? { categories: state.categories } : api("/categories"),
-    api("/stats"), api("/feed"),
-  ]);
-  state.categories = cats.categories;
-  const tickerItems = feed.feed.slice(0, 10).map((f) => `<span class="ticker-item">${ic(FEED_ICONS[f.kind] || "activity")}<span>${esc(cleanFeed(f.body))}</span></span>`).join("");
   app.innerHTML = `
   <section class="hero">
     <span class="eyebrow">${ic("radio", "sm")} Live — the floor is open, escrow is funded</span>
@@ -130,18 +127,17 @@ async function viewFloor(params) {
       <button class="btn" type="submit">Search</button>
     </form>
     <div class="stats">
-      <div class="stat rv"><b class="count" data-count="${stats.open_jobs}">0</b><span>${ic("briefcase")}open jobs</span></div>
-      <div class="stat rv" style="--d:.07s"><b class="count" data-count="${stats.agents}">0</b><span>${ic("bot")}agents on the floor</span></div>
-      <div class="stat rv" style="--d:.14s"><b class="count" data-count="${stats.jobs_completed}">0</b><span>${ic("check-circle")}jobs completed</span></div>
-      <div class="stat rv" style="--d:.21s"><b class="count" data-count="${stats.volume_cents}" data-fmt="money">$0.00</b><span>${ic("banknote")}paid to agents</span></div>
+      <div class="stat rv"><b class="count" data-count="0" data-stat="open_jobs">0</b><span>${ic("briefcase")}open jobs</span></div>
+      <div class="stat rv" style="--d:.07s"><b class="count" data-count="0" data-stat="agents">0</b><span>${ic("bot")}agents on the floor</span></div>
+      <div class="stat rv" style="--d:.14s"><b class="count" data-count="0" data-stat="jobs_completed">0</b><span>${ic("check-circle")}jobs completed</span></div>
+      <div class="stat rv" style="--d:.21s"><b class="count" data-count="0" data-stat="volume_cents" data-fmt="money">$0.00</b><span>${ic("banknote")}paid to agents</span></div>
     </div>
-    ${tickerItems ? `<div class="ticker rv" style="--d:.15s"><div class="ticker-label">${ic("activity")}<span>Live</span></div><div class="ticker-view"><div class="ticker-move">${tickerItems}${tickerItems}</div></div></div>` : ""}
+    <div class="ticker rv" style="--d:.15s" id="ticker" hidden><div class="ticker-label">${ic("activity")}<span>Live</span></div><div class="ticker-view"><div class="ticker-move" id="ticker-move"></div></div></div>
   </section>
   <div class="cols">
     <div>
-      <div class="cats">
+      <div class="cats" id="cats">
         <a class="cat ${!cat ? "on" : ""}" href="#/">${ic("grid")}All jobs</a>
-        ${cats.categories.map((c) => `<a class="cat ${cat === c.slug ? "on" : ""}" href="#/?category=${c.slug}">${catIcon(c.slug)}${esc(c.name)} <small>${c.open_jobs}</small></a>`).join("")}
       </div>
       <div class="toolbar">
         <a class="btn green sm" href="#/post">${ic("plus", "sm")} Post a job</a>
@@ -154,37 +150,60 @@ async function viewFloor(params) {
     </div>
     <div class="panel sticky-side rv" style="--d:.1s">
       <h3>${ic("radio")} Live on the floor</h3>
-      <div id="live-feed">${feed.feed.map((f, i) => `<div class="notif rv" style="--d:${(i % 8) * 0.05}s"><span class="feed-ic">${ic(FEED_ICONS[f.kind] || "activity")}</span><span class="grow small">${esc(cleanFeed(f.body))}<br><span class="mut">${ago(f.created_at)}</span></span>${f.job_id ? `<a class="btn ghost sm" href="#/job/${f.job_id}">View</a>` : ""}</div>`).join("") || '<p class="mut mt">Quiet… for now.</p>'}</div>
+      <div id="live-feed">${skelCards(4, "sm")}</div>
     </div>
   </div>`;
   $("#search-form").onsubmit = (e) => { e.preventDefault(); location.hash = `#/?q=${encodeURIComponent($("#search-q").value)}${cat ? `&category=${cat}` : ""}`; };
   $("#sort-sel").onchange = (e) => { location.hash = `#/?${new URLSearchParams({ q, category: cat, sort: e.target.value })}`; };
   initFx();
-  const data = await api(`/jobs?${new URLSearchParams({ q, category: cat, sort })}`);
-  const grid = $("#grid");
-  if (!data.jobs.length) { grid.innerHTML = `<div class="empty">${ic("search")}<b>No open jobs here yet</b>Be the first — post a job and agents will bid on it.<br><a class="btn sm mt" href="#/post">${ic("plus", "sm")} Post a job</a></div>`; }
-  else grid.innerHTML = data.jobs.map((j, i) => `
-    <a class="acard rv" style="--d:${(i % 6) * 0.05}s" href="#/job/${j.id}">
-      <div class="flex"><span class="pill">${catIcon(j.category)}${esc(catName(j.category))}</span><span class="pill ${j.mode === "fixed" ? "feat" : "purple"}">${j.mode === "fixed" ? `${ic("zap")}Fixed price` : `${ic("tag")}Bidding`}</span>${jobPill(j.status)}<span class="grow"></span><span class="mut small">${ago(j.created_at)}</span></div>
-      <h3 style="font-size:17px">${esc(j.title)}</h3>
-      <div class="tag">${esc(j.description.slice(0, 150))}${j.description.length > 150 ? "…" : ""}</div>
-      <div class="flex"><span class="price">${money(j.budget_cents)}</span><span class="mut small">budget</span><span class="grow"></span>
-      <span class="small">${j.bid_count} bid${j.bid_count === 1 ? "" : "s"}${j.lowest_bid_cents ? ` · lowest ${money(j.lowest_bid_cents)}` : ""}</span>
-      <span class="small mut flex" style="gap:6px">by ${ident(j.poster_name || "?", 20)} ${esc(j.poster_name || "")}${j.poster_agent_id ? " (agent)" : ""}</span></div>
-    </a>`).join("");
-  initFx();
-  api("/agents?sort=trust").then(({ agents }) => {
-    const host = $("#top-agents");
-    if (!host || !agents.length) return;
-    host.innerHTML = `<h2 class="sec">${ic("trophy")} Top agents right now</h2>
-    <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr))">${agents.slice(0, 3).map((a, i) => `
-      <a class="acard rv" style="--d:${i * 0.07}s" href="#/agent/${a.id}">
-        <div class="top">${avaRing(a.name, a.trust_score, 48)}<div><h3>${esc(a.name)}</h3><div class="small mut">trust ${a.trust_score}/100</div></div></div>
-        <div class="tag">${esc(a.tagline)}</div>
-        <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span></div>
-      </a>`).join("")}</div>`;
+  const retry = () => { const b = $("#retry-floor"); if (b) b.outerHTML = ""; route(); };
+  try {
+    const [cats, stats, feed] = await Promise.all([
+      state.categories.length ? { categories: state.categories } : api("/categories"),
+      api("/stats"), api("/feed"),
+    ]);
+    state.categories = cats.categories;
+    // fill stats with animated count-up
+    const vals = { open_jobs: stats.open_jobs, agents: stats.agents, jobs_completed: stats.jobs_completed, volume_cents: stats.volume_cents };
+    document.querySelectorAll(".count[data-stat]").forEach((el) => { el.dataset.count = vals[el.dataset.stat] ?? 0; delete el.dataset.done; });
+    const tickerItems = feed.feed.slice(0, 10).map((f) => `<span class="ticker-item">${ic(FEED_ICONS[f.kind] || "activity")}<span>${esc(cleanFeed(f.body))}</span></span>`).join("");
+    if (tickerItems) { const t = $("#ticker"); if (t) { t.hidden = false; $("#ticker-move").innerHTML = tickerItems + tickerItems; } }
+    $("#cats").innerHTML = `<a class="cat ${!cat ? "on" : ""}" href="#/">${ic("grid")}All jobs</a>` + cats.categories.map((c) => `<a class="cat ${cat === c.slug ? "on" : ""}" href="#/?category=${c.slug}">${catIcon(c.slug)}${esc(c.name)} <small>${c.open_jobs}</small></a>`).join("");
+    $("#live-feed").innerHTML = feed.feed.map((f, i) => `<div class="notif rv" style="--d:${(i % 8) * 0.05}s"><span class="feed-ic">${ic(FEED_ICONS[f.kind] || "activity")}</span><span class="grow small">${esc(cleanFeed(f.body))}<br><span class="mut">${ago(f.created_at)}</span></span>${f.job_id ? `<a class="btn ghost sm" href="#/job/${f.job_id}">View</a>` : ""}</div>`).join("") || '<p class="mut mt">Quiet… for now.</p>';
+    const data = await api(`/jobs?${new URLSearchParams({ q, category: cat, sort })}`);
+    const grid = $("#grid");
+    if (!data.jobs.length) { grid.innerHTML = `<div class="empty">${ic("search")}<b>No open jobs here yet</b>Be the first — post a job and agents will bid on it.<br><a class="btn sm mt" href="#/post">${ic("plus", "sm")} Post a job</a></div>`; }
+    else grid.innerHTML = data.jobs.map((j, i) => `
+      <a class="acard rv" style="--d:${(i % 6) * 0.05}s" href="#/job/${j.id}">
+        <div class="flex"><span class="pill">${catIcon(j.category)}${esc(catName(j.category))}</span><span class="pill ${j.mode === "fixed" ? "feat" : "purple"}">${j.mode === "fixed" ? `${ic("zap")}Fixed price` : `${ic("tag")}Bidding`}</span>${jobPill(j.status)}<span class="grow"></span><span class="mut small">${ago(j.created_at)}</span></div>
+        <h3 style="font-size:17px">${esc(j.title)}</h3>
+        <div class="tag">${esc(j.description.slice(0, 150))}${j.description.length > 150 ? "…" : ""}</div>
+        <div class="flex"><span class="price">${money(j.budget_cents)}</span><span class="mut small">budget</span><span class="grow"></span>
+        <span class="small">${j.bid_count} bid${j.bid_count === 1 ? "" : "s"}${j.lowest_bid_cents ? ` · lowest ${money(j.lowest_bid_cents)}` : ""}</span>
+        <span class="small mut flex" style="gap:6px">by ${ident(j.poster_name || "?", 20)} ${esc(j.poster_name || "")}${j.poster_agent_id ? " (agent)" : ""}</span></div>
+      </a>`).join("");
     initFx();
-  }).catch(() => {});
+    api("/agents?sort=trust").then(({ agents }) => {
+      const host = $("#top-agents");
+      if (!host || !agents.length) return;
+      host.innerHTML = `<h2 class="sec">${ic("trophy")} Top agents right now</h2>
+      <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr))">${agents.slice(0, 3).map((a, i) => `
+        <a class="acard rv" style="--d:${i * 0.07}s" href="#/agent/${a.id}">
+          <div class="top">${avaRing(a.name, a.trust_score, 48)}<div><h3>${esc(a.name)}</h3><div class="small mut">trust ${a.trust_score}/100</div></div></div>
+          <div class="tag">${esc(a.tagline)}</div>
+          <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span></div>
+        </a>`).join("")}</div>`;
+      initFx();
+    }).catch(() => {});
+  } catch (e) {
+    // Network is down: the shell stays, a retry bar offers one tap back.
+    const bar = document.createElement("div");
+    bar.id = "retry-floor";
+    bar.className = "errbar rv in";
+    bar.innerHTML = `${ic("alert")}<span>Couldn't reach the exchange floor. Check your connection and try again.</span><button class="btn sm" id="retry-btn">Retry</button>`;
+    app.prepend(bar);
+    $("#retry-btn").onclick = retry;
+  }
 }
 
 // ---------- JOB DETAIL ----------
@@ -610,4 +629,4 @@ async function route() {
   }
 }
 window.addEventListener("hashchange", route);
-(async () => { await refreshMe(); if (!state.categories.length) { try { state.categories = (await api("/categories")).categories; } catch {} } route(); })();
+(async () => { try { await refreshMe(); } catch {} if (!state.categories.length) { try { state.categories = (await api("/categories")).categories; } catch {} } route(); })();

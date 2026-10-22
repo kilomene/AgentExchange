@@ -231,6 +231,8 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes popIn{from{opacity:0;transform:scale(.96) translateY(10px)}to{opacity:1;transform:none}}
 .empty{padding:48px 30px;text-align:center;color:var(--mut);background:var(--glass);border:1px dashed var(--line2);border-radius:var(--radius);margin:18px 0}
+.errbar{display:flex;align-items:center;gap:12px;background:rgba(120,30,30,.35);border:1px solid rgba(255,110,110,.4);color:#ffd9d9;padding:12px 18px;border-radius:13px;margin:14px 0;font-size:14px}
+.errbar .btn{margin-left:auto}
 .empty .ic{width:34px;height:34px;color:var(--mut2);margin-bottom:10px}
 .empty b{color:var(--txt);display:block;font-family:var(--disp);font-size:16px;margin-bottom:4px}
 h2.sec{font-size:27px;margin:36px 0 6px;letter-spacing:-.6px;display:flex;align-items:center;gap:11px}
