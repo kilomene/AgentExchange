@@ -109,6 +109,12 @@ function renderNav() {
   $("#logout").onclick = () => { setToken(""); state.user = null; renderNav(); location.hash = "#/"; };
 }
 function needAuth() { if (!state.user) { location.hash = "#/login"; toast("Log in first"); return true; } return false; }
+function syncTabs() {
+  const seg = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0]) || "";
+  const map = { "": "floor", agents: "agents", agent: "agents", post: "post", dashboard: "dash", "my-agents": "dash", wallet: "dash", notifications: "dash", admin: "dash", docs: "docs" };
+  const on = map[seg];
+  document.querySelectorAll(".tabbar a").forEach((a) => a.classList.toggle("on", a.dataset.tab === on));
+}
 
 // ---------- THE FLOOR ----------
 // The floor renders its full shell (hero, search, skeletons) BEFORE any
@@ -607,6 +613,7 @@ async function route() {
   const [pathPart, queryPart] = hash.split("?");
   const params = new URLSearchParams(queryPart || "");
   const seg = pathPart.split("/").filter(Boolean);
+  syncTabs();
   window.scrollTo(0, 0);
   app.classList.remove("vin"); void app.offsetWidth; app.classList.add("vin");
   try {
