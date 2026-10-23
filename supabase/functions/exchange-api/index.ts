@@ -138,6 +138,15 @@ function publicAgent(a: any) {
   const trust = Math.round(((Number(a.rating_avg) || 0) * 20) * 0.6 + Math.min(40, (a.jobs_completed || 0) * 2));
   return { ...rest, has_api: !!api_key_hash, skills: a.skills ? a.skills.split(",").map((t: string) => t.trim()).filter(Boolean) : [], trust_score: Math.min(100, trust) };
 }
+function autoAvatar(name: string) {
+  // Automatic profile picture for every agent: a generated emblem (initials on
+  // a name-hashed gradient), stored as an SVG data URI at creation time.
+  const p = String(name || "?").trim().split(/\s+/).filter(Boolean);
+  const ini = (((p[0]?.[0] || "?") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase()).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let h = 0; for (const c of String(name || "")) h = (h * 31 + c.charCodeAt(0)) % 360;
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${h},85%,58%)'/><stop offset='1' stop-color='hsl(${(h + 45) % 360},85%,42%)'/></linearGradient></defs><rect width='96' height='96' rx='22' fill='url(#g)'/><circle cx='48' cy='48' r='31' fill='none' stroke='rgba(255,255,255,.4)' stroke-width='2'/><text x='48' y='61' font-family='Arial,sans-serif' font-size='30' font-weight='700' fill='#fff' text-anchor='middle'>${ini}</text></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
 async function fireWebhook(url: string, payload: Record<string, unknown>) {
   if (!url) return;
   try {
@@ -528,7 +537,7 @@ async function handle(req: Request) {
     const apiKey = randomToken(20);
     const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
       owner_id: u.id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
-      category: cat.slug, avatar: String(b.avatar || "🤖").slice(0, 8), skills: String(b.skills || "").slice(0, 300),
+      category: cat.slug, avatar: b.avatar ? String(b.avatar).slice(0, 2000) : autoAvatar(name), skills: String(b.skills || "").slice(0, 300),
       rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: String(b.webhook_url || "").slice(0, 300), created_at: now(),
     }) });
     return json({ id: rows[0].id, api_key: apiKey, note: "Save this API key — shown once. Your agent uses it on /agent/* to find jobs, bid and deliver on its own." }, 201);
@@ -545,7 +554,7 @@ async function handle(req: Request) {
     const b = await body();
     await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({
       name: String(b.name || a.name).slice(0, 80), tagline: String(b.tagline ?? a.tagline).slice(0, 140), description: String(b.description ?? a.description).slice(0, 4000),
-      category: String(b.category || a.category), avatar: String(b.avatar || a.avatar).slice(0, 8), skills: String(b.skills ?? a.skills).slice(0, 300),
+      category: String(b.category || a.category), avatar: String(b.avatar || a.avatar).slice(0, 2000), skills: String(b.skills ?? a.skills).slice(0, 300),
       rate_cents: b.rate !== undefined ? cents(Number(b.rate) * 100) : a.rate_cents,
       status: ["active", "paused"].includes(b.status) ? b.status : a.status, webhook_url: String(b.webhook_url ?? a.webhook_url ?? "").slice(0, 300),
     }) });

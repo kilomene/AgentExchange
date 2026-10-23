@@ -27,13 +27,16 @@ const starRow = (n, total = 5) => Array.from({ length: total }, (_, i) => `<svg 
 const stars = (avg, n) => `<span class="stars">${starRow(Math.round(avg || 0))}</span> <b>${(avg || 0).toFixed(1)}</b> <span class="mut">(${n || 0})</span>`;
 const initials = (name) => { const p = String(name || "?").trim().split(/\s+/).filter(Boolean); return ((p[0]?.[0] || "?") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase(); };
 const hueOf = (s) => { let h = 0; for (const ch of String(s || "")) h = (h * 31 + ch.charCodeAt(0)) % 360; return h; };
-const ident = (name, size = 34, sq = false) => `<span class="ident${sq ? " sq" : ""}" style="--h:${hueOf(name)};width:${size}px;height:${size}px;font-size:${Math.max(9, Math.round(size * 0.38))}px" title="${esc(name || "")}">${esc(initials(name))}</span>`;
+const isImgAva = (a) => typeof a === "string" && (a.startsWith("/") || a.startsWith("http") || a.startsWith("data:image"));
+const ident = (name, size = 34, sq = false, avatar = "") => isImgAva(avatar)
+  ? `<span class="ident${sq ? " sq" : ""}" style="width:${size}px;height:${size}px" title="${esc(name || "")}"><img class="ident-img" src="${esc(avatar)}" alt="${esc(name || "")}" loading="lazy"></span>`
+  : `<span class="ident${sq ? " sq" : ""}" style="--h:${hueOf(name)};width:${size}px;height:${size}px;font-size:${Math.max(9, Math.round(size * 0.38))}px" title="${esc(name || "")}">${esc(initials(name))}</span>`;
 const ring = (score, size = 44) => {
   const sw = 3, r = (size - sw) / 2, c = 2 * Math.PI * r, p = Math.max(0, Math.min(100, Number(score) || 0)) / 100;
   const cls = score >= 70 ? "hi" : score >= 40 ? "mid" : "lo";
   return `<span class="ring ${cls}" style="width:${size}px;height:${size}px" title="Trust score ${score}/100"><svg width="${size}" height="${size}"><circle class="ring-bg" cx="${size / 2}" cy="${size / 2}" r="${r}"/><circle class="ring-fg" cx="${size / 2}" cy="${size / 2}" r="${r}" stroke-dasharray="0 ${c.toFixed(1)}" data-dash="${(c * p).toFixed(1)} ${c.toFixed(1)}"/></svg><b>${score}</b></span>`;
 };
-const avaRing = (name, trust, size = 56) => `<span class="ava-wrap" style="width:${size}px;height:${size}px">${ident(name, size, true)}${ring(trust, size + 12)}</span>`;
+const avaRing = (a, size = 56) => `<span class="ava-wrap" style="width:${size}px;height:${size}px">${ident(a.name, size, true, a.avatar)}${ring(a.trust_score, size + 12)}</span>`;
 const jobPill = (s) => ({
   open: `<span class="pill green">${ic("open-dot")}Open</span>`,
   awarded: `<span class="pill purple">${ic("award")}Awarded</span>`,
@@ -195,7 +198,7 @@ async function viewFloor(params) {
       host.innerHTML = `<h2 class="sec">${ic("trophy")} Top agents right now</h2>
       <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr))">${agents.slice(0, 3).map((a, i) => `
         <a class="acard rv" style="--d:${i * 0.07}s" href="#/agent/${a.id}">
-          <div class="top">${avaRing(a.name, a.trust_score, 48)}<div><h3>${esc(a.name)}</h3><div class="small mut">trust ${a.trust_score}/100</div></div></div>
+          <div class="top">${avaRing(a, 48)}<div><h3>${esc(a.name)}</h3><div class="small mut">trust ${a.trust_score}/100</div></div></div>
           <div class="tag">${esc(a.tagline)}</div>
           <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span></div>
         </a>`).join("")}</div>`;
@@ -239,7 +242,7 @@ async function viewJob(id) {
       </div>
       <div class="panel rv" style="--d:.06s">
         <h3>${ic("tag")} Bids (${bids.length})</h3>
-        ${bids.map((b) => `<div class="notif">${ident(b.agent_name || "?", 34)}
+        ${bids.map((b) => `<div class="notif">${ident(b.agent_name || "?", 34, false, b.agent_avatar)}
           <span class="grow"><a href="#/agent/${b.agent_id}"><b>${esc(b.agent_name)}</b></a> ${stars(b.agent_rating || 0, b.agent_jobs || 0)}<br>
           <span class="small mut">${esc(b.pitch)} · ETA ${b.eta_hours}h · ${ago(b.created_at)}</span></span>
           <b>${money(b.amount_cents)}</b>
@@ -262,7 +265,7 @@ async function viewJob(id) {
     <div class="panel sticky-side rv" style="--d:.08s">
       <div class="big">${money(j.budget_cents)}</div>
       <p class="small mut flex" style="gap:6px">${ic("lock", "sm")} budget · locked in escrow at posting</p>
-      ${j.agreed_cents ? `<p class="mt">Agreed price: <b>${money(j.agreed_cents)}</b><br><span class="small mut flex" style="gap:6px">Winner: ${ident(j.awarded_agent_name || "?", 20)} ${esc(j.awarded_agent_name || "")} · fee ${money(j.fee_cents)}</span></p>` : ""}
+      ${j.agreed_cents ? `<p class="mt">Agreed price: <b>${money(j.agreed_cents)}</b><br><span class="small mut flex" style="gap:6px">Winner: ${ident(j.awarded_agent_name || "?", 20, false, j.awarded_agent_avatar)} ${esc(j.awarded_agent_name || "")} · fee ${money(j.fee_cents)}</span></p>` : ""}
       <div style="display:grid;gap:9px" class="mt">
         ${awardedMine && j.status === "awarded" ? `<textarea id="deliv" rows="4" placeholder="Paste the delivered work or its link…"></textarea><button class="btn green" id="act-deliver">${ic("package")} Deliver work</button>` : ""}
         ${isPoster && j.status === "delivered" ? `<button class="btn green" id="act-complete">${ic("check-circle")} Approve &amp; release payment</button>` : ""}
@@ -301,7 +304,7 @@ async function viewAgents(params) {
   <select id="a-sort">${[["trust", "Trust score"], ["rating", "Top rated"], ["earnings", "Top earners"], ["newest", "Newest"]].map(([v, l]) => `<option value="${v}" ${sort === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>
   <div class="grid">${data.agents.map((a, i) => `
     <a class="acard rv" style="--d:${(i % 6) * 0.05}s" href="#/agent/${a.id}">
-      <div class="top">${avaRing(a.name, a.trust_score, 52)}<div><div class="flex" style="gap:7px"><span class="rank">#${i + 1}</span><h3>${esc(a.name)}</h3></div><div class="small mut">by ${esc(a.owner_name || "")}</div></div></div>
+      <div class="top">${avaRing(a, 52)}<div><div class="flex" style="gap:7px"><span class="rank">#${i + 1}</span><h3>${esc(a.name)}</h3></div><div class="small mut">by ${esc(a.owner_name || "")}</div></div></div>
       <div class="tag">${esc(a.tagline)}</div>
       <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span><span>· ${money(a.earnings_cents)} earned</span></div>
       <div class="flex"><span class="small mut">typical rate</span><span class="price">${money(a.rate_cents)}</span><span class="hire-chip">Hire ${ic("arrow-r")}</span></div>
@@ -317,7 +320,7 @@ async function viewAgent(id) {
   <p class="mt"><a class="mut" href="#/agents">${ic("arrow-l", "sm")} Leaderboard</a></p>
   <div class="cols mt">
     <div>
-      <div class="flex rv">${avaRing(a.name, a.trust_score, 72)}
+      <div class="flex rv">${avaRing(a, 72)}
       <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span></div></div></div>
       <p class="mt rv" style="font-size:16px;--d:.05s">${esc(a.tagline)}</p>
       <div class="panel rv" style="--d:.08s"><h3>${ic("user")} About</h3><p class="mt" style="white-space:pre-wrap">${esc(a.description)}</p>
@@ -452,7 +455,7 @@ async function viewMyAgents() {
   <button class="btn" id="new-agent">${ic("plus", "sm")} Register an agent</button></div>
   <div class="grid">${agents.map((a, i) => `
     <div class="acard rv" style="--d:${(i % 6) * 0.05}s">
-      <div class="top">${avaRing(a.name, a.trust_score, 52)}<div><h3>${esc(a.name)}</h3><div class="small mut">${esc(catName(a.category))} · ${a.status}</div></div></div>
+      <div class="top">${avaRing(a, 52)}<div><h3>${esc(a.name)}</h3><div class="small mut">${esc(catName(a.category))} · ${a.status}</div></div></div>
       <div class="tag">${esc(a.tagline)}</div>
       <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span><span>· ${money(a.earnings_cents)} earned</span></div>
       <div class="flex"><span class="small mut">rate</span><span class="price">${money(a.rate_cents)}</span><span class="grow"></span>
@@ -465,7 +468,7 @@ async function viewMyAgents() {
       <label>Tagline</label><input id="f-tag" value="${esc(a.tagline || "")}">
       <label>Description</label><textarea id="f-desc" rows="4">${esc(a.description || "")}</textarea>
       <label>Category</label><select id="f-cat">${state.categories.map((c) => `<option value="${c.slug}" ${a.category === c.slug ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select>
-      <label>Avatar (emoji)</label><input id="f-ava" value="${esc(a.avatar || "🤖")}" maxlength="4">
+      <label>Avatar (optional — blank = automatic profile picture)</label><input id="f-ava" value="${esc(a.avatar || "")}" placeholder="Automatic" maxlength="2000">
       <label>Skills (comma separated)</label><input id="f-skills" value="${esc((a.skills || []).join(", "))}">
       <label>Typical rate per job (USD)</label><input id="f-rate" type="number" step="0.01" min="0" value="${a.rate_cents ? a.rate_cents / 100 : ""}">
       <label>Webhook URL (optional — we POST awards here)</label><input id="f-hook" value="${esc(a.webhook_url || "")}">
@@ -590,7 +593,7 @@ async function viewAdmin() {
   <div class="panel rv"><h3>${ic("landmark")} Pending payouts</h3>
     ${payouts.payouts.filter((p) => p.status === "pending").map((p) => `<div class="notif"><span class="grow">${money(p.amount_cents)} → ${esc(p.destination)}<br><span class="small mut">${esc(p.name || "")} (${esc(p.email || "")})</span></span><button class="btn sm green" data-pay="paid" data-id="${p.id}">Mark paid</button><button class="btn sm red" data-pay="reject" data-id="${p.id}">Reject</button></div>`).join("") || '<p class="mut mt">None.</p>'}</div>
   <div class="panel rv"><h3>${ic("bot")} Agents</h3><table><tr><th>Agent</th><th>Owner</th><th>Trust</th><th>Rating</th><th>Jobs</th><th>Earned</th><th>Status</th><th></th></tr>
-    ${agents.agents.map((a) => `<tr><td><span class="flex" style="gap:8px">${ident(a.name || "?", 26)} <b>${esc(a.name)}</b></span></td><td>${esc(a.owner_name || "")}</td><td>${a.trust_score}</td><td>${(a.rating_avg || 0).toFixed(1)} (${a.rating_count})</td><td>${a.jobs_completed}</td><td>${money(a.earnings_cents)}</td><td>${a.status}</td><td><button class="btn ghost sm" data-asus="${a.id}" data-on="${a.status === "suspended" ? "active" : "suspended"}">${a.status === "suspended" ? "Restore" : "Suspend"}</button></td></tr>`).join("")}</table></div>
+    ${agents.agents.map((a) => `<tr><td><span class="flex" style="gap:8px">${ident(a.name || "?", 26, false, a.avatar)} <b>${esc(a.name)}</b></span></td><td>${esc(a.owner_name || "")}</td><td>${a.trust_score}</td><td>${(a.rating_avg || 0).toFixed(1)} (${a.rating_count})</td><td>${a.jobs_completed}</td><td>${money(a.earnings_cents)}</td><td>${a.status}</td><td><button class="btn ghost sm" data-asus="${a.id}" data-on="${a.status === "suspended" ? "active" : "suspended"}">${a.status === "suspended" ? "Restore" : "Suspend"}</button></td></tr>`).join("")}</table></div>
   <div class="panel rv"><h3>${ic("users")} Users</h3><table><tr><th>User</th><th>Role</th><th>Balance</th><th>Held</th><th>Status</th><th></th></tr>
     ${users.users.map((u) => `<tr><td><span class="flex" style="gap:8px">${ident(u.name || "?", 26)} <span><b>${esc(u.name)}</b><br><span class="mut small">${esc(u.email)}</span></span></span></td><td>${u.role}</td><td>${money(u.balance_cents)}</td><td>${money(u.held_cents)}</td><td>${u.suspended ? "suspended" : "active"}</td><td><button class="btn ghost sm" data-usus="${u.id}" data-on="${u.suspended ? 0 : 1}">${u.suspended ? "Unsuspend" : "Suspend"}</button> <button class="btn ghost sm" data-credit="${u.id}">Credit $</button></td></tr>`).join("")}</table></div>
   <div class="panel rv"><h3>${ic("sliders")} Settings</h3>
