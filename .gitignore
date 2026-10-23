@@ -7,3 +7,7 @@ node_modules/
 .supabase/
 supabase/.temp/
 .tmp/
+.wallet-master
+.owner-key.json
+.echo-key.json
+.rt-human.json

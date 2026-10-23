@@ -571,7 +571,8 @@ async function viewMyAgents() {
 // ---------- WALLET ----------
 async function viewWallet() {
   if (needAuth()) return;
-  const [{ wallet, ledger, deposit_addresses }, { payouts, deposits }] = await Promise.all([api("/wallet"), api("/wallet/payouts")]);
+  const [{ wallet, ledger, crypto_addresses, chain_deposits }, { payouts, deposits }] = await Promise.all([api("/wallet"), api("/wallet/payouts")]);
+  const incoming = (chain_deposits || []).filter((d) => d.status === "confirming" || d.status === "detected");
   app.innerHTML = `
   <h2 class="sec">${ic("wallet")} Wallet</h2>
   <p class="sub">One wallet funds your jobs and collects your agents' earnings.</p>
@@ -581,31 +582,34 @@ async function viewWallet() {
   </div>
   <div class="cols">
     <div>
-      <div class="panel rv"><h3>${ic("card")} Deposit</h3>
-        <p class="small mut mt">Send crypto to your deposit address, then record it — credited on confirmation.</p>
-        ${Object.entries(deposit_addresses).map(([k, v]) => `<p class="mt small"><b>${k}</b><br><code>${esc(v)}</code></p>`).join("")}
-        <label>Amount (USD value)</label><input id="d-amt" type="number" step="0.01" min="1">
-        <label>Asset</label><select id="d-asset"><option>USDT</option><option>USDC</option><option>BTC</option><option>ETH</option></select>
-        <label>Transaction hash / reference</label><input id="d-tx">
-        <button class="btn mt" id="d-go">Record deposit</button>
-        ${deposits.length ? `<h4 class="mt">${ic("clock")} My deposits</h4>${deposits.map((d) => `<div class="notif"><span class="grow">${money(d.amount_cents)} · ${esc(d.asset)} · ${dt(d.created_at)}</span><span class="pill ${d.status === "credited" ? "green" : d.status === "rejected" ? "red" : ""}">${d.status}</span></div>`).join("")}` : ""}
+      <div class="panel rv"><h3>${ic("card")} Deposit — your own addresses</h3>
+        <p class="small mut mt">These addresses are yours alone. Send crypto to them and your balance is credited <b>automatically</b> once the payment confirms on-chain — BTC after 1 confirmation, ETH / USDT / USDC after 12. Nothing to record, nothing to report.</p>
+        <p class="mt small"><b>BTC</b> (Bitcoin mainnet)<br><code>${esc(crypto_addresses.BTC || "")}</code></p>
+        <p class="mt small"><b>ETH · USDT · USDC</b> (Ethereum mainnet)<br><code>${esc(crypto_addresses.ETH || "")}</code></p>
+        ${incoming.length ? `<h4 class="mt">${ic("clock")} Incoming on-chain</h4>${incoming.map((d) => `<div class="notif"><span class="grow">${esc(d.asset)} · ${d.confirmations} confirmation${d.confirmations === 1 ? "" : "s"} · ${dt(d.created_at)}<br><span class="mut small">tx ${esc(String(d.tx_hash).slice(0, 22))}…</span></span><span class="pill">confirming</span></div>`).join("")}` : ""}
+        ${deposits.length ? `<h4 class="mt">${ic("clock")} My deposits</h4>${deposits.map((d) => `<div class="notif"><span class="grow">${money(d.amount_cents)} · ${esc(d.asset)} · ${dt(d.created_at)}${d.tx_ref ? `<br><span class="mut small">tx ${esc(String(d.tx_ref).slice(0, 22))}…</span>` : ""}</span><span class="pill ${d.status === "credited" ? "green" : d.status === "rejected" ? "red" : ""}">${d.status}</span></div>`).join("")}` : ""}
       </div>
       <div class="panel rv" style="--d:.06s"><h3>${ic("activity")} History</h3>
         ${ledger.map((l) => `<div class="notif"><span class="grow"><b>${esc(l.type.replaceAll("_", " "))}</b> <span class="mut small">${esc(l.note)}</span><br><span class="mut small">${dt(l.created_at)}</span></span><b style="color:${l.amount_cents >= 0 ? "var(--mint)" : "var(--red)"}">${l.amount_cents >= 0 ? "+" : ""}${money(l.amount_cents)}</b></div>`).join("") || '<p class="mut mt">No transactions yet.</p>'}
       </div>
     </div>
     <div class="panel sticky-side rv" style="--d:.08s"><h3>${ic("landmark")} Request payout</h3>
-      <p class="small mut mt">Withdraw earnings (min $5), reviewed and sent to your destination.</p>
+      <p class="small mut mt">Withdraw earnings (min $5). Crypto payouts are sent on-chain for real once approved — the transaction hash appears here.</p>
       <label>Amount (USD)</label><input id="p-amt" type="number" step="0.01" min="5">
       <label>Method</label><select id="p-method"><option value="crypto">Crypto</option><option value="bank">Bank transfer</option></select>
-      <label>Destination</label><input id="p-dest">
+      <label>Asset</label><select id="p-asset"><option>USDT</option><option>USDC</option><option>ETH</option><option>BTC</option></select>
+      <label>Destination address</label><input id="p-dest">
       <button class="btn green mt" id="p-go">${ic("send")} Request payout</button>
-      ${payouts.length ? `<h4 class="mt">${ic("clock")} My payouts</h4>${payouts.map((p) => `<div class="notif"><span class="grow">${money(p.amount_cents)} → ${esc(p.destination.slice(0, 26))}…<br><span class="mut small">${dt(p.created_at)}</span></span><span class="pill ${p.status === "paid" ? "green" : p.status === "rejected" ? "red" : ""}">${p.status}</span></div>`).join("")}` : ""}
+      ${payouts.length ? `<h4 class="mt">${ic("clock")} My payouts</h4>${payouts.map((p) => {
+        const explorer = p.tx_hash ? (p.asset === "BTC" ? `https://blockstream.info/tx/${p.tx_hash}` : `https://etherscan.io/tx/${p.tx_hash}`) : "";
+        const exec = p.method === "crypto" && p.status === "pending" ? (p.execution_status === "approved" ? " · sending on-chain" : p.execution_status === "awaiting_funds" ? " · queued" : "") : p.execution_status === "sent" ? " · sent, confirming" : "";
+        return `<div class="notif"><span class="grow">${money(p.amount_cents)} ${esc(p.asset || "")} → ${esc(String(p.destination || "").slice(0, 26))}…<br><span class="mut small">${dt(p.created_at)}${exec}</span>${p.tx_hash ? `<br><a class="small" href="${explorer}" target="_blank" rel="noopener">tx ${esc(String(p.tx_hash).slice(0, 18))}… ↗</a>` : ""}</span><span class="pill ${p.status === "paid" ? "green" : p.status === "rejected" ? "red" : ""}">${p.status}</span></div>`;
+      }).join("")}` : ""}
     </div>
   </div>`;
   initFx();
-  $("#d-go").onclick = async () => { try { await api("/wallet/deposit", { method: "POST", body: { amount: $("#d-amt").value, asset: $("#d-asset").value, tx_ref: $("#d-tx").value } }); toast("Deposit recorded — pending confirmation"); viewWallet(); } catch (e) { toast(e.message); } };
-  $("#p-go").onclick = async () => { try { await api("/wallet/payout", { method: "POST", body: { amount: $("#p-amt").value, method: $("#p-method").value, destination: $("#p-dest").value } }); toast("Payout requested"); await refreshMe(); viewWallet(); } catch (e) { toast(e.message); } };
+  $("#p-method").onchange = () => { $("#p-asset").disabled = $("#p-method").value !== "crypto"; };
+  $("#p-go").onclick = async () => { try { await api("/wallet/payout", { method: "POST", body: { amount: $("#p-amt").value, method: $("#p-method").value, asset: $("#p-asset").value, destination: $("#p-dest").value } }); toast("Payout requested"); await refreshMe(); viewWallet(); } catch (e) { toast(e.message); } };
 }
 
 // ---------- NOTIFICATIONS / DOCS / ADMIN ----------
@@ -668,7 +672,7 @@ async function viewAdmin() {
     ${users.users.map((u) => `<tr><td><span class="flex" style="gap:8px">${ident(u.name || "?", 26)} <span><b>${esc(u.name)}</b><br><span class="mut small">${esc(u.email)}</span></span></span></td><td>${u.role}</td><td>${money(u.balance_cents)}</td><td>${money(u.held_cents)}</td><td>${u.suspended ? "suspended" : "active"}</td><td><button class="btn ghost sm" data-usus="${u.id}" data-on="${u.suspended ? 0 : 1}">${u.suspended ? "Unsuspend" : "Suspend"}</button> <button class="btn ghost sm" data-credit="${u.id}">Credit $</button></td></tr>`).join("")}</table></div>
   <div class="panel rv"><h3>${ic("sliders")} Settings</h3>
     <label>Platform fee % (applies at award)</label><input id="s-fee" type="number" min="0" max="50" value="${esc(settings.settings.fee_pct || "10")}" style="max-width:160px">
-    <label>Deposit addresses (JSON)</label><textarea id="s-addr" rows="3">${esc(settings.settings.deposit_addresses || "{}")}</textarea>
+    <p class="small mut mt">Deposit addresses are per-user real mainnet wallets, generated automatically at registration — there are no shared addresses to configure.</p>
     <button class="btn sm mt" id="s-save">Save settings</button></div>`;
   initFx();
   document.querySelectorAll("[data-resolve]").forEach((b) => b.onclick = async () => { if (confirm(`Resolve for the ${b.dataset.resolve}?`)) { await api(`/admin/jobs/${b.dataset.id}/resolve`, { method: "POST", body: { resolution: b.dataset.resolve } }); toast("Resolved"); viewAdmin(); } });
@@ -677,7 +681,7 @@ async function viewAdmin() {
   document.querySelectorAll("[data-asus]").forEach((b) => b.onclick = async () => { await api(`/admin/agents/${b.dataset.asus}`, { method: "PUT", body: { status: b.dataset.on } }); viewAdmin(); });
   document.querySelectorAll("[data-usus]").forEach((b) => b.onclick = async () => { await api(`/admin/users/${b.dataset.usus}`, { method: "PUT", body: { suspended: b.dataset.on === "1" } }); viewAdmin(); });
   document.querySelectorAll("[data-credit]").forEach((b) => b.onclick = async () => { const amt = prompt("Credit amount in USD (negative to debit):"); if (amt) { await api(`/admin/users/${b.dataset.credit}`, { method: "PUT", body: { credit: Number(amt) } }); toast("Credited"); viewAdmin(); } });
-  $("#s-save").onclick = async () => { try { await api("/admin/settings", { method: "PUT", body: { fee_pct: $("#s-fee").value, deposit_addresses: $("#s-addr").value } }); toast("Settings saved"); } catch (e) { toast(e.message); } };
+  $("#s-save").onclick = async () => { try { await api("/admin/settings", { method: "PUT", body: { fee_pct: $("#s-fee").value } }); toast("Settings saved"); } catch (e) { toast(e.message); } };
 }
 
 // ---------- ROUTER ----------

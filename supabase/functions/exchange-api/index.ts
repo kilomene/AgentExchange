@@ -3,6 +3,11 @@
 // functions) is the store; this function is the only door. Money moves
 // happen exclusively through the transactional RPC functions.
 
+// Shared wallet core: per-user BIP39 wallets (BTC BIP84 + one EVM address),
+// seeds AES-256-GCM-encrypted with WALLET_MASTER_KEY before they touch the DB.
+// @ts-ignore: plain ESM module shared with the Node wallet service
+import { createEncryptedWallet, isValidBtcAddress, isValidEvmAddress } from "../_shared/wallet.mjs";
+
 const SB_URL = Deno.env.get("SUPABASE_URL")!;
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const JWT_SECRET = Deno.env.get("EXCHANGE_JWT_SECRET") ?? SB_KEY;
@@ -121,6 +126,22 @@ async function walletOf(userId: number) {
     w = { user_id: userId, balance_cents: 0, held_cents: 0 };
   }
   return w;
+}
+// The user's real mainnet chain wallet (public addresses only — the encrypted
+// seed never leaves the database through this API). Created lazily on first
+// need so every account, old or new, ends up with exactly one wallet.
+async function chainWalletOf(userId: number) {
+  const existing = await one(`ex_user_wallets?user_id=eq.${userId}&select=btc_address,evm_address,created_at`);
+  if (existing) return existing;
+  const created = createEncryptedWallet(Deno.env.get("WALLET_MASTER_KEY") || "");
+  const t = now();
+  const rows = await pg("ex_user_wallets", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: userId, seed_ciphertext: created.seed_ciphertext, seed_nonce: created.seed_nonce, btc_address: created.btc_address, evm_address: created.evm_address, created_at: t, updated_at: t }) }).catch(() => null);
+  if (rows?.[0]) return { btc_address: rows[0].btc_address, evm_address: rows[0].evm_address, created_at: rows[0].created_at };
+  return await one(`ex_user_wallets?user_id=eq.${userId}&select=btc_address,evm_address,created_at`);
+}
+function cryptoAddressesOf(cw: any) {
+  if (!cw) return {};
+  return { BTC: cw.btc_address, ETH: cw.evm_address, USDT: cw.evm_address, USDC: cw.evm_address };
 }
 async function notify(userId: number, type: string, bodyText: string, link = "") {
   await pg("ex_notifications", { method: "POST", body: JSON.stringify({ user_id: userId, type, body: bodyText, link, created_at: now() }) });
@@ -325,6 +346,7 @@ async function handle(req: Request) {
     const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: b.avatar || avatarDataUri("user:" + email, name), created_at: now() }) });
     const user = rows[0];
     await walletOf(user.id);
+    try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
     if (b.work) { try { await createHumanProfile(user, b.work); } catch { /* profile can be created later via /my/worker-profile */ } }
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
     return json({ token, user: { id: user.id, email, name, role: user.role, avatar: user.avatar } }, 201);
@@ -341,8 +363,10 @@ async function handle(req: Request) {
   if (path === "/auth/me" && method === "GET") {
     const u = await requireUser(req);
     const w = await walletOf(u.id);
+    let cw: any = null;
+    try { cw = await chainWalletOf(u.id); } catch (e) { console.error("chain wallet load failed for user", u.id, e); }
     const unreadRows = await pg(`ex_notifications?user_id=eq.${u.id}&is_read=eq.false&select=id`);
-    return json({ user: u, wallet: w, unread_notifications: unreadRows.length });
+    return json({ user: u, wallet: w, crypto_wallet: cw ? { btc_address: cw.btc_address, evm_address: cw.evm_address } : null, unread_notifications: unreadRows.length });
   }
   if (path === "/auth/profile" && method === "PUT") {
     const u = await requireUser(req);
@@ -563,8 +587,11 @@ async function handle(req: Request) {
     const u = await requireUser(req);
     const w = await walletOf(u.id);
     const ledger = await pg(`ex_ledger?user_id=eq.${u.id}&select=*&order=created_at.desc&limit=100`);
-    const addr = await one(`ex_settings?key=eq.deposit_addresses&select=value`);
-    return json({ wallet: w, ledger, deposit_addresses: JSON.parse(addr?.value || "{}") });
+    let cw: any = null;
+    try { cw = await chainWalletOf(u.id); } catch (e) { console.error("chain wallet load failed for user", u.id, e); }
+    const addresses = cryptoAddressesOf(cw);
+    const chainDeposits = await pg(`ex_chain_deposits?user_id=eq.${u.id}&select=asset,address,tx_hash,amount_cents,confirmations,status,created_at&order=created_at.desc&limit=50`).catch(() => []);
+    return json({ wallet: w, ledger, deposit_addresses: addresses, crypto_addresses: addresses, crypto_wallet: cw ? { btc_address: cw.btc_address, evm_address: cw.evm_address } : null, chain_deposits: chainDeposits });
   }
   if (path === "/wallet/deposit" && method === "POST") {
     const u = await requireUser(req);
@@ -579,8 +606,15 @@ async function handle(req: Request) {
     const b = await body();
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 500) return err("minimum payout is $5");
-    await rpc("ex_move_balance", { p_user: u.id, p_amount: -amount, p_type: "payout", p_ref: "", p_note: `Payout request to ${String(b.destination || "").slice(0, 60)}`, p_now: now() });
-    const rows = await pg("ex_payouts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: u.id, amount_cents: amount, method: b.method === "bank" ? "bank" : "crypto", destination: String(b.destination || "").slice(0, 200), created_at: now() }) });
+    const method = b.method === "bank" ? "bank" : "crypto";
+    const asset = ["BTC", "ETH", "USDT", "USDC"].includes(String(b.asset || "").toUpperCase()) ? String(b.asset).toUpperCase() : "USDT";
+    const destination = String(b.destination || "").slice(0, 200).trim();
+    if (method === "crypto") {
+      const valid = asset === "BTC" ? isValidBtcAddress(destination) : isValidEvmAddress(destination);
+      if (!valid) return err(`destination is not a valid ${asset} address`);
+    } else if (!destination) return err("destination required");
+    await rpc("ex_move_balance", { p_user: u.id, p_amount: -amount, p_type: "payout", p_ref: "", p_note: `Payout request to ${destination.slice(0, 60)}`, p_now: now() });
+    const rows = await pg("ex_payouts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: u.id, amount_cents: amount, method, asset, destination, created_at: now() }) });
     return json({ id: rows[0].id, status: "pending" }, 201);
   }
   if (path === "/wallet/payouts" && method === "GET") {
@@ -839,6 +873,14 @@ async function handle(req: Request) {
       const p = await one(`ex_payouts?id=eq.${id}&status=eq.pending&select=*`);
       if (!p) return err("pending payout not found", 404);
       if (b.action === "paid") {
+        if (p.method === "crypto") {
+          // Real on-chain execution: the wallet service picks the payout up,
+          // broadcasts from the treasury wallet, and marks it paid with the
+          // transaction hash once the send confirms. Never faked here.
+          await pg(`ex_payouts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ execution_status: "approved", failure_reason: "" }) });
+          await notify(p.user_id, "wallet", `Payout of $${(p.amount_cents / 100).toFixed(2)} approved — being sent on-chain`, "#/wallet");
+          return json({ ok: true, execution: "approved" });
+        }
         await pg(`ex_payouts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "paid", resolved_at: now() }) });
         await notify(p.user_id, "wallet", `Payout of $${(p.amount_cents / 100).toFixed(2)} sent`, "#/wallet");
       } else if (b.action === "reject") {
@@ -857,7 +899,7 @@ async function handle(req: Request) {
     if (path === "/admin/settings" && method === "PUT") {
       const b = await body();
       for (const [k, v] of Object.entries(b)) {
-        if (["fee_pct", "deposit_addresses"].includes(k)) {
+        if (["fee_pct"].includes(k)) {
           await pg("ex_settings?on_conflict=key", { method: "POST", prefer: "resolution=merge-duplicates", body: JSON.stringify({ key: k, value: typeof v === "string" ? v : JSON.stringify(v) }) });
         }
       }
