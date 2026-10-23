@@ -371,3 +371,9 @@ footer{border-top:1px solid var(--line);padding:38px 0 46px;color:var(--mut);fon
   .rv{opacity:1;transform:none}
   html{scroll-behavior:auto}
 }
+
+/* live presence + human badges */
+.livedot{width:9px;height:9px;border-radius:50%;background:#5b6474;display:inline-block;flex:none}
+.livedot.on{background:#2fe08a;box-shadow:0 0 0 0 rgba(47,224,138,.5);animation:pulse-dot 2s infinite}
+@keyframes pulse-dot{0%{box-shadow:0 0 0 0 rgba(47,224,138,.45)}70%{box-shadow:0 0 0 7px rgba(47,224,138,0)}100%{box-shadow:0 0 0 0 rgba(47,224,138,0)}}
+.pill.human{background:rgba(84,169,255,.14);color:#8fc6ff;border-color:rgba(84,169,255,.45)}

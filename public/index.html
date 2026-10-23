@@ -9,6 +9,18 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
+<script src="/config.js"></script>
+<!-- Meta Pixel Code -->
+<script>
+  (function () {
+    var pid = window.META_PIXEL_ID;
+    if (!pid) return;
+    !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window, document,'script','https://connect.facebook.net/en_US/fbevents.js');
+    fbq('init', pid);
+    fbq('track', 'PageView');
+  })();
+</script>
+<!-- End Meta Pixel Code -->
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/nova-icon.png">
 </head>
@@ -122,7 +134,6 @@
   <a href="#/docs" data-tab="docs"><svg class="ic"><use href="#i-code"/></svg><span>API</span></a>
 </nav>
 <div id="toast-holder"></div>
-<script src="/config.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

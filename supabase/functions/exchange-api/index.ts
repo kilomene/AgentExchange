@@ -138,14 +138,74 @@ function publicAgent(a: any) {
   const trust = Math.round(((Number(a.rating_avg) || 0) * 20) * 0.6 + Math.min(40, (a.jobs_completed || 0) * 2));
   return { ...rest, has_api: !!api_key_hash, skills: a.skills ? a.skills.split(",").map((t: string) => t.trim()).filter(Boolean) : [], trust_score: Math.min(100, trust) };
 }
+function seedHash(str: string) { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rngFrom(seed: number) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+// Generative avatar engine: a seeded emblem generator with millions of unique
+// combinations (gradient hues x background pattern x symbol x rotation x
+// initials variants). Deterministic: the same seed always yields the same
+// avatar, for any agent or human, anywhere. No two seeds need ever collide
+// in practice across thousands of registrations.
+const AV_SYMBOLS = [
+  "M48 10l7.5 30.5L86 48l-30.5 7.5L48 86l-7.5-30.5L10 48l30.5-7.5z",
+  "M50 8L24 54h18l-6 34L64 40H45z",
+  "M48 12l26 36-26 36L22 48z",
+  "M48 10l33 19v38L48 86L15 67V29z",
+  "M48 16l30 58H18z",
+  "M48 14v50M28 44l20-20 20 20",
+  "M30 22h36v14H30zM30 46h36v14H30zM30 70h24v14H30z",
+  "M60 12a34 34 0 1 0 24 44A40 40 0 0 1 60 12z",
+  "M48 20a28 28 0 1 1 0 56 28 28 0 0 1 0-56zM48 34a14 14 0 1 1 0 28 14 14 0 0 1 0-28z",
+  "M24 30l24-14 24 14v36L48 80 24 66z",
+  "M48 12c14 16 22 26 22 40a22 22 0 1 1-44 0c0-14 8-24 22-40z",
+  "M22 74V40l26-18 26 18v34H58V52H38v22z",
+  "M48 18a30 30 0 1 1-21 51l8-8a20 20 0 1 0 13-27z",
+  "M18 66l14-30 16 20 16-20 14 30zM18 74h60v8H18z",
+  "M34 14h28v20H34zM24 42h48v40H24z",
+  "M20 62c9-18 19-18 28 0s19 18 28 0l-6 12c-7-10-15-10-22 0s-15 10-22 0z",
+];
+function avPattern(kind: number, color: string) {
+  switch (kind % 6) {
+    case 0: return `<circle cx='48' cy='48' r='31' fill='none' stroke='${color}' stroke-width='2'/><circle cx='48' cy='48' r='20' fill='none' stroke='${color}' stroke-width='2'/>`;
+    case 1: { let d = ""; for (let i = 0; i < 5; i++) for (let j = 0; j < 5; j++) d += `<circle cx='${14 + i * 17}' cy='${14 + j * 17}' r='2.2' fill='${color}'/>`; return d; }
+    case 2: return `<path d='M0 30Q24 18 48 30T96 30M0 52Q24 40 48 52T96 52M0 74Q24 62 48 74T96 74' fill='none' stroke='${color}' stroke-width='2'/>`;
+    case 3: return `<path d='M14 0v96M38 0v96M62 0v96M86 0v96M0 14h96M0 38h96M0 62h96M0 86h96' stroke='${color}' stroke-width='1.6'/>`;
+    case 4: return `<circle cx='15' cy='15' r='12' fill='none' stroke='${color}' stroke-width='2'/><circle cx='85' cy='81' r='16' fill='none' stroke='${color}' stroke-width='2'/><circle cx='83' cy='13' r='7' fill='none' stroke='${color}' stroke-width='2'/>`;
+    default: return "";
+  }
+}
+function genAvatar(seedStr: string, name = "") {
+  const r = rngFrom(seedHash(String(seedStr)));
+  const h1 = Math.floor(r() * 360), h2 = (h1 + 30 + Math.floor(r() * 90)) % 360;
+  const pat = Math.floor(r() * 6);
+  const sym = Math.floor(r() * AV_SYMBOLS.length);
+  const rot = Math.floor(r() * 4) * 90;
+  const symFill = r() > 0.22 ? "#ffffff" : "rgba(10,12,24,.88)";
+  const p = String(name || "").trim().split(/\s+/).filter(Boolean);
+  const ini = (((p[0]?.[0] || "") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase()).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const center = (ini && r() > 0.62)
+    ? `<text x='48' y='63' font-family='Arial,sans-serif' font-size='32' font-weight='700' fill='${symFill}' text-anchor='middle'>${ini}</text>`
+    : `<g transform='rotate(${rot} 48 48)'><path d='${AV_SYMBOLS[sym]}' fill='${symFill}'/></g>`;
+  return `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${h1},85%,56%)'/><stop offset='1' stop-color='hsl(${h2},85%,40%)'/></linearGradient></defs><rect width='96' height='96' rx='22' fill='url(#g)'/><g opacity='.28'>${avPattern(pat, "#ffffff")}</g>${center}</svg>`;
+}
+const avatarDataUri = (seedStr: string, name = "") => `data:image/svg+xml;utf8,${encodeURIComponent(genAvatar(seedStr, name))}`;
 function autoAvatar(name: string) {
-  // Automatic profile picture for every agent: a generated emblem (initials on
-  // a name-hashed gradient), stored as an SVG data URI at creation time.
-  const p = String(name || "?").trim().split(/\s+/).filter(Boolean);
-  const ini = (((p[0]?.[0] || "?") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase()).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  let h = 0; for (const c of String(name || "")) h = (h * 31 + c.charCodeAt(0)) % 360;
-  const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${h},85%,58%)'/><stop offset='1' stop-color='hsl(${(h + 45) % 360},85%,42%)'/></linearGradient></defs><rect width='96' height='96' rx='22' fill='url(#g)'/><circle cx='48' cy='48' r='31' fill='none' stroke='rgba(255,255,255,.4)' stroke-width='2'/><text x='48' y='61' font-family='Arial,sans-serif' font-size='30' font-weight='700' fill='#fff' text-anchor='middle'>${ini}</text></svg>`;
-  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+  return avatarDataUri("agent:" + String(name || "").toLowerCase(), name);
+}
+async function createHumanProfile(user: any, work: any) {
+  const cat = await one(`ex_categories?slug=eq.${q(String(work?.category || ""))}&select=slug`);
+  if (!cat) return null;
+  const fields = {
+    name: user.name, tagline: String(work.tagline || "Human worker — hire me directly").slice(0, 140),
+    description: String(work.description || "").slice(0, 4000), category: cat.slug,
+    skills: String(work.skills || "").slice(0, 300), rate_cents: cents(Number(work.rate || 25) * 100),
+  };
+  const existing = await one(`ex_agents?owner_id=eq.${user.id}&is_human=eq.true&select=id`);
+  if (existing) { await pg(`ex_agents?id=eq.${existing.id}`, { method: "PATCH", body: JSON.stringify(fields) }); return existing.id; }
+  const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
+    owner_id: user.id, ...fields, avatar: avatarDataUri(`human:${user.id}:${user.name}`, user.name),
+    api_key_hash: null, webhook_url: "", is_human: true, created_at: now(),
+  }) });
+  return rows[0].id;
 }
 async function fireWebhook(url: string, payload: Record<string, unknown>) {
   if (!url) return;
@@ -179,6 +239,11 @@ async function handle(req: Request) {
   if (path === "/feed" && method === "GET") {
     const rows = await pg(`ex_feed?select=*&order=created_at.desc&limit=40`);
     return json({ feed: rows });
+  }
+  if (path.startsWith("/avatar/") && method === "GET" && seg.length === 2) {
+    // Public generative avatar for ANY seed (user id, agent name, email...).
+    const seed = decodeURIComponent(seg[1]).slice(0, 120);
+    return new Response(genAvatar(seed, seed), { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400", ...CORS } });
   }
   if (path === "/stats" && method === "GET") {
     const [agents, completed, users, vol] = await Promise.all([
@@ -234,16 +299,16 @@ async function handle(req: Request) {
   }
   if (path.startsWith("/jobs/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar)`);
+    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
     if (!j) return err("job not found", 404);
-    const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed)&order=amount_cents.asc`);
+    const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
     const viewer = await authUser(req);
     let messages: any[] = [];
     if (viewer && (viewer.id === j.poster_user_id || viewer.role === "admin" || (j.awarded_agent_id && (await one(`ex_agents?id=eq.${j.awarded_agent_id}&owner_id=eq.${viewer.id}&select=id`))))) {
       messages = await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
     }
     const review = await one(`ex_reviews?job_id=eq.${id}&select=*`);
-    return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed })), messages, review });
+    return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
   }
 
   // ===== auth =====
@@ -257,9 +322,10 @@ async function handle(req: Request) {
     if (password.length < 8) return err("password must be at least 8 characters");
     const exists = await one(`ex_users?email=eq.${q(email)}&select=id`);
     if (exists) return err("email already registered", 409);
-    const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: b.avatar || "🤖", created_at: now() }) });
+    const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: b.avatar || avatarDataUri("user:" + email, name), created_at: now() }) });
     const user = rows[0];
     await walletOf(user.id);
+    if (b.work) { try { await createHumanProfile(user, b.work); } catch { /* profile can be created later via /my/worker-profile */ } }
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
     return json({ token, user: { id: user.id, email, name, role: user.role, avatar: user.avatar } }, 201);
   }
@@ -281,7 +347,7 @@ async function handle(req: Request) {
   if (path === "/auth/profile" && method === "PUT") {
     const u = await requireUser(req);
     const b = await body();
-    await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ name: String(b.name || u.name).slice(0, 80), avatar: String(b.avatar || u.avatar).slice(0, 8), bio: String(b.bio || "").slice(0, 500) }) });
+    await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ name: String(b.name || u.name).slice(0, 80), avatar: String(b.avatar || u.avatar).slice(0, 2000), bio: String(b.bio || "").slice(0, 500) }) });
     return json({ ok: true });
   }
   if (path === "/auth/password" && method === "PUT") {
@@ -346,6 +412,7 @@ async function handle(req: Request) {
     if (!existing) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ bids_placed: (agent.bids_placed || 0) + 1 }) });
     await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ updated_at: now() }) });
     await notify(job.poster_user_id, "bid", `New bid on "${job.title}": ${agent.name} bid $${(amount / 100).toFixed(2)}`, `#/job/${job.id}`);
+    if (job.poster_agent_id) { const pa = await one(`ex_agents?id=eq.${job.poster_agent_id}&select=webhook_url`); if (pa?.webhook_url) await fireWebhook(pa.webhook_url, { event: "bid_received", job_id: job.id, title: job.title, amount_cents: amount, bidder: agent.name }); }
     await feed("bid_placed", `💰 ${agent.name} bid $${(amount / 100).toFixed(2)} on "${job.title}"`, job.id);
     return rows[0];
   }
@@ -435,6 +502,7 @@ async function handle(req: Request) {
       const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
       if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
       await notify(awardedOwner, "payment", `✅ "${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
+      if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: job.agreed_cents - job.fee_cents });
       await feed("completed", `✅ "${job.title}" completed — $${(job.agreed_cents / 100).toFixed(2)} paid out`, job.id);
       return json({ job: updated[0] });
     }
@@ -447,6 +515,7 @@ async function handle(req: Request) {
     if (action === "dispute" && isPoster && ["awarded", "delivered"].includes(job.status)) {
       await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(b.reason || "").slice(0, 1000), updated_at: t }) });
       await notify(awardedOwner, "dispute", `⚠️ "${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
+      { const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`); if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title }); }
       const admins = await pg("ex_users?role=eq.admin&select=id");
       for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
       return json({ ok: true });
@@ -522,6 +591,17 @@ async function handle(req: Request) {
   }
 
   // ===== my agents =====
+  if (path === "/my/worker-profile" && method === "POST") {
+    const u = await requireUser(req);
+    const id = await createHumanProfile(u, await body());
+    if (!id) return err("invalid category");
+    return json({ id, is_human: true });
+  }
+  if (path === "/my/worker-profile" && method === "GET") {
+    const u = await requireUser(req);
+    const row = await one(`ex_agents?owner_id=eq.${u.id}&is_human=eq.true&select=*`);
+    return json({ profile: row ? publicAgent(row) : null });
+  }
   if (path === "/my/agents" && method === "GET") {
     const u = await requireUser(req);
     const rows = await pg(`ex_agents?owner_id=eq.${u.id}&select=*&order=created_at.desc`);

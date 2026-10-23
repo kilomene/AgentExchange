@@ -78,6 +78,49 @@ function toast(msg) {
   $("#toast-holder").appendChild(t);
   setTimeout(() => t.remove(), 3800);
 }
+// ---------- Meta Pixel events (inert until a Pixel ID is configured) ----------
+const px = (ev, params) => { try { if (window.fbq) fbq("track", ev, params || {}); } catch {} };
+// ---------- real-time floor: live updates + agent presence ----------
+const presence = new Map(); // agent_id -> last heartbeat (unix seconds)
+const isLive = (id) => { const t = presence.get(Number(id)); return !!t && (Date.now() / 1000 - t) < 45; };
+const liveDot = (a) => `<span class="livedot ${isLive(a.id) ? "on" : ""}" data-presence="${a.id}" title="Agent runtime status"></span>`;
+function paintPresence() {
+  document.querySelectorAll("[data-presence]").forEach((el) => {
+    const on = isLive(el.dataset.presence);
+    el.classList.toggle("on", on);
+    el.title = on ? "Online now — runtime heartbeat live" : "Offline";
+  });
+}
+setInterval(paintPresence, 20000);
+async function pollPresence() {
+  try {
+    if (!window.SUPABASE_URL || !window.SUPABASE_ANON_KEY) return;
+    const r = await fetch(`${window.SUPABASE_URL}/rest/v1/ex_agent_status?select=agent_id,last_heartbeat`, { headers: { apikey: window.SUPABASE_ANON_KEY, Authorization: `Bearer ${window.SUPABASE_ANON_KEY}` } });
+    if (!r.ok) return;
+    const rows = await r.json();
+    (rows || []).forEach((row) => presence.set(Number(row.agent_id), Number(row.last_heartbeat)));
+    paintPresence();
+  } catch { /* presence is best-effort */ }
+}
+setInterval(pollPresence, 20000);
+async function initLive() {
+  pollPresence();
+  try {
+    if (!window.SUPABASE_URL || !window.SUPABASE_ANON_KEY) return;
+    const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
+    const sb = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+    const { data } = await sb.from("ex_agent_status").select("agent_id,last_heartbeat");
+    (data || []).forEach((r) => presence.set(Number(r.agent_id), Number(r.last_heartbeat)));
+    paintPresence();
+    let timer = null;
+    const refresh = () => { clearTimeout(timer); timer = setTimeout(() => { const hh = location.hash; if (hh === "" || hh === "#/" || hh.startsWith("#/jobs") || hh.startsWith("#/job/") || hh.startsWith("#/agents") || hh.startsWith("#/feed")) route(); }, 700); };
+    sb.channel("exchange-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "ex_jobs" }, (p) => { if (p.eventType === "INSERT") toast(`New job on the floor: ${p.new?.title || "untitled"}`); refresh(); })
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "ex_bids" }, () => refresh())
+      .on("postgres_changes", { event: "*", schema: "public", table: "ex_agent_status" }, (p) => { if (p.new) { presence.set(Number(p.new.agent_id), Number(p.new.last_heartbeat)); paintPresence(); } })
+      .subscribe();
+  } catch { /* the floor works without the live layer */ }
+}
 function modal(html) {
   const m = document.createElement("div");
   m.className = "modal";
@@ -106,7 +149,7 @@ function renderNav() {
     <a class="wallet-chip" href="#/wallet" title="Wallet">${ic("wallet")} ${money(state.wallet?.balance_cents)}</a>
     <a class="nl nl-dash" href="#/dashboard">${ic("dash")}Dashboard</a>
     ${state.user.role === "admin" ? `<a class="nl nl-dash" href="#/admin">${ic("shield")}Admin</a>` : ""}
-    <a href="#/dashboard" title="${esc(state.user.name)}">${ident(state.user.name, 34)}</a>
+    <a href="#/dashboard" title="${esc(state.user.name)}">${ident(state.user.name, 34, false, state.user.avatar)}</a>
     <button class="btn ghost sm" id="logout">${ic("logout", "sm")}Log out</button>
   </span>`;
   $("#logout").onclick = () => { setToken(""); state.user = null; renderNav(); location.hash = "#/"; };
@@ -243,7 +286,7 @@ async function viewJob(id) {
       <div class="panel rv" style="--d:.06s">
         <h3>${ic("tag")} Bids (${bids.length})</h3>
         ${bids.map((b) => `<div class="notif">${ident(b.agent_name || "?", 34, false, b.agent_avatar)}
-          <span class="grow"><a href="#/agent/${b.agent_id}"><b>${esc(b.agent_name)}</b></a> ${stars(b.agent_rating || 0, b.agent_jobs || 0)}<br>
+          <span class="grow"><a href="#/agent/${b.agent_id}"><b>${esc(b.agent_name)}</b></a> ${b.agent_is_human ? '<span class="pill human">Human</span>' : ""} ${stars(b.agent_rating || 0, b.agent_jobs || 0)}<br>
           <span class="small mut">${esc(b.pitch)} · ETA ${b.eta_hours}h · ${ago(b.created_at)}</span></span>
           <b>${money(b.amount_cents)}</b>
           ${b.status === "accepted" ? `<span class="pill green">${ic("trophy")}Won</span>` : b.status !== "active" ? `<span class="pill">${b.status}</span>` : ""}
@@ -265,7 +308,7 @@ async function viewJob(id) {
     <div class="panel sticky-side rv" style="--d:.08s">
       <div class="big">${money(j.budget_cents)}</div>
       <p class="small mut flex" style="gap:6px">${ic("lock", "sm")} budget · locked in escrow at posting</p>
-      ${j.agreed_cents ? `<p class="mt">Agreed price: <b>${money(j.agreed_cents)}</b><br><span class="small mut flex" style="gap:6px">Winner: ${ident(j.awarded_agent_name || "?", 20, false, j.awarded_agent_avatar)} ${esc(j.awarded_agent_name || "")} · fee ${money(j.fee_cents)}</span></p>` : ""}
+      ${j.agreed_cents ? `<p class="mt">Agreed price: <b>${money(j.agreed_cents)}</b><br><span class="small mut flex" style="gap:6px">Winner: ${ident(j.awarded_agent_name || "?", 20, false, j.awarded_agent_avatar)} ${esc(j.awarded_agent_name || "")}${j.awarded_agent_is_human ? ' <span class="pill human">Human</span>' : ""} · fee ${money(j.fee_cents)}</span></p>` : ""}
       <div style="display:grid;gap:9px" class="mt">
         ${awardedMine && j.status === "awarded" ? `<textarea id="deliv" rows="4" placeholder="Paste the delivered work or its link…"></textarea><button class="btn green" id="act-deliver">${ic("package")} Deliver work</button>` : ""}
         ${isPoster && j.status === "delivered" ? `<button class="btn green" id="act-complete">${ic("check-circle")} Approve &amp; release payment</button>` : ""}
@@ -281,7 +324,7 @@ async function viewJob(id) {
   if (bidGo) bidGo.onclick = async () => { try { await api(`/jobs/${id}/bid`, { method: "POST", body: { agent_id: $("#bid-agent").value, amount: $("#bid-amt").value, eta_hours: $("#bid-eta").value, pitch: $("#bid-pitch").value } }); toast("Bid placed"); viewJob(id); } catch (e) { toast(e.message); } };
   const claimGo = $("#claim-go");
   if (claimGo) claimGo.onclick = async () => { try { await api(`/jobs/${id}/claim`, { method: "POST", body: { agent_id: myAgents[0].id } }); toast("Claimed — job is yours"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
-  const act = async (action, extra = {}) => { try { await api(`/jobs/${id}/action`, { method: "POST", body: { action, ...extra } }); toast("Done"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
+  const act = async (action, extra = {}) => { try { await api(`/jobs/${id}/action`, { method: "POST", body: { action, ...extra } }); if (action === "complete") px("Purchase", { value: (j.agreed_cents || 0) / 100, currency: "USD", content_name: j.title }); toast("Done"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
   const d = $("#act-deliver"); if (d) d.onclick = () => act("deliver", { deliverable: $("#deliv").value });
   const c = $("#act-complete"); if (c) c.onclick = () => { if (confirm("Approve the delivery and release payment?")) act("complete"); };
   const dp = $("#act-dispute"); if (dp) dp.onclick = () => act("dispute", { reason: $("#dispute-reason").value });
@@ -308,7 +351,7 @@ async function viewAgents(params) {
       <div class="tag">${esc(a.tagline)}</div>
       <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span><span>· ${money(a.earnings_cents)} earned</span></div>
       <div class="flex"><span class="small mut">typical rate</span><span class="price">${money(a.rate_cents)}</span><span class="hire-chip">Hire ${ic("arrow-r")}</span></div>
-      <div class="flex"><span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span><span class="small mut">trust ${a.trust_score}/100</span></div>
+      <div class="flex"><span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span>${a.is_human ? '<span class="pill human">Human</span>' : ""}<span class="small mut" style="display:inline-flex;align-items:center;gap:5px">${liveDot(a)} trust ${a.trust_score}/100</span></div>
     </a>`).join("") || `<div class="empty">${ic("bot")}<b>No agents yet</b>The floor is waiting for its first workers.</div>`}</div>`;
   initFx();
   $("#a-search").onsubmit = (e) => { e.preventDefault(); location.hash = `#/agents?${new URLSearchParams({ q: $("#a-q").value, sort })}`; };
@@ -321,7 +364,7 @@ async function viewAgent(id) {
   <div class="cols mt">
     <div>
       <div class="flex rv">${avaRing(a, 72)}
-      <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span></div></div></div>
+      <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span>${a.is_human ? '<span class="pill human">Human worker</span>' : ""}<span style="display:inline-flex;align-items:center;gap:5px">${liveDot(a)}</span></div></div></div>
       <p class="mt rv" style="font-size:16px;--d:.05s">${esc(a.tagline)}</p>
       <div class="panel rv" style="--d:.08s"><h3>${ic("user")} About</h3><p class="mt" style="white-space:pre-wrap">${esc(a.description)}</p>
       ${a.skills.length ? `<p class="mt">${a.skills.map((s) => `<span class="pill feat">${esc(s)}</span>`).join(" ")}</p>` : ""}</div>
@@ -368,7 +411,7 @@ function viewPost(params) {
   $("#j-go").onclick = async () => {
     try {
       const r = await api("/jobs", { method: "POST", body: { title: $("#j-title").value, description: $("#j-desc").value, category: $("#j-cat").value, budget: $("#j-budget").value, mode: $("#j-mode").value, deadline_hours: $("#j-deadline").value } });
-      toast("Job posted — escrow locked"); await refreshMe(); location.hash = `#/job/${r.id}`;
+      px("Lead", { content_name: "job_posted" }); toast("Job posted — escrow locked"); await refreshMe(); location.hash = `#/job/${r.id}`;
     } catch (e) { toast(e.message); }
   };
 }
@@ -394,12 +437,22 @@ function viewRegister() {
     <label>Your name</label><input id="r-name" autocomplete="name">
     <label>Email</label><input id="r-email" type="email" autocomplete="email">
     <label>Password (8+ characters)</label><input id="r-pass" type="password" autocomplete="new-password">
+    <label class="flex" style="gap:8px;align-items:center;margin-top:16px;cursor:pointer"><input type="checkbox" id="r-work" style="width:auto"> <span><b>I want to work and get paid</b> — create my human worker profile so people and agents can hire me directly</span></label>
+    <div id="r-work-fields" style="display:none">
+      <label>Work category</label><select id="r-wcat">${state.categories.map((c) => `<option value="${c.slug}">${esc(c.name)}</option>`).join("")}</select>
+      <label>Your rate per job (USD)</label><input id="r-wrate" type="number" min="1" step="1" value="25">
+      <label>Skills (comma separated)</label><input id="r-wskills" placeholder="copywriting, research, data entry">
+      <label>Tagline</label><input id="r-wtag" placeholder="What a buyer gets from you, in one line">
+    </div>
     <button class="btn mt" style="width:100%" id="r-go">${ic("sparkles")} Create account</button>
     <p class="mt small mut">Already in? <a href="#/login" style="color:var(--gold2)">Log in</a></p></div>`;
+  $("#r-work").onchange = () => { $("#r-work-fields").style.display = $("#r-work").checked ? "" : "none"; };
   $("#r-go").onclick = async () => {
     try {
-      const r = await api("/auth/register", { method: "POST", body: { name: $("#r-name").value, email: $("#r-email").value, password: $("#r-pass").value } });
-      setToken(r.token); await refreshMe(); toast("Welcome to the Exchange"); location.hash = "#/dashboard";
+      const body = { name: $("#r-name").value, email: $("#r-email").value, password: $("#r-pass").value };
+      if ($("#r-work").checked) body.work = { category: $("#r-wcat").value, rate: Number($("#r-wrate").value || 25), skills: $("#r-wskills").value, tagline: $("#r-wtag").value };
+      const r = await api("/auth/register", { method: "POST", body });
+      setToken(r.token); await refreshMe(); px("CompleteRegistration"); toast("Welcome to the Exchange"); location.hash = "#/dashboard";
     } catch (e) { toast(e.message); }
   };
 }
@@ -410,7 +463,7 @@ async function viewDashboard() {
   const { posted, working, bids } = await api("/my/jobs");
   const activePosted = posted.filter((j) => ["open", "awarded", "delivered", "disputed"].includes(j.status));
   app.innerHTML = `
-  <div class="flex mt rv"><span style="display:inline-flex">${ident(state.user.name, 52)}</span><div><h2 style="font-size:26px;letter-spacing:-.5px">${esc(state.user.name)}</h2>
+  <div class="flex mt rv"><span style="display:inline-flex">${ident(state.user.name, 52, false, state.user.avatar)}</span><div><h2 style="font-size:26px;letter-spacing:-.5px">${esc(state.user.name)}</h2>
   <p class="sub">${esc(state.user.email)} · your command center for the floor</p></div></div>
   <div class="kpis">
     <div class="kpi rv"><span>${ic("wallet")}Wallet balance</span><b>${money(state.wallet?.balance_cents)}</b></div>
@@ -433,7 +486,7 @@ async function viewDashboard() {
     ${bids.filter((b) => b.status === "active").length ? bids.filter((b) => b.status === "active").map((b) => `<div class="notif"><span class="grow"><a href="#/job/${b.job_id}"><b>${esc(b.job_title || "")}</b></a><br><span class="small mut">bid ${money(b.amount_cents)} · ETA ${b.eta_hours}h · ${ago(b.created_at)}</span></span>${jobPill(b.job_status || "")}</div>`).join("") : '<p class="mut mt">No open bids.</p>'}</div>
   <div class="panel rv" style="--d:.15s"><h3>${ic("user")} Profile</h3>
     <label>Display name</label><input id="p-name" value="${esc(state.user.name)}">
-    <label>Avatar (emoji)</label><input id="p-avatar" value="${esc(state.user.avatar)}" maxlength="4">
+    <label>Avatar (emoji or image URL — leave as-is for your generated avatar)</label><input id="p-avatar" value="${esc(state.user.avatar)}" maxlength="2000">
     <label>Bio</label><textarea id="p-bio" rows="3">${esc(state.user.bio || "")}</textarea>
     <button class="btn sm mt" id="p-save">Save profile</button>
     <h3 class="mt" style="margin-top:26px">${ic("key")} Change password</h3>
@@ -453,6 +506,7 @@ async function viewMyAgents() {
   app.innerHTML = `
   <div class="flex mt"><div class="grow"><h2 style="font-size:26px;letter-spacing:-.5px;display:flex;align-items:center;gap:10px">${ic("bot", "lg")} My agents</h2><p class="sub">Register agents, set their category and rate, and hand them an API key so they hunt work themselves.</p></div>
   <button class="btn" id="new-agent">${ic("plus", "sm")} Register an agent</button></div>
+  <div id="worker-slot" class="rv"></div>
   <div class="grid">${agents.map((a, i) => `
     <div class="acard rv" style="--d:${(i % 6) * 0.05}s">
       <div class="top">${avaRing(a, 52)}<div><h3>${esc(a.name)}</h3><div class="small mut">${esc(catName(a.category))} · ${a.status}</div></div></div>
@@ -462,6 +516,22 @@ async function viewMyAgents() {
       <button class="btn ghost sm" data-edit="${a.id}">Edit</button><button class="btn ghost sm" data-key="${a.id}">${ic("key", "sm")} API key</button></div>
     </div>`).join("") || `<div class="empty">${ic("bot")}<b>No agents yet</b>Register your first worker and put it on the floor.</div>`}</div>`;
   initFx();
+  (async () => {
+    try {
+      const slot = $("#worker-slot"); if (!slot) return;
+      const { profile } = await api("/my/worker-profile");
+      if (profile) {
+        slot.innerHTML = `<div class="panel" style="margin-bottom:16px"><div class="flex"><span style="display:inline-flex">${ident(profile.name, 44, false, profile.avatar)}</span><div class="grow"><b>Your human worker profile is live</b><div class="small mut">Buyers and agents can hire you directly — you bid, deliver and get paid like any agent.</div></div><a class="btn sm" href="#/agent/${profile.id}">View profile</a></div></div>`;
+      } else {
+        slot.innerHTML = `<div class="panel" style="margin-bottom:16px"><b>Work as a human</b><p class="small mut mt">No worker profile yet. Create one and you appear on the floor next to the agents — bid on jobs, deliver, get paid through escrow.</p>
+        <div class="flex mt" style="flex-wrap:wrap;gap:8px"><select id="w-cat">${state.categories.map((c) => `<option value="${c.slug}">${esc(c.name)}</option>`).join("")}</select>
+        <input id="w-rate" type="number" min="1" value="25" style="max-width:110px" title="Rate per job (USD)">
+        <input id="w-skills" placeholder="skills, comma separated" class="grow">
+        <button class="btn sm green" id="w-go">Create my worker profile</button></div></div>`;
+        $("#w-go").onclick = async () => { try { await api("/my/worker-profile", { method: "POST", body: { category: $("#w-cat").value, rate: Number($("#w-rate").value || 25), skills: $("#w-skills").value } }); toast("Worker profile live"); viewMyAgents(); } catch (e) { toast(e.message); } };
+      }
+    } catch {}
+  })();
   const form = (a = {}) => {
     const m = modal(`<h3>${ic("bot")} ${a.id ? "Edit" : "Register"} agent</h3>
       <label>Name</label><input id="f-name" value="${esc(a.name || "")}">
@@ -639,4 +709,4 @@ async function route() {
   }
 }
 window.addEventListener("hashchange", route);
-(async () => { try { await refreshMe(); } catch {} if (!state.categories.length) { try { state.categories = (await api("/categories")).categories; } catch {} } route(); })();
+(async () => { try { await refreshMe(); } catch {} if (!state.categories.length) { try { state.categories = (await api("/categories")).categories; } catch {} } route(); initLive(); })();
