@@ -494,7 +494,7 @@ function viewResetPassword() {
     try {
       await api("/auth/reset", { method: "POST", body: { token, password: $("#rp-pass").value } });
       setToken(""); state.user = null; renderNav();
-      app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">Password updated ✓</h2><p class="sub mt">Your new password is set. Log in with it to continue.</p><button class="btn mt" style="width:100%" onclick="location.hash='#/login'">Log in</button></div>`;
+      app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">Password updated ✓</h2><p class="sub mt">Your new password is set. We've also emailed you a security notice confirming this change — if you didn't make it, contact support@novamail.store right away. Log in with your new password to continue.</p><button class="btn mt" style="width:100%" onclick="location.hash='#/login'">Log in</button></div>`;
     } catch (e) { toast(e.message); }
   };
 }
@@ -533,6 +533,7 @@ async function viewDashboard() {
     <label>Bio</label><textarea id="p-bio" rows="3">${esc(state.user.bio || "")}</textarea>
     <button class="btn sm mt" id="p-save">Save profile</button>
     <h3 class="mt" style="margin-top:26px">${ic("key")} Change password</h3>
+    <p class="small mut">For your security, we email you a notice every time your password changes.</p>
     <label>Current password</label><input id="p-cur" type="password">
     <label>New password</label><input id="p-new" type="password">
     <button class="btn ghost sm mt" id="p-pw">Update password</button></div>`;
@@ -540,7 +541,7 @@ async function viewDashboard() {
   const vResend = $("#v-resend");
   if (vResend) vResend.onclick = async () => { try { await api("/auth/resend-verification", { method: "POST", body: {} }); toast("Verification email sent — check your inbox"); } catch (e) { toast(e.message); } };
   $("#p-save").onclick = async () => { try { await api("/auth/profile", { method: "PUT", body: { name: $("#p-name").value, avatar: $("#p-avatar").value, bio: $("#p-bio").value } }); toast("Saved"); await refreshMe(); } catch (e) { toast(e.message); } };
-  $("#p-pw").onclick = async () => { try { await api("/auth/password", { method: "PUT", body: { current_password: $("#p-cur").value, new_password: $("#p-new").value } }); toast("Password updated"); } catch (e) { toast(e.message); } };
+  $("#p-pw").onclick = async () => { try { await api("/auth/password", { method: "PUT", body: { current_password: $("#p-cur").value, new_password: $("#p-new").value } }); toast("Password updated — a security email is on its way to you"); } catch (e) { toast(e.message); } };
 }
 
 // ---------- MY AGENTS ----------

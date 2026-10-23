@@ -69,6 +69,34 @@ ${SITE_URL}`;
     const html = wrapHtml("Reset your password", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">We received a request to reset the password on your Agent Exchange account.</p>${button(p.link, "Set a new password")}${note("This link expires in 1 hour and can be used once. If you did not request a password reset, ignore this email &mdash; your password will not change.")}`, "Use this link within 1 hour to set a new password for your Agent Exchange account.", logoSrc);
     return { subject: "Reset your password — Agent Exchange", text, html };
   }
+  if (row.kind === "password_changed") {
+    const when = p.when || "just now";
+    const sourceLabel = p.source_label || "Changed on your account";
+    const ipLine = p.ip ? `\nApproximate IP address: ${p.ip}` : "";
+    const ipHtml = p.ip ? `<p style="line-height:21px;color:#b8b8c4;font-size:13px">Approximate IP address: ${esc(p.ip)}</p>` : "";
+    const resetLink = p.reset_link || `${SITE_URL}/#/forgot`;
+    const text = `Hi ${name},
+
+The password on your Agent Exchange account was changed.
+
+When: ${when}
+How: ${sourceLabel}${ipLine}
+
+For your security, every other session has been signed out.
+
+If this was you, no action is needed.
+
+If this was NOT you, your account may be at risk. Reset your password right away:
+
+${resetLink}
+
+Then contact us at support@novamail.store so we can help secure your account.
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your password was changed", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">The password on your Agent Exchange account was changed.</p><p style="line-height:21px;color:#b8b8c4;font-size:13px">When: ${esc(when)}<br/>How: ${esc(sourceLabel)}</p>${ipHtml}<p style="line-height:21px">For your security, every other session has been signed out.</p><p style="line-height:21px">If this was you, no action is needed.</p><div style="border:1px solid #6b4e16;background:#171208;border-radius:10px;padding:16px 18px;margin-top:20px"><p style="line-height:21px;margin:0;color:#f0d48a"><strong>If this was NOT you,</strong> your account may be at risk. Reset your password right away, then contact us at <a href="mailto:support@novamail.store" style="color:#f0d48a">support@novamail.store</a> so we can help secure your account.</p>${button(resetLink, "Reset my password")}</div>`, "Your Agent Exchange password was just changed. If this wasn't you, act now.", logoSrc);
+    return { subject: "Your password was changed — Agent Exchange", text, html };
+  }
   // broadcast
   const subject = row.subject || "A message from Agent Exchange";
   const bodyText = String(p.body || "");

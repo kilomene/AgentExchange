@@ -169,6 +169,26 @@ async function queueVerifyMail(user: { id: number; email: string; name: string }
   const raw = await mintEmailToken(user.id, "verify", 60 * 60 * 24);
   await queueMail("verify", user.email, user.name, { name: user.name, link: `${SITE_URL}/#/verify-email?token=${raw}` });
 }
+// Every password change notifies the account owner: a security email from
+// no-reply@novamail.store (via ex_outbox -> exchange-mailerd) AND an in-app
+// notification, so a hijacked session can never silently rotate the password.
+async function queuePasswordChangedMail(user: { id: number; email: string; name: string }, source: "settings" | "reset", req: Request): Promise<boolean> {
+  let when = new Date().toISOString();
+  try { when = new Date().toLocaleString("en-US", { dateStyle: "full", timeStyle: "long", timeZone: "UTC" }); } catch { /* ISO fallback */ }
+  const ip = (req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || "").split(",")[0].trim();
+  const payload: Record<string, unknown> = {
+    name: user.name,
+    when,
+    source_label: source === "reset" ? "Changed using a password reset link" : "Changed in your account settings",
+    reset_link: `${SITE_URL}/#/forgot`,
+  };
+  if (ip) payload.ip = ip;
+  // Mail and in-app notification are independent: one failing must not eat the other.
+  let mailed = false;
+  try { await queueMail("password_changed", user.email, user.name, payload); mailed = true; } catch (e) { console.error("password-changed mail queue failed for user", user.id, e); }
+  try { await notify(user.id, "security", "🔒 Your password was changed — we emailed you the details. If this wasn't you, reset your password right away.", "#/forgot"); } catch (e) { console.error("password-changed notification failed for user", user.id, e); }
+  return mailed;
+}
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
   const row = await one(`ex_email_tokens?token_hash=eq.${await sha256hex(raw)}&kind=eq.${kind}&select=*`);
@@ -408,7 +428,8 @@ async function handle(req: Request) {
     if (!(await verifyPassword(String(b.current_password || ""), full.password_hash))) return err("current password wrong", 401);
     if (String(b.new_password || "").length < 8) return err("new password must be at least 8 characters");
     await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(b.new_password), password_changed_at: now() }) });
-    return json({ ok: true });
+    const notified = await queuePasswordChangedMail({ id: u.id, email: u.email, name: u.name }, "settings", req);
+    return json({ ok: true, notified });
   }
   if (path === "/auth/verify" && method === "POST") {
     const b = await body();
@@ -445,7 +466,12 @@ async function handle(req: Request) {
     if (!row) return err("this reset link is invalid or has expired", 400);
     await pg(`ex_email_tokens?user_id=eq.${row.user_id}&used_at=is.null`, { method: "PATCH", body: JSON.stringify({ used_at: now() }) });
     await pg(`ex_users?id=eq.${row.user_id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(password), password_changed_at: now(), email_verified: true }) });
-    return json({ ok: true, reset: true });
+    let notified = false;
+    try {
+      const target = await one(`ex_users?id=eq.${row.user_id}&select=id,email,name`);
+      if (target) notified = await queuePasswordChangedMail(target, "reset", req);
+    } catch (e) { console.error("password-changed mail queue failed for user", row.user_id, e); }
+    return json({ ok: true, reset: true, notified });
   }
 
   // ===== jobs lifecycle =====
