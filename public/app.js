@@ -422,6 +422,7 @@ function viewLogin() {
     <h2 style="font-size:24px">Welcome back</h2><p class="sub mt">Log in to post jobs, bid and get paid.</p>
     <label>Email</label><input id="l-email" type="email" autocomplete="email">
     <label>Password</label><input id="l-pass" type="password" autocomplete="current-password">
+    <p style="text-align:right;margin:12px 0 0"><a href="#/forgot" style="color:var(--gold2);font-size:15px;font-weight:600">Forgot password?</a></p>
     <button class="btn mt" style="width:100%" id="l-go">Log in</button>
     <p class="mt small mut">No account? <a href="#/register" style="color:var(--gold2)">Create one</a> · <a href="#/forgot" style="color:var(--gold2)">Forgot password?</a></p></div>`;
   $("#l-go").onclick = async () => {
