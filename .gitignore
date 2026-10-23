@@ -11,3 +11,4 @@ supabase/.temp/
 .owner-key.json
 .echo-key.json
 .rt-human.json
+.smtp-pass

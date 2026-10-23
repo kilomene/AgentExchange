@@ -86,6 +86,7 @@ async function verifyPassword(password: string, stored: string) {
   return (await pbkdf2(password, parts[1])) === parts[2];
 }
 async function signJwt(payload: Record<string, unknown>) {
+  payload = { iat: now(), ...payload };
   const head = b64url(enc.encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
   const body = b64url(enc.encode(JSON.stringify(payload)));
   return `${head}.${body}.${b64url(await hmac(JWT_SECRET, `${head}.${body}`))}`;
@@ -104,14 +105,16 @@ function randomToken(n = 24) {
 }
 
 // ---------- domain helpers ----------
-type User = { id: number; email: string; name: string; role: string; avatar: string; bio: string; suspended: boolean; created_at: number };
+type User = { id: number; email: string; name: string; role: string; avatar: string; bio: string; suspended: boolean; created_at: number; email_verified: boolean; password_changed_at: number };
 async function authUser(req: Request): Promise<User | null> {
   const h = req.headers.get("authorization") || "";
   if (!h.startsWith("Bearer ")) return null;
   const payload = await verifyJwt(h.slice(7));
   if (!payload) return null;
-  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at`);
+  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at`);
   if (!user || user.suspended) return null;
+  // Sessions issued before the latest password change/reset are dead.
+  if (payload.iat && Number(user.password_changed_at || 0) > Number(payload.iat)) return null;
   return user;
 }
 async function requireUser(req: Request): Promise<User> {
@@ -148,6 +151,29 @@ async function notify(userId: number, type: string, bodyText: string, link = "")
 }
 async function feed(kind: string, bodyText: string, jobId?: number) {
   await pg("ex_feed", { method: "POST", body: JSON.stringify({ kind, body: bodyText, job_id: jobId ?? null, created_at: now() }) });
+}
+// ---------- email system (verification, password reset, broadcasts) ----------
+// Mail itself is sent by the exchange-mailerd service from ex_outbox rows;
+// this function only mints single-use hashed tokens and queues the mail.
+const SITE_URL = "https://exchange.novamail.store";
+async function mintEmailToken(userId: number, kind: "verify" | "reset", ttlSec: number) {
+  await pg(`ex_email_tokens?user_id=eq.${userId}&kind=eq.${kind}&used_at=is.null`, { method: "PATCH", body: JSON.stringify({ used_at: now() }) });
+  const raw = randomToken(32);
+  await pg("ex_email_tokens", { method: "POST", body: JSON.stringify({ user_id: userId, kind, token_hash: await sha256hex(raw), expires_at: now() + ttlSec, created_at: now() }) });
+  return raw;
+}
+async function queueMail(kind: string, toEmail: string, toName: string, payload: Record<string, unknown>, subject?: string) {
+  await pg("ex_outbox", { method: "POST", body: JSON.stringify({ kind, to_email: toEmail, to_name: toName || null, subject: subject || null, payload, created_at: now() }) });
+}
+async function queueVerifyMail(user: { id: number; email: string; name: string }) {
+  const raw = await mintEmailToken(user.id, "verify", 60 * 60 * 24);
+  await queueMail("verify", user.email, user.name, { name: user.name, link: `${SITE_URL}/#/verify-email?token=${raw}` });
+}
+async function findEmailToken(raw: string, kind: string) {
+  if (!raw || raw.length < 32) return null;
+  const row = await one(`ex_email_tokens?token_hash=eq.${await sha256hex(raw)}&kind=eq.${kind}&select=*`);
+  if (!row || row.used_at || Number(row.expires_at) < now()) return null;
+  return row;
 }
 async function feePct() {
   const row = await one(`ex_settings?key=eq.fee_pct&select=value`);
@@ -348,8 +374,9 @@ async function handle(req: Request) {
     await walletOf(user.id);
     try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
     if (b.work) { try { await createHumanProfile(user, b.work); } catch { /* profile can be created later via /my/worker-profile */ } }
+    try { await queueVerifyMail({ id: user.id, email, name }); } catch (e) { console.error("verify mail queue failed for user", user.id, e); }
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
-    return json({ token, user: { id: user.id, email, name, role: user.role, avatar: user.avatar } }, 201);
+    return json({ token, user: { id: user.id, email, name, role: user.role, avatar: user.avatar, email_verified: false } }, 201);
   }
   if (path === "/auth/login" && method === "POST") {
     const b = await body();
@@ -358,7 +385,7 @@ async function handle(req: Request) {
     if (!user || !(await verifyPassword(String(b.password || ""), user.password_hash))) return err("invalid email or password", 401);
     if (user.suspended) return err("account suspended", 403);
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
-    return json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, bio: user.bio } });
+    return json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, bio: user.bio, email_verified: !!user.email_verified } });
   }
   if (path === "/auth/me" && method === "GET") {
     const u = await requireUser(req);
@@ -380,8 +407,45 @@ async function handle(req: Request) {
     const full = await one(`ex_users?id=eq.${u.id}&select=password_hash`);
     if (!(await verifyPassword(String(b.current_password || ""), full.password_hash))) return err("current password wrong", 401);
     if (String(b.new_password || "").length < 8) return err("new password must be at least 8 characters");
-    await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(b.new_password) }) });
+    await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(b.new_password), password_changed_at: now() }) });
     return json({ ok: true });
+  }
+  if (path === "/auth/verify" && method === "POST") {
+    const b = await body();
+    const row = await findEmailToken(String(b.token || ""), "verify");
+    if (!row) return err("this verification link is invalid or has expired", 400);
+    await pg(`ex_email_tokens?id=eq.${row.id}`, { method: "PATCH", body: JSON.stringify({ used_at: now() }) });
+    await pg(`ex_users?id=eq.${row.user_id}`, { method: "PATCH", body: JSON.stringify({ email_verified: true }) });
+    return json({ ok: true, verified: true });
+  }
+  if (path === "/auth/resend-verification" && method === "POST") {
+    const u = await requireUser(req);
+    if (u.email_verified) return json({ ok: true, already_verified: true });
+    await queueVerifyMail({ id: u.id, email: u.email, name: u.name });
+    return json({ ok: true, sent: true });
+  }
+  if (path === "/auth/forgot" && method === "POST") {
+    const b = await body();
+    const email = String(b.email || "").toLowerCase().trim();
+    const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended`);
+    if (user && !user.suspended) {
+      try {
+        const raw = await mintEmailToken(user.id, "reset", 60 * 60);
+        await queueMail("reset", user.email, user.name, { name: user.name, link: `${SITE_URL}/#/reset-password?token=${raw}` });
+      } catch (e) { console.error("reset mail queue failed", e); }
+    }
+    // Same answer whether or not the account exists — no enumeration.
+    return json({ ok: true });
+  }
+  if (path === "/auth/reset" && method === "POST") {
+    const b = await body();
+    const password = String(b.password || "");
+    if (password.length < 8) return err("password must be at least 8 characters");
+    const row = await findEmailToken(String(b.token || ""), "reset");
+    if (!row) return err("this reset link is invalid or has expired", 400);
+    await pg(`ex_email_tokens?user_id=eq.${row.user_id}&used_at=is.null`, { method: "PATCH", body: JSON.stringify({ used_at: now() }) });
+    await pg(`ex_users?id=eq.${row.user_id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(password), password_changed_at: now(), email_verified: true }) });
+    return json({ ok: true, reset: true });
   }
 
   // ===== jobs lifecycle =====
@@ -413,6 +477,7 @@ async function handle(req: Request) {
   }
   if (path === "/jobs" && method === "POST") {
     const u = await requireUser(req);
+    if (!u.email_verified) return err("verify your email first — we sent a confirmation link to your inbox", 403);
     const b = await body();
     let posterAgentId: number | null = null;
     if (b.poster_agent_id) {
@@ -603,6 +668,7 @@ async function handle(req: Request) {
   }
   if (path === "/wallet/payout" && method === "POST") {
     const u = await requireUser(req);
+    if (!u.email_verified) return err("verify your email first — we sent a confirmation link to your inbox", 403);
     const b = await body();
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 500) return err("minimum payout is $5");
@@ -781,6 +847,24 @@ async function handle(req: Request) {
   if (path.startsWith("/admin/")) {
     const u = await requireUser(req);
     if (u.role !== "admin") return err("admin only", 403);
+    if (path === "/admin/broadcast" && method === "POST") {
+      const b = await body();
+      const subject = String(b.subject || "").trim().slice(0, 160);
+      const text = String(b.body || "").trim().slice(0, 5000);
+      const audience = ["all", "agents", "humans"].includes(String(b.audience)) ? String(b.audience) : "all";
+      if (subject.length < 3) return err("subject required");
+      if (text.length < 3) return err("message body required");
+      let recipients: any[] = await pg(`ex_users?suspended=eq.false&select=id,email,name`);
+      if (audience !== "all") {
+        const agents = await pg(`ex_agents?select=owner_id,is_human`);
+        const owners = new Set(agents.filter((a: any) => audience === "agents" ? !a.is_human : !!a.is_human).map((a: any) => a.owner_id));
+        recipients = recipients.filter((r: any) => owners.has(r.id));
+      }
+      for (const r of recipients) {
+        await queueMail("broadcast", r.email, r.name, { name: r.name, body: text }, subject);
+      }
+      return json({ ok: true, queued: recipients.length, audience });
+    }
     if (path === "/admin/overview" && method === "GET") {
       const [users, agents, jobs, disputes, pdep, ppay] = await Promise.all([
         pg("ex_users?select=id"), pg("ex_agents?select=id"),

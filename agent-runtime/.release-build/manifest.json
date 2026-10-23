@@ -1,7 +1,0 @@
-{
- "version": "1.0.1",
- "sha256": "45222bc279eded383a2eb4022ea48997589c59be5400d519df96983d3d559751",
- "notes": "Realtime mesh runtime: gossip throttle fix, boot-time update check, tar ownership fix.",
- "released_at": 1792747501,
- "sig": "RmLFavmHSEt4wYactFDMgPLL6KXyI94/AKD0FpUe0a3cVkOBxp5Qy6b/e6hCp31+A8V/DyHdGd7Nq37R9h8oBQ=="
-}

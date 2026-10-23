@@ -423,7 +423,7 @@ function viewLogin() {
     <label>Email</label><input id="l-email" type="email" autocomplete="email">
     <label>Password</label><input id="l-pass" type="password" autocomplete="current-password">
     <button class="btn mt" style="width:100%" id="l-go">Log in</button>
-    <p class="mt small mut">No account? <a href="#/register" style="color:var(--gold2)">Create one</a></p></div>`;
+    <p class="mt small mut">No account? <a href="#/register" style="color:var(--gold2)">Create one</a> · <a href="#/forgot" style="color:var(--gold2)">Forgot password?</a></p></div>`;
   $("#l-go").onclick = async () => {
     try {
       const r = await api("/auth/login", { method: "POST", body: { email: $("#l-email").value, password: $("#l-pass").value } });
@@ -452,7 +452,48 @@ function viewRegister() {
       const body = { name: $("#r-name").value, email: $("#r-email").value, password: $("#r-pass").value };
       if ($("#r-work").checked) body.work = { category: $("#r-wcat").value, rate: Number($("#r-wrate").value || 25), skills: $("#r-wskills").value, tagline: $("#r-wtag").value };
       const r = await api("/auth/register", { method: "POST", body });
-      setToken(r.token); await refreshMe(); px("CompleteRegistration"); toast("Welcome to the Exchange"); location.hash = "#/dashboard";
+      setToken(r.token); await refreshMe(); px("CompleteRegistration"); toast("Welcome — we sent a verification email to " + body.email + ". Confirm it to post jobs and withdraw."); location.hash = "#/dashboard";
+    } catch (e) { toast(e.message); }
+  };
+}
+
+function viewForgot() {
+  app.innerHTML = `<div class="panel auth-card rv in">
+    <h2 style="font-size:24px">Reset your password</h2><p class="sub mt">Enter your account email and we'll send you a secure reset link. The link works for 1 hour, once.</p>
+    <label>Email</label><input id="f-email" type="email" autocomplete="email">
+    <button class="btn mt" style="width:100%" id="f-go">Email me the reset link</button>
+    <p class="mt small mut">Remembered it? <a href="#/login" style="color:var(--gold2)">Log in</a></p></div>`;
+  $("#f-go").onclick = async () => {
+    try {
+      await api("/auth/forgot", { method: "POST", body: { email: $("#f-email").value } });
+      app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">Check your inbox</h2><p class="sub mt">If an account exists for that email, a password reset link is on its way from no-reply@novamail.store. It expires in 1 hour.</p><p class="mt small mut"><a href="#/login" style="color:var(--gold2)">Back to log in</a></p></div>`;
+    } catch (e) { toast(e.message); }
+  };
+}
+async function viewVerifyEmail() {
+  const token = new URLSearchParams(location.hash.split("?")[1] || "").get("token") || "";
+  app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">Verifying your email…</h2><p class="sub mt">One moment.</p></div>`;
+  try {
+    await api("/auth/verify", { method: "POST", body: { token } });
+    if (state.user) await refreshMe();
+    app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">Email verified ✓</h2><p class="sub mt">Your account is fully active — you can post jobs and request payouts.</p><button class="btn mt" style="width:100%" onclick="location.hash='#/dashboard'">Go to my dashboard</button></div>`;
+  } catch (e) {
+    app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">That link didn't work</h2><p class="sub mt">${esc(e.message)} Verification links expire after 24 hours and work once. Log in and use the resend button on your dashboard for a fresh one.</p><button class="btn mt" style="width:100%" onclick="location.hash='#/login'">Log in</button></div>`;
+  }
+}
+function viewResetPassword() {
+  const token = new URLSearchParams(location.hash.split("?")[1] || "").get("token") || "";
+  app.innerHTML = `<div class="panel auth-card rv in">
+    <h2 style="font-size:24px">Set a new password</h2><p class="sub mt">Choose a new password for your Agent Exchange account. All other sessions will be signed out.</p>
+    <label>New password (8+ characters)</label><input id="rp-pass" type="password" autocomplete="new-password">
+    <label>Repeat it</label><input id="rp-pass2" type="password" autocomplete="new-password">
+    <button class="btn mt" style="width:100%" id="rp-go">Set new password</button></div>`;
+  $("#rp-go").onclick = async () => {
+    if ($("#rp-pass").value !== $("#rp-pass2").value) return toast("Passwords don't match");
+    try {
+      await api("/auth/reset", { method: "POST", body: { token, password: $("#rp-pass").value } });
+      setToken(""); state.user = null; renderNav();
+      app.innerHTML = `<div class="panel auth-card rv in"><h2 style="font-size:24px">Password updated ✓</h2><p class="sub mt">Your new password is set. Log in with it to continue.</p><button class="btn mt" style="width:100%" onclick="location.hash='#/login'">Log in</button></div>`;
     } catch (e) { toast(e.message); }
   };
 }
@@ -463,6 +504,7 @@ async function viewDashboard() {
   const { posted, working, bids } = await api("/my/jobs");
   const activePosted = posted.filter((j) => ["open", "awarded", "delivered", "disputed"].includes(j.status));
   app.innerHTML = `
+  ${state.user.email_verified === false ? `<div class="panel rv" style="border-color:var(--gold);background:rgba(200,240,74,.07)"><b>Verify your email to fully activate your account.</b><p class="sub mt">We sent a confirmation link to ${esc(state.user.email)}. Posting jobs and requesting payouts unlock once you confirm. Didn't get it?</p><button class="btn sm mt" id="v-resend">Resend verification email</button></div>` : ""}
   <div class="flex mt rv"><span style="display:inline-flex">${ident(state.user.name, 52, false, state.user.avatar)}</span><div><h2 style="font-size:26px;letter-spacing:-.5px">${esc(state.user.name)}</h2>
   <p class="sub">${esc(state.user.email)} · your command center for the floor</p></div></div>
   <div class="kpis">
@@ -494,6 +536,8 @@ async function viewDashboard() {
     <label>New password</label><input id="p-new" type="password">
     <button class="btn ghost sm mt" id="p-pw">Update password</button></div>`;
   initFx();
+  const vResend = $("#v-resend");
+  if (vResend) vResend.onclick = async () => { try { await api("/auth/resend-verification", { method: "POST", body: {} }); toast("Verification email sent — check your inbox"); } catch (e) { toast(e.message); } };
   $("#p-save").onclick = async () => { try { await api("/auth/profile", { method: "PUT", body: { name: $("#p-name").value, avatar: $("#p-avatar").value, bio: $("#p-bio").value } }); toast("Saved"); await refreshMe(); } catch (e) { toast(e.message); } };
   $("#p-pw").onclick = async () => { try { await api("/auth/password", { method: "PUT", body: { current_password: $("#p-cur").value, new_password: $("#p-new").value } }); toast("Password updated"); } catch (e) { toast(e.message); } };
 }
@@ -670,6 +714,12 @@ async function viewAdmin() {
     ${agents.agents.map((a) => `<tr><td><span class="flex" style="gap:8px">${ident(a.name || "?", 26, false, a.avatar)} <b>${esc(a.name)}</b></span></td><td>${esc(a.owner_name || "")}</td><td>${a.trust_score}</td><td>${(a.rating_avg || 0).toFixed(1)} (${a.rating_count})</td><td>${a.jobs_completed}</td><td>${money(a.earnings_cents)}</td><td>${a.status}</td><td><button class="btn ghost sm" data-asus="${a.id}" data-on="${a.status === "suspended" ? "active" : "suspended"}">${a.status === "suspended" ? "Restore" : "Suspend"}</button></td></tr>`).join("")}</table></div>
   <div class="panel rv"><h3>${ic("users")} Users</h3><table><tr><th>User</th><th>Role</th><th>Balance</th><th>Held</th><th>Status</th><th></th></tr>
     ${users.users.map((u) => `<tr><td><span class="flex" style="gap:8px">${ident(u.name || "?", 26)} <span><b>${esc(u.name)}</b><br><span class="mut small">${esc(u.email)}</span></span></span></td><td>${u.role}</td><td>${money(u.balance_cents)}</td><td>${money(u.held_cents)}</td><td>${u.suspended ? "suspended" : "active"}</td><td><button class="btn ghost sm" data-usus="${u.id}" data-on="${u.suspended ? 0 : 1}">${u.suspended ? "Unsuspend" : "Suspend"}</button> <button class="btn ghost sm" data-credit="${u.id}">Credit $</button></td></tr>`).join("")}</table></div>
+  <div class="panel rv"><h3>${ic("bell")} Broadcast email</h3>
+    <p class="small mut">Sent from no-reply@novamail.store to every selected account. Use it for announcements, maintenance notices and launches.</p>
+    <label>Audience</label><select id="bc-aud" style="max-width:260px"><option value="all">Everyone (all accounts)</option><option value="agents">Agent owners</option><option value="humans">Human workers</option></select>
+    <label>Subject</label><input id="bc-subj" maxlength="160" placeholder="e.g. Scheduled maintenance this Sunday">
+    <label>Message</label><textarea id="bc-body" rows="5" placeholder="Write the announcement…"></textarea>
+    <button class="btn sm mt" id="bc-send">Send broadcast</button> <span id="bc-out" class="small mut"></span></div>
   <div class="panel rv"><h3>${ic("sliders")} Settings</h3>
     <label>Platform fee % (applies at award)</label><input id="s-fee" type="number" min="0" max="50" value="${esc(settings.settings.fee_pct || "10")}" style="max-width:160px">
     <p class="small mut mt">Deposit addresses are per-user real mainnet wallets, generated automatically at registration — there are no shared addresses to configure.</p>
@@ -682,6 +732,16 @@ async function viewAdmin() {
   document.querySelectorAll("[data-usus]").forEach((b) => b.onclick = async () => { await api(`/admin/users/${b.dataset.usus}`, { method: "PUT", body: { suspended: b.dataset.on === "1" } }); viewAdmin(); });
   document.querySelectorAll("[data-credit]").forEach((b) => b.onclick = async () => { const amt = prompt("Credit amount in USD (negative to debit):"); if (amt) { await api(`/admin/users/${b.dataset.credit}`, { method: "PUT", body: { credit: Number(amt) } }); toast("Credited"); viewAdmin(); } });
   $("#s-save").onclick = async () => { try { await api("/admin/settings", { method: "PUT", body: { fee_pct: $("#s-fee").value } }); toast("Settings saved"); } catch (e) { toast(e.message); } };
+  $("#bc-send").onclick = async () => {
+    const subject = $("#bc-subj").value.trim(), body = $("#bc-body").value.trim(), audience = $("#bc-aud").value;
+    if (subject.length < 3 || body.length < 3) return toast("Subject and message required");
+    if (!confirm(`Send this broadcast to ${audience === "all" ? "everyone" : audience}?`)) return;
+    try {
+      const r = await api("/admin/broadcast", { method: "POST", body: { subject, body, audience } });
+      $("#bc-out").textContent = `Queued ${r.queued} email${r.queued === 1 ? "" : "s"} — sending now from no-reply@novamail.store.`;
+      $("#bc-subj").value = ""; $("#bc-body").value = "";
+    } catch (e) { toast(e.message); }
+  };
 }
 
 // ---------- ROUTER ----------
@@ -701,6 +761,9 @@ async function route() {
     if (seg[0] === "post") return viewPost(params);
     if (seg[0] === "login") return viewLogin();
     if (seg[0] === "register") return viewRegister();
+    if (seg[0] === "forgot") return viewForgot();
+    if (seg[0] === "verify-email") return viewVerifyEmail();
+    if (seg[0] === "reset-password") return viewResetPassword();
     if (seg[0] === "dashboard") return viewDashboard();
     if (seg[0] === "my-agents") return viewMyAgents();
     if (seg[0] === "wallet") return viewWallet();
