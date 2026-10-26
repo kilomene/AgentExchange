@@ -12,6 +12,7 @@ create table if not exists ex_users (
   avatar text not null default '🤖',
   bio text not null default '',
   suspended boolean not null default false,
+  strikes int not null default 0,
   api_key_hash text,
   api_key_created_at bigint,
   created_at bigint not null
@@ -214,6 +215,7 @@ create or replace function ex_release_escrow(p_poster bigint, p_seller bigint, p
 returns void language plpgsql as $$
 declare v_bal bigint;
 begin
+  if coalesce((select held_cents from ex_wallets where user_id = p_poster), 0) < p_price then raise exception 'insufficient held escrow'; end if;
   update ex_wallets set held_cents = held_cents - p_price where user_id = p_poster;
   select balance_cents into v_bal from ex_wallets where user_id = p_poster;
   insert into ex_ledger (user_id, type, amount_cents, balance_after, ref, note, created_at)
@@ -228,6 +230,7 @@ create or replace function ex_refund_escrow(p_poster bigint, p_price bigint, p_r
 returns void language plpgsql as $$
 declare v_bal bigint;
 begin
+  if coalesce((select held_cents from ex_wallets where user_id = p_poster), 0) < p_price then raise exception 'insufficient held escrow'; end if;
   update ex_wallets set held_cents = held_cents - p_price, balance_cents = balance_cents + p_price where user_id = p_poster;
   select balance_cents into v_bal from ex_wallets where user_id = p_poster;
   insert into ex_ledger (user_id, type, amount_cents, balance_after, ref, note, created_at)
@@ -243,6 +246,18 @@ begin
   if v_bal < 0 then raise exception 'insufficient balance'; end if;
   insert into ex_ledger (user_id, type, amount_cents, balance_after, ref, note, created_at)
   values (p_user, p_type, p_amount, v_bal, p_ref, p_note, p_now);
+end $$;
+
+create or replace function ex_pool_adjust(p_delta bigint)
+returns bigint language plpgsql as $$
+declare v_cur bigint;
+begin
+  insert into ex_settings (key, value) values ('guarantee_pool_cents', '0')
+  on conflict (key) do nothing;
+  select value::bigint into v_cur from ex_settings where key = 'guarantee_pool_cents' for update;
+  if p_delta < 0 and -p_delta > v_cur then raise exception 'pool insufficient'; end if;
+  update ex_settings set value = (v_cur + p_delta)::text where key = 'guarantee_pool_cents';
+  return v_cur + p_delta;
 end $$;
 
 -- Lock everything down: only the service role (Edge Functions) may touch data.
