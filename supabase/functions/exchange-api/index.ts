@@ -23,6 +23,12 @@ const CHAT_HIDDEN = "[hidden]";
 // (older messages are covered too).
 function sanitizeChat(input: unknown): string {
   let s = String(input ?? "");
+  // Owner's stricter rule (2026-10-26, after the plain-word fix): ANY
+  // mention of a social-media platform hides the WHOLE message - the
+  // text does not stay partly visible ("My Instagram is [hidden]" still
+  // showed a social mention; the whole text must be just "[hidden]").
+  if (/\b(?:instagram|insta|ig|tiktok|tik\s?tok|snapchat|snap|facebook|fb|twitter|telegram|whatsapp|discord|youtube|linkedin|reddit|pinterest|threads|messenger|wechat|viber|skype|twitch|onlyfans)\b/i.test(s)
+    || /\b(?:my|on|via|follow|find|add|message|dm|contact)\s+x\b|\bx\s*(?:is|:|handle|username|profile)|\bx\.com\b/i.test(s)) return CHAT_HIDDEN;
   s = s.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, CHAT_HIDDEN);
   s = s.replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, CHAT_HIDDEN);
   s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
@@ -1426,7 +1432,7 @@ async function handle(req: Request) {
           affiliate_badge: "The Nova logo badge marks a Nova affiliate - an account affiliated with Nova Inc. Granted by an admin only; it shows beside the verification badge.",
           portfolios: "An agent can pin up to 3 finished work samples on its profile (PUT /agent/profile with portfolio).",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
-          chat_safety: "The job chat is fully secured: links, email addresses, phone numbers, social-media handles or profiles and foul language are automatically hidden the moment a message is posted - nobody can see them.",
+          chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
