@@ -301,7 +301,7 @@ async function queuePasswordChangedMail(user: { id: number; email: string; name:
 async function userContact(userId: number) {
   return await one(`ex_users?id=eq.${userId}&select=email,name`);
 }
-const fmtMoney = (c: number) => "$" + (Number(c || 0) / 100).toFixed(2);
+const fmtMoney = (c: number) => "$" + (Number(c || 0) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 function fmtDeadline(ts: number) {
   try { return new Date(ts * 1000).toLocaleString("en-US", { dateStyle: "full", timeStyle: "short", timeZone: "UTC" }) + " UTC"; } catch { return new Date(ts * 1000).toISOString(); }
 }
@@ -735,10 +735,21 @@ async function handle(req: Request) {
       await rpc("ex_hold_escrow", { p_user: job.poster_user_id, p_amount: bid.amount_cents, p_ref: `job:${job.id}`, p_note: `Escrow held at agreed price for job #${job.id}`, p_now: t });
     }
     await pg(`ex_bids?id=eq.${bid.id}`, { method: "PATCH", body: JSON.stringify({ status: "accepted" }) });
+    const loserBids = await pg(`ex_bids?job_id=eq.${job.id}&id=neq.${bid.id}&status=eq.active&select=agent_id,bidder_user_id`);
     await pg(`ex_bids?job_id=eq.${job.id}&id=neq.${bid.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
     const agent = await one(`ex_agents?id=eq.${bid.agent_id}&select=*`);
     await notify(bid.bidder_user_id, "award", `Your agent ${agent?.name} won "${job.title}" — $${(bid.amount_cents / 100).toFixed(2)} is in escrow. Deliver by the deadline.`, `#/job/${job.id}`);
     await queueLifecycleMail("job_awarded", bid.bidder_user_id, { agent_name: agent?.name || "Your agent", title: job.title, amount: fmtMoney(bid.amount_cents), deadline: fmtDeadline(updated[0].work_deadline), link: `${SITE_URL}/#/job/${job.id}` });
+    // EMAIL the bidders who were not picked (owner's order, 2026-10-26).
+    try {
+      const seenLosers = new Set<number>();
+      for (const lb of loserBids) {
+        if (seenLosers.has(lb.bidder_user_id)) continue;
+        seenLosers.add(lb.bidder_user_id);
+        const lAgent = await one(`ex_agents?id=eq.${lb.agent_id}&select=name`);
+        await queueLifecycleMail("bid_not_selected", lb.bidder_user_id, { agent_name: lAgent?.name || "Your agent", title: job.title, winner_name: agent?.name || "another agent", link: `${SITE_URL}/#/jobs` });
+      }
+    } catch (e) { console.error("bid_not_selected mail failed", e); }
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, deliver_via: `/agent/jobs/${job.id}/deliver` });
     await feed("awarded", `"${job.title}" awarded to ${agent?.name} for $${(bid.amount_cents / 100).toFixed(2)}`, job.id);
     return updated[0];
@@ -810,17 +821,30 @@ async function handle(req: Request) {
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.open`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "cancelled", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job is not open"), { status: 400 });
     await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${job.id}`, p_note: "Escrow refunded — job cancelled", p_now: t });
+    const openBids = await pg(`ex_bids?job_id=eq.${job.id}&status=eq.active&select=agent_id,bidder_user_id`);
     await pg(`ex_bids?job_id=eq.${job.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
+    // EMAIL every bidder whose bid just died with the job (2026-10-26).
+    try {
+      const seenOwners = new Set<number>();
+      for (const ob of openBids) {
+        if (seenOwners.has(ob.bidder_user_id)) continue;
+        seenOwners.add(ob.bidder_user_id);
+        const bAgent = await one(`ex_agents?id=eq.${ob.agent_id}&select=name`);
+        await queueLifecycleMail("job_cancelled", ob.bidder_user_id, { agent_name: bAgent?.name || "Your agent", title: job.title, link: `${SITE_URL}/#/jobs` });
+      }
+    } catch (e) { console.error("job_cancelled mail failed", e); }
     return updated[0];
   }
   async function disputeJob(job: any, reason: unknown) {
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(reason || "").slice(0, 1000), updated_at: now() }) });
     if (awardedOwner) await notify(awardedOwner, "dispute", `"${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
+    if (awardedOwner) await queueLifecycleMail("dispute_opened", awardedOwner, { title: job.title, reason: String(reason || "").slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
     const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`);
     if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title });
     const admins = await pg("ex_users?role=eq.admin&select=id");
     for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
+    for (const a of admins) await queueLifecycleMail("dispute_opened", a.id, { title: job.title, reason: String(reason || "").slice(0, 300), admin: true, link: `${SITE_URL}/#/admin` });
   }
   async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
     const text = String(rawText || "").trim();
@@ -847,6 +871,7 @@ async function handle(req: Request) {
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`);
     if (agent) {
       await notify(agent.owner_id, "review", `${agent.name} got a ${stars}-star review on "${job.title}"`, `#/agent/${job.awarded_agent_id}`);
+      await queueLifecycleMail("review_received", agent.owner_id, { agent_name: agent.name, stars, review: String(b.body || "").slice(0, 600), rating_avg: avg, title: job.title, link: `${SITE_URL}/#/agent/${job.awarded_agent_id}` });
       await feed("review", `${agent.name} earned ${stars} stars on "${job.title}"`, job.id);
     }
     return { rating_avg: avg, rating_count: all.length };
@@ -1499,13 +1524,18 @@ async function handle(req: Request) {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "refunded", updated_at: t }) });
         await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents, p_ref: `job:${id}`, p_note: "Dispute resolved for poster — escrow refunded", p_now: t });
         await notify(job.poster_user_id, "dispute", `Dispute on "${job.title}" resolved in your favor — escrow refunded`, `#/job/${id}`);
+        const posterWalletRes = await walletOf(job.poster_user_id).catch(() => null);
+        await queueLifecycleMail("dispute_resolved", job.poster_user_id, { title: job.title, summary: "The dispute was resolved in your favor — the escrow has been refunded to your wallet.", amount_label: "Amount refunded", amount: fmtMoney(job.agreed_cents), wallet_after: fmtMoney(posterWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` });
         if (agent) await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" resolved for the poster`, `#/job/${id}`);
+        if (agent) await queueLifecycleMail("dispute_resolved", agent.owner_id, { title: job.title, summary: "The dispute was resolved for the poster — the escrow was refunded to the poster and no payment was released for this job.", link: `${SITE_URL}/#/job/${id}` });
       } else if (b.resolution === "agent") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "completed", updated_at: t }) });
         await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${id}`, p_now: t });
         await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
         await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" resolved in your favor — payment released`, `#/job/${id}`);
+        if (agent) { const sellerWalletRes = await walletOf(agent.owner_id).catch(() => null); await queueLifecycleMail("dispute_resolved", agent.owner_id, { title: job.title, summary: "The dispute was resolved in your favor — the payment has been released to your wallet.", amount_label: "Amount received", amount: fmtMoney(job.agreed_cents - job.fee_cents), wallet_after: fmtMoney(sellerWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` }); }
         await notify(job.poster_user_id, "dispute", `Dispute on "${job.title}" resolved for the agent`, `#/job/${id}`);
+        await queueLifecycleMail("dispute_resolved", job.poster_user_id, { title: job.title, summary: "The dispute was resolved for the agent — the escrow payment was released to the agent.", link: `${SITE_URL}/#/job/${id}` });
       } else return err("resolution must be 'poster' or 'agent'");
       return json({ ok: true });
     }
