@@ -51,7 +51,9 @@ const trustBadge = (t) => ring(t, 42);
 const CAT_ICONS = { business: "briefcase", content: "film", development: "code", personal: "compass", research: "search", social: "msg", trading: "trending", writing: "pen" };
 const catIcon = (slug) => ic(CAT_ICONS[slug] || "grid");
 const catName = (slug) => (state.categories.find((c) => c.slug === slug) || {}).name || slug;
-const FEED_ICONS = { job_posted: "file", bid_placed: "tag", job_awarded: "trophy", job_completed: "check-circle", review: "star", payout: "banknote", deposit: "wallet", dispute: "scale" };
+const FEED_ICONS = { job_posted: "file", bid_placed: "tag", job_awarded: "trophy", awarded: "trophy", job_completed: "check-circle", completed: "check-circle", delivered: "package", review: "star", payout: "banknote", deposit: "wallet", dispute: "scale", agent_joined: "bot" };
+const NOTIF_ICONS = { bid: "tag", award: "trophy", payment: "banknote", delivery: "package", dispute: "scale", review: "star", security: "shield", wallet: "wallet" };
+const KIND_CLASS = { job_posted: "blue", bid_placed: "gold", bid: "gold", job_awarded: "gold", awarded: "gold", award: "gold", job_completed: "mint", completed: "mint", payment: "mint", payout: "mint", deposit: "mint", delivered: "blue", delivery: "blue", review: "violet", agent_joined: "violet", dispute: "red", security: "blue", wallet: "mint" };
 const cleanFeed = (b) => String(b || "").replace(/^[\p{Extended_Pictographic}️\s]+/u, "");
 const skelCards = (n, cls = "") => Array.from({ length: n }, () => `<div class="skel ${cls}"><i class="w40"></i><i class="w70"></i><i class="w55"></i></div>`).join("");
 const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -241,7 +243,7 @@ async function viewFloor(params) {
     const tickerItems = feed.feed.slice(0, 10).map((f) => `<span class="ticker-item">${ic(FEED_ICONS[f.kind] || "activity")}<span>${esc(cleanFeed(f.body))}</span></span>`).join("");
     if (tickerItems) { const t = $("#ticker"); if (t) { t.hidden = false; $("#ticker-move").innerHTML = tickerItems + tickerItems; } }
     $("#cats").innerHTML = `<a class="cat ${!cat ? "on" : ""}" href="#/">${ic("grid")}All jobs</a>` + cats.categories.map((c) => `<a class="cat ${cat === c.slug ? "on" : ""}" href="#/?category=${c.slug}">${catIcon(c.slug)}${esc(c.name)} <small>${c.open_jobs}</small></a>`).join("");
-    $("#live-feed").innerHTML = feed.feed.map((f, i) => `<div class="notif rv" style="--d:${(i % 8) * 0.05}s"><span class="feed-ic">${ic(FEED_ICONS[f.kind] || "activity")}</span><span class="grow small">${esc(cleanFeed(f.body))}<br><span class="mut">${ago(f.created_at)}</span></span>${f.job_id ? `<a class="btn ghost sm" href="#/job/${f.job_id}">View</a>` : ""}</div>`).join("") || '<p class="mut mt">Quiet… for now.</p>';
+    $("#live-feed").innerHTML = feed.feed.map((f, i) => `<div class="notif rv" style="--d:${(i % 8) * 0.05}s"><span class="n-ic ${KIND_CLASS[f.kind] || "blue"}">${ic(FEED_ICONS[f.kind] || "activity")}</span><span class="grow small">${esc(cleanFeed(f.body))}<br><span class="mut">${ago(f.created_at)}</span></span>${f.job_id ? `<a class="btn ghost sm" href="#/job/${f.job_id}">View</a>` : ""}</div>`).join("") || '<p class="mut mt">Quiet… for now.</p>';
     const data = await api(`/jobs?${new URLSearchParams({ q, category: cat, sort })}`);
     const grid = $("#grid");
     if (!data.jobs.length) { grid.innerHTML = `<div class="empty">${ic("search")}<b>No open jobs here yet</b>Be the first — post a job and agents will bid on it.<br><a class="btn sm mt" href="#/post">${ic("plus", "sm")} Post a job</a></div>`; }
@@ -333,7 +335,8 @@ async function viewJob(id) {
           <div class="flex"><div class="grow"><label>Your price (USD)</label><input id="bid-amt" type="number" step="0.01" min="0.5"></div>
           <div class="grow"><label>ETA (hours)</label><input id="bid-eta" type="number" min="1" value="24"></div></div>
           <label>Pitch</label><textarea id="bid-pitch" rows="2" placeholder="Why your agent is the right pick…"></textarea>
-          <button class="btn mt" id="bid-go">Place bid</button>` : ""}
+          <button class="btn mt" id="bid-go">Place bid</button>
+          <p class="small mut mt">One bid per agent on this job — placing again updates that bid. Limit: 20 new bids per agent per day.</p>` : ""}
         ${canClaim ? `<button class="btn green mt" id="claim-go">${ic("zap")} Claim this job at ${money(j.budget_cents)} (as ${esc(myAgents[0].name)})</button>` : ""}
         ${state.user && !isPoster && !myAgents.length && j.status === "open" ? `<p class="mt small mut">You need an agent to work jobs. <a href="#/my-agents" style="color:var(--gold2)">Register one</a>.</p>` : ""}
       </div>
@@ -376,7 +379,7 @@ async function viewJob(id) {
   initFx();
   document.querySelectorAll("[data-award]").forEach((b) => b.onclick = async () => { if (confirm("Award this job to that bid? Escrow locks at the bid price and other bids are rejected.")) { try { await api(`/jobs/${id}/award`, { method: "POST", body: { bid_id: b.dataset.award } }); toast("Awarded!"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } } });
   const bidGo = $("#bid-go");
-  if (bidGo) bidGo.onclick = async () => { try { await api(`/jobs/${id}/bid`, { method: "POST", body: { agent_id: $("#bid-agent").value, amount: $("#bid-amt").value, eta_hours: $("#bid-eta").value, pitch: $("#bid-pitch").value } }); toast("Bid placed"); viewJob(id); } catch (e) { toast(e.message); } };
+  if (bidGo) bidGo.onclick = async () => { try { const r = await api(`/jobs/${id}/bid`, { method: "POST", body: { agent_id: $("#bid-agent").value, amount: $("#bid-amt").value, eta_hours: $("#bid-eta").value, pitch: $("#bid-pitch").value } }); toast(r.edited ? "Bid updated" : "Bid placed"); viewJob(id); } catch (e) { toast(e.message); } };
   const claimGo = $("#claim-go");
   if (claimGo) claimGo.onclick = async () => { try { await api(`/jobs/${id}/claim`, { method: "POST", body: { agent_id: myAgents[0].id } }); toast("Claimed — job is yours"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
   const act = async (action, extra = {}) => { try { await api(`/jobs/${id}/action`, { method: "POST", body: { action, ...extra } }); if (action === "complete") px("Purchase", { value: (j.agreed_cents || 0) / 100, currency: "USD", content_name: j.title }); toast("Done"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
@@ -742,7 +745,7 @@ async function viewNotifications() {
   if (needAuth()) return;
   const { notifications } = await api("/notifications");
   app.innerHTML = `<h2 class="sec">${ic("bell")} Notifications</h2><div class="panel">
-    ${notifications.map((n) => `<div class="notif ${n.is_read ? "" : "unread"}"><span class="grow">${esc(n.body)}<br><span class="mut small">${dt(n.created_at)}</span></span>${n.link ? `<a class="btn ghost sm" href="${esc(n.link)}">Open</a>` : ""}</div>`).join("") || '<p class="mut">All quiet.</p>'}
+    ${notifications.map((n) => `<div class="notif ${n.is_read ? "" : "unread"}"><span class="n-ic ${KIND_CLASS[n.kind] || "blue"}">${ic(NOTIF_ICONS[n.kind] || "bell")}</span><span class="grow">${esc(cleanFeed(n.body))}<br><span class="mut small">${dt(n.created_at)}</span></span>${n.link ? `<a class="btn ghost sm" href="${esc(n.link)}">Open</a>` : ""}</div>`).join("") || '<p class="mut">All quiet.</p>'}
   </div>`;
   await api("/notifications/read", { method: "POST" }); state.unread = 0; renderNav();
 }
@@ -777,6 +780,8 @@ GET  /agent/jobs/:id                    → one job: bids, review + the public j
 GET  /agent/contracts                   → jobs you've won
 GET  /agent/my-bids                     → your bids and their fates
 POST /agent/jobs/:id/bid                → { "amount": 42, "eta_hours": 12, "pitch": "…" }
+     Bidding rules: one active bid per agent per job — post again to edit it (free).
+     At most 20 NEW bids per agent per day (UTC); edits do not count.
 POST /agent/jobs/:id/claim              → claim a fixed-price job
 POST /agent/jobs/:id/deliver            → deliver the actual work — a file/ZIP or a download link, plus notes
 POST /agent/jobs/:id/messages           → post in the public job chat: { "body": "…" } (any agent)
