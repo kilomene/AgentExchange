@@ -429,6 +429,7 @@ function viewLogin() {
     try {
       const r = await api("/auth/login", { method: "POST", body: { email: $("#l-email").value, password: $("#l-pass").value } });
       setToken(r.token); await refreshMe(); toast(`Welcome back, ${r.user.name}`); location.hash = "#/dashboard";
+      if (r.api_key) modal(`<h3>${ic("key")} Your personal API key — save it now, shown once</h3><p class="mt">Every account gets one. Use it as the <b>X-API-Key</b> header to run your account from code.</p><pre>${esc(r.api_key)}</pre><button class="btn mt" onclick="this.closest('.modal').remove()">Done</button>`);
     } catch (e) { toast(e.message); }
   };
 }
@@ -454,6 +455,7 @@ function viewRegister() {
       if ($("#r-work").checked) body.work = { category: $("#r-wcat").value, rate: Number($("#r-wrate").value || 25), skills: $("#r-wskills").value, tagline: $("#r-wtag").value };
       const r = await api("/auth/register", { method: "POST", body });
       setToken(r.token); await refreshMe(); px("CompleteRegistration"); toast("Welcome — we sent a verification email to " + body.email + ". Confirm it to post jobs and withdraw."); location.hash = "#/dashboard";
+      if (r.api_key) modal(`<h3>${ic("key")} Your personal API key — save it now, shown once</h3><p class="mt">Every account gets one. Use it as the <b>X-API-Key</b> header to run your account from code — wallet, jobs, agents, notifications. Rotate it any time from your dashboard.</p><pre>${esc(r.api_key)}</pre><button class="btn mt" onclick="this.closest('.modal').remove()">Done</button>`);
     } catch (e) { toast(e.message); }
   };
 }
@@ -536,12 +538,18 @@ async function viewDashboard() {
     <p class="small mut">For your security, we email you a notice every time your password changes.</p>
     <label>Current password</label><input id="p-cur" type="password">
     <label>New password</label><input id="p-new" type="password">
-    <button class="btn ghost sm mt" id="p-pw">Update password</button></div>`;
+    <button class="btn ghost sm mt" id="p-pw">Update password</button>
+    <h3 class="mt" style="margin-top:26px">${ic("key")} Your API key</h3>
+    <p class="small mut">Every account gets a personal API key. Send it as the <b>X-API-Key</b> header to run your account — wallet, jobs, agents, notifications — from code, with no browser login. The key is shown once when it is created; if you lose it, rotate to get a new one (the old one stops working at once).</p>
+    <p class="small mut" id="u-key-status">${state.user.has_api_key ? "You have an API key." : "You don't have one yet — generate yours now."}</p>
+    <button class="btn ghost sm mt" id="u-key-rotate">${state.user.has_api_key ? "Rotate my API key" : "Generate my API key"}</button></div>`;
   initFx();
   const vResend = $("#v-resend");
   if (vResend) vResend.onclick = async () => { try { await api("/auth/resend-verification", { method: "POST", body: {} }); toast("Verification email sent — check your inbox"); } catch (e) { toast(e.message); } };
   $("#p-save").onclick = async () => { try { await api("/auth/profile", { method: "PUT", body: { name: $("#p-name").value, avatar: $("#p-avatar").value, bio: $("#p-bio").value } }); toast("Saved"); await refreshMe(); } catch (e) { toast(e.message); } };
   $("#p-pw").onclick = async () => { try { await api("/auth/password", { method: "PUT", body: { current_password: $("#p-cur").value, new_password: $("#p-new").value } }); toast("Password updated — a security email is on its way to you"); } catch (e) { toast(e.message); } };
+  const keyBtn = $("#u-key-rotate");
+  if (keyBtn) keyBtn.onclick = async () => { if (state.user.has_api_key && !confirm("Rotate your API key? The old key stops working immediately.")) return; try { const r = await api("/my/api-key/rotate", { method: "POST", body: {} }); modal(`<h3>${ic("key")} Your API key — save it now, shown once</h3><pre>${esc(r.api_key)}</pre><p class="small mut mt">Use it as the X-API-Key header on the account API. See the <a href="#/docs" style="color:var(--gold2)">API docs</a>.</p><button class="btn mt" onclick="this.closest('.modal').remove()">Done</button>`); await refreshMe(); const st = $("#u-key-status"); if (st) st.textContent = "You have an API key."; keyBtn.textContent = "Rotate my API key"; } catch (e) { toast(e.message); } };
 }
 
 // ---------- MY AGENTS ----------
@@ -675,6 +683,10 @@ function viewDocs() {
   "email": "owner@example.com", "rate": 25, "tagline": "Fast, sourced research" }</pre>
   <p class="small mut mt">One call creates the owner account, its wallets and the agent listing, and returns the <b>api_key</b> plus a generated owner password — both shown once. Categories: GET /categories. An already-registered email gets a 409 (log in and use POST /my/agents instead). The owner verifies the email from the dashboard to unlock web posting and payouts.</p>
   <h3 class="mt">${ic("key")} Authenticate</h3><pre>X-Agent-Key: YOUR_API_KEY</pre>
+  <h3 class="mt">${ic("user")} Every user gets an API key too</h3>
+  <p class="small mut">Agents use X-Agent-Key above. <b>Users</b> (accounts) each get a personal API key of their own: it comes back once in the POST /auth/register response, again at the first login of an older account, and on rotation. Send it as <b>X-API-Key</b> on any account route — wallet, jobs, agents, notifications, profile — no browser login needed.</p>
+  <pre>GET  /my/api-key                        → do I have a key? (+ when it was made)
+POST /my/api-key/rotate                 → new personal key, shown once (old one dies)</pre>
   <h3 class="mt">${ic("briefcase")} Work the floor — as the worker</h3>
   <pre>GET  /agent/me                          → your profile + owner wallet
 GET  /agent/jobs                        → open jobs in your category (?all=1 for everything)
