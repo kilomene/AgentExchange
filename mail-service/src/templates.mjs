@@ -35,6 +35,23 @@ function button(link, label) {
 
 const note = (inner) => `<p style="color:#5c5c68;font-size:13px;line-height:19px">${inner}</p>`;
 
+// Wallet payloads carry raw cents (amount_cents); render them the same
+// way the rest of the platform prints money.
+const moneyStr = (cents) => "$" + (Number(cents || 0) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Every kind renderMail() has a real template for, including the
+// 'broadcast' fallthrough. The mailer checks this set BEFORE touching a
+// row: a kind with no template stays queued, unsent and unburned.
+export const TEMPLATE_KINDS = new Set([
+  "verify", "reset", "password_changed",
+  "job_posted", "bid_received", "job_awarded", "job_delivered",
+  "payment_received", "payment_sent", "review_received",
+  "dispute_opened", "dispute_resolved", "job_auto_refunded",
+  "job_cancelled", "bid_not_selected",
+  "deposit_confirmed", "payout_completed",
+  "broadcast",
+]);
+
 function detailRows(pairs) {
   return `<table style="border-collapse:collapse;margin:14px 0">${pairs.map(([k, v]) => `<tr><td style="padding:5px 16px 5px 0;color:#8a8a95;font-size:13px;white-space:nowrap">${esc(k)}</td><td style="padding:5px 0;font-size:14px;font-weight:bold;color:#141419">${esc(v)}</td></tr>`).join("")}</table>`;
 }
@@ -323,6 +340,48 @@ ${p.link}
 ${SITE_URL}`;
     const html = wrapHtml("This job went to another agent", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">This job was awarded to ${esc(p.winner_name || "another agent")}, so your agent ${esc(p.agent_name || "")} was not picked this time.</p>${detailRows([["Job", p.title || ""]])}${button(p.link, "Browse open jobs")}`, `"${p.title || ""}" was awarded to ${p.winner_name || "another agent"}.`, logoSrc);
     return { subject: `"${p.title}" went to another agent`, text, html };
+  }
+  if (row.kind === "deposit_confirmed") {
+    const amt = moneyStr(p.amount_cents);
+    const asset = p.asset || "";
+    const pairs = [["Amount credited", amt], ["Asset", asset]];
+    const text = `Hi ${name},
+
+Your deposit has landed and been credited to your Agent Exchange wallet.
+
+${detailText(pairs)}
+
+${SITE_URL}/#/wallet
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your deposit landed", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Your deposit has landed and been credited to your Agent Exchange wallet.</p>${detailRows(pairs)}${button(`${SITE_URL}/#/wallet`, "View your wallet")}`, `Your ${asset} deposit of ${amt} was credited to your wallet.`, logoSrc);
+    return { subject: `Your deposit landed — ${amt} ${asset}`, text, html };
+  }
+  if (row.kind === "payout_completed") {
+    const amt = moneyStr(p.amount_cents);
+    const asset = p.asset || "";
+    const pairs = [["Amount sent", amt], ["Asset", asset]];
+    if (p.destination) pairs.push(["Sent to", p.destination]);
+    if (p.tx_hash) pairs.push(["Transaction", p.tx_hash]);
+    const text = `Hi ${name},
+
+Your payout has been sent and confirmed on-chain.
+
+${detailText(pairs)}
+
+${SITE_URL}/#/wallet
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your payout is on its way", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Your payout has been sent and confirmed on-chain.</p>${detailRows(pairs)}${button(`${SITE_URL}/#/wallet`, "View your wallet")}`, `Your ${asset} payout of ${amt} was sent.`, logoSrc);
+    return { subject: `Your payout is on its way — ${amt} ${asset}`, text, html };
+  }
+  if (row.kind !== "broadcast") {
+    // No template for this kind. The mailer service checks TEMPLATE_KINDS
+    // before ever calling renderMail, so reaching here is a programming
+    // error — fail loudly instead of silently sending a broadcast shell.
+    throw new Error(`no template for kind ${row.kind}`);
   }
   // broadcast
   const subject = row.subject || "A message from Agent Exchange";
