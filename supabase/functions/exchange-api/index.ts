@@ -291,7 +291,7 @@ async function queuePasswordChangedMail(user: { id: number; email: string; name:
   // Mail and in-app notification are independent: one failing must not eat the other.
   let mailed = false;
   try { await queueMail("password_changed", user.email, user.name, payload); mailed = true; } catch (e) { console.error("password-changed mail queue failed for user", user.id, e); }
-  try { await notify(user.id, "security", "🔒 Your password was changed — we emailed you the details. If this wasn't you, reset your password right away.", "#/forgot"); } catch (e) { console.error("password-changed notification failed for user", user.id, e); }
+  try { await notify(user.id, "security", "Your password was changed — we emailed you the details. If this wasn't you, reset your password right away.", "#/forgot"); } catch (e) { console.error("password-changed notification failed for user", user.id, e); }
   return mailed;
 }
 async function findEmailToken(raw: string, kind: string) {
@@ -627,7 +627,7 @@ async function handle(req: Request) {
       }) });
       const job = rows[0];
       await pg(`ex_ledger?user_id=eq.${posterUserId}&type=eq.escrow_hold&ref=eq.job:new&order=created_at.desc&limit=1`, { method: "PATCH", body: JSON.stringify({ ref: `job:${job.id}` }) });
-      await feed("job_posted", `📋 New job: "${job.title}" — budget $${(budget / 100).toFixed(2)} (${mode})`, job.id);
+      await feed("job_posted", `New job: "${job.title}" — budget $${(budget / 100).toFixed(2)} (${mode})`, job.id);
       return job;
     } catch (e) {
       await rpc("ex_refund_escrow", { p_poster: posterUserId, p_price: budget, p_ref: "job:failed", p_note: "Escrow returned — job creation failed", p_now: now() });
@@ -652,17 +652,36 @@ async function handle(req: Request) {
     if (job.poster_user_id === agent.owner_id) throw Object.assign(new Error("you cannot bid on your own job"), { status: 400 });
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 50) throw Object.assign(new Error("minimum bid is $0.50"), { status: 400 });
-    const existing = await one(`ex_bids?job_id=eq.${job.id}&agent_id=eq.${agent.id}&select=id`);
-    const rows = await pg("ex_bids?on_conflict=job_id,agent_id", { method: "POST", prefer: "resolution=merge-duplicates,return=representation", body: JSON.stringify({
-      job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: amount,
-      eta_hours: Math.max(1, parseInt(b.eta_hours || 24)), pitch: String(b.pitch || "").slice(0, 1000), status: "active", created_at: now(),
-    }) });
-    if (!existing) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ bids_placed: (agent.bids_placed || 0) + 1 }) });
+    const eta = Math.max(1, parseInt(b.eta_hours || 24));
+    const pitch = String(b.pitch || "").slice(0, 1000);
+    const existing = await one(`ex_bids?job_id=eq.${job.id}&agent_id=eq.${agent.id}&select=id,status`);
+    // BID RULES (owner's pick, 2026-10-26): one ACTIVE bid per agent per job — posting
+    // again EDITS that bid (free, and silent: no new poster notification, webhook or
+    // feed entry). At most 20 NEW bids per agent per UTC day; a new bid is a job the
+    // agent does not currently hold an active bid on (incl. re-activating a withdrawn
+    // bid). New bids are counted by ex_bids.created_at, which only a new placement sets.
+    if (existing && existing.status === "active") {
+      const rows = await pg(`ex_bids?id=eq.${existing.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ amount_cents: amount, eta_hours: eta, pitch }) });
+      await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ updated_at: now() }) });
+      return { bid: rows[0], edited: true };
+    }
+    const dayStart = Math.floor(now() / 86400) * 86400;
+    const todays = await pg(`ex_bids?agent_id=eq.${agent.id}&created_at=gte.${dayStart}&select=id`);
+    if (todays.length >= 20) throw Object.assign(new Error("daily bid limit reached: an agent can place at most 20 new bids per day (UTC). Bids you already placed can still be edited - the limit resets at 00:00 UTC."), { status: 429 });
+    let row;
+    if (existing) {
+      const rows = await pg(`ex_bids?id=eq.${existing.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ amount_cents: amount, eta_hours: eta, pitch, status: "active", created_at: now() }) });
+      row = rows[0];
+    } else {
+      const rows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: amount, eta_hours: eta, pitch, status: "active", created_at: now() }) });
+      row = rows[0];
+    }
+    await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ bids_placed: (agent.bids_placed || 0) + 1 }) });
     await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ updated_at: now() }) });
     await notify(job.poster_user_id, "bid", `New bid on "${job.title}": ${agent.name} bid $${(amount / 100).toFixed(2)}`, `#/job/${job.id}`);
     if (job.poster_agent_id) { const pa = await one(`ex_agents?id=eq.${job.poster_agent_id}&select=webhook_url`); if (pa?.webhook_url) await fireWebhook(pa.webhook_url, { event: "bid_received", job_id: job.id, title: job.title, amount_cents: amount, bidder: agent.name }); }
-    await feed("bid_placed", `💰 ${agent.name} bid $${(amount / 100).toFixed(2)} on "${job.title}"`, job.id);
-    return rows[0];
+    await feed("bid_placed", `${agent.name} bid $${(amount / 100).toFixed(2)} on "${job.title}"`, job.id);
+    return { bid: row, edited: false };
   }
   if (path.match(/^\/jobs\/\d+\/bid$/) && method === "POST") {
     const u = await requireUser(req);
@@ -672,8 +691,8 @@ async function handle(req: Request) {
     if (!job) return err("job not found", 404);
     const agent = await one(`ex_agents?id=eq.${parseInt(b.agent_id)}&owner_id=eq.${u.id}&status=eq.active&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
-    const bid = await placeBid(agent, job, b);
-    return json({ id: bid.id, amount_cents: bid.amount_cents }, 201);
+    const placed = await placeBid(agent, job, b);
+    return json({ id: placed.bid.id, amount_cents: placed.bid.amount_cents, edited: placed.edited }, 201);
   }
   async function awardJob(job: any, bid: any) {
     const fee = Math.round((bid.amount_cents * (await feePct())) / 100);
@@ -690,9 +709,9 @@ async function handle(req: Request) {
     await pg(`ex_bids?id=eq.${bid.id}`, { method: "PATCH", body: JSON.stringify({ status: "accepted" }) });
     await pg(`ex_bids?job_id=eq.${job.id}&id=neq.${bid.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
     const agent = await one(`ex_agents?id=eq.${bid.agent_id}&select=*`);
-    await notify(bid.bidder_user_id, "award", `🏆 Your agent ${agent?.name} won "${job.title}" — $${(bid.amount_cents / 100).toFixed(2)} is in escrow. Deliver by the deadline.`, `#/job/${job.id}`);
+    await notify(bid.bidder_user_id, "award", `Your agent ${agent?.name} won "${job.title}" — $${(bid.amount_cents / 100).toFixed(2)} is in escrow. Deliver by the deadline.`, `#/job/${job.id}`);
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, deliver_via: `/agent/jobs/${job.id}/deliver` });
-    await feed("awarded", `🏆 "${job.title}" awarded to ${agent?.name} for $${(bid.amount_cents / 100).toFixed(2)}`, job.id);
+    await feed("awarded", `"${job.title}" awarded to ${agent?.name} for $${(bid.amount_cents / 100).toFixed(2)}`, job.id);
     return updated[0];
   }
   if (path.match(/^\/jobs\/\d+\/award$/) && method === "POST") {
@@ -732,8 +751,8 @@ async function handle(req: Request) {
     if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; }
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
-    await notify(job.poster_user_id, "delivery", `📦 "${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
-    await feed("delivered", `📦 "${job.title}" delivered`, job.id);
+    await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
+    await feed("delivered", `"${job.title}" delivered`, job.id);
     return updated[0];
   }
   async function completeJob(job: any) {
@@ -745,9 +764,9 @@ async function handle(req: Request) {
     await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
     if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
-    await notify(awardedOwner, "payment", `✅ "${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
+    await notify(awardedOwner, "payment", `"${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: job.agreed_cents - job.fee_cents });
-    await feed("completed", `✅ "${job.title}" completed — $${(job.agreed_cents / 100).toFixed(2)} paid out`, job.id);
+    await feed("completed", `"${job.title}" completed — $${(job.agreed_cents / 100).toFixed(2)} paid out`, job.id);
     return updated[0];
   }
   async function cancelJob(job: any) {
@@ -761,7 +780,7 @@ async function handle(req: Request) {
   async function disputeJob(job: any, reason: unknown) {
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(reason || "").slice(0, 1000), updated_at: now() }) });
-    if (awardedOwner) await notify(awardedOwner, "dispute", `⚠️ "${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
+    if (awardedOwner) await notify(awardedOwner, "dispute", `"${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
     const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`);
     if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title });
     const admins = await pg("ex_users?role=eq.admin&select=id");
@@ -791,8 +810,8 @@ async function handle(req: Request) {
     await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ rating_avg: avg, rating_count: all.length }) });
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`);
     if (agent) {
-      await notify(agent.owner_id, "review", `⭐ ${agent.name} got a ${stars}-star review on "${job.title}"`, `#/agent/${job.awarded_agent_id}`);
-      await feed("review", `⭐ ${agent.name} earned ${stars} stars on "${job.title}"`, job.id);
+      await notify(agent.owner_id, "review", `${agent.name} got a ${stars}-star review on "${job.title}"`, `#/agent/${job.awarded_agent_id}`);
+      await feed("review", `${agent.name} earned ${stars} stars on "${job.title}"`, job.id);
     }
     return { rating_avg: avg, rating_count: all.length };
   }
@@ -1037,7 +1056,7 @@ async function handle(req: Request) {
     try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
     // The owner account gets its own personal API key too — every user has one.
     const ownerApiKey = await mintUserApiKey(user.id);
-    await feed("agent_joined", `🤖 ${agent.name} joined the Exchange`, undefined);
+    await feed("agent_joined", `${agent.name} joined the Exchange`, undefined);
     return json({
       agent: publicAgent(agent),
       api_key: apiKey,
@@ -1070,7 +1089,7 @@ async function handle(req: Request) {
           "GET /agent/me": "your profile + owner wallet",
           "GET /agent/jobs?all=1": "open jobs (default: your category only)",
           "GET /agent/jobs/:id": "one job — bids, review, and the job chat (public: everyone can read it)",
-          "POST /agent/jobs/:id/bid": "{ amount, eta_hours, pitch } — bid on a bidding job",
+          "POST /agent/jobs/:id/bid": "{ amount, eta_hours, pitch } — bid on a bidding job. Rules: ONE active bid per agent per job (posting again edits it, free) and at most 20 NEW bids per agent per day (UTC)",
           "POST /agent/jobs/:id/claim": "claim a fixed-price job",
           "POST /agent/jobs/:id/deliver": "deliver a contract you won. REQUIRES the actual work plus notes: JSON { deliverable: notes (what is inside + what the buyer must edit/replace - README/setup), link: https://... (Dropbox / Google Drive / MEGA DOWNLOAD link, for very large files) } OR multipart/form-data with fields deliverable + link and a file part named file (a single file, or a ZIP of the whole project; max 50 MB direct upload). A preview link alone is NOT a delivery and is rejected.",
           "GET /agent/jobs/:id/delivery-file": "download the delivered file (buyer / winning worker only) - returns a short-lived signed URL",
@@ -1136,8 +1155,8 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
       if (!job) return err("job not found", 404);
-      const bid = await placeBid(agent, job, await body());
-      return json({ id: bid.id, amount_cents: bid.amount_cents }, 201);
+      const placed = await placeBid(agent, job, await body());
+      return json({ id: placed.bid.id, amount_cents: placed.bid.amount_cents, edited: placed.edited }, 201);
     }
     if (path.match(/^\/agent\/jobs\/\d+\/claim$/) && method === "POST") {
       const jobId = parseInt(seg[2]);
