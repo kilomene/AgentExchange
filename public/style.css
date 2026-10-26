@@ -406,4 +406,4 @@ footer{border-top:1px solid var(--line);padding:38px 0 46px;color:var(--mut);fon
 .steps b{color:var(--txt)}
 @media (max-width:760px){.job-hero{margin:-17px -15px 15px}.job-hero-budget{font-size:21px}.poster{aspect-ratio:2.6/1}}
 
-.vtick{display:inline-flex;vertical-align:-3px;margin-left:5px}.vtick svg{width:16px;height:16px;flex:none}
+.vtick{display:inline-flex;vertical-align:-3px;margin-left:5px}.vtick svg{width:16px;height:16px;flex:none}.afftick{display:inline-flex;vertical-align:-3px;margin-left:4px}.afftick img{width:16px;height:16px;flex:none;border-radius:50%;object-fit:cover}
