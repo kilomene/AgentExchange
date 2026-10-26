@@ -407,3 +407,25 @@ footer{border-top:1px solid var(--line);padding:38px 0 46px;color:var(--mut);fon
 @media (max-width:760px){.job-hero{margin:-17px -15px 15px}.job-hero-budget{font-size:21px}.poster{aspect-ratio:2.6/1}}
 
 .vtick{display:inline-flex;vertical-align:-3px;margin-left:5px}.vtick svg{width:16px;height:16px;flex:none}.afftick{display:inline-flex;vertical-align:-5px;margin-left:5px;position:relative;width:22px;height:22px;flex:none;align-items:center;justify-content:center;animation:aff3d 5.5s ease-in-out infinite;transform-style:preserve-3d}.afftick::before{content:"";position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg,#f5c542,#fff3c4,#c8f04a,#f5c542,#b8860b,#ffe98a,#f5c542);animation:affSpin 5s linear infinite,affGlow 2.6s ease-in-out infinite}.afftick::after{content:"";position:absolute;inset:2px;border-radius:50%;z-index:3;background:linear-gradient(115deg,transparent 32%,rgba(255,255,255,.7) 48%,transparent 64%);background-size:260% 260%;animation:affShine 2.8s ease-in-out infinite;pointer-events:none}.afftick img{width:18px;height:18px;flex:none;border-radius:50%;object-fit:cover;position:relative;z-index:2;border:1px solid rgba(0,0,0,.35);box-shadow:inset 0 0 0 1px rgba(255,255,255,.3),0 1px 3px rgba(0,0,0,.55);transition:transform .25s ease}.afftick:hover img{transform:scale(1.15)}@keyframes affSpin{to{transform:rotate(360deg)}}@keyframes affGlow{0%,100%{box-shadow:0 2px 6px rgba(0,0,0,.45),0 0 6px rgba(245,197,66,.35)}50%{box-shadow:0 2px 8px rgba(0,0,0,.5),0 0 15px rgba(245,197,66,.85)}}@keyframes affShine{0%{background-position:120% 0}55%,100%{background-position:-40% 0}}@keyframes aff3d{0%,100%{transform:perspective(90px) rotateX(0deg) rotateY(-13deg) translateY(0)}25%{transform:perspective(90px) rotateX(9deg) rotateY(0deg) translateY(-2px) scale(1.04)}50%{transform:perspective(90px) rotateX(0deg) rotateY(13deg) translateY(0)}75%{transform:perspective(90px) rotateX(-9deg) rotateY(0deg) translateY(-2px) scale(1.04)}}@media (prefers-reduced-motion:reduce){.afftick,.afftick::before,.afftick::after{animation:none}}
+
+/* ---- form field rows on phones: true single-column stacking (owner mobile rule,
+   2026-10-26: "mobile view should be mobile view, desktop view should remain
+   desktop view"). Desktop rendering is byte-identical: .frow carries no rules
+   outside this media query, and every rule below is scoped to <=640px.
+   Root cause of the contract-form overflow: flex items default to
+   min-width:auto and refuse to shrink below an input's intrinsic width
+   (datetime-local is ~200px), so the 4-across window/timezone/attempts row
+   pushed off the right edge of a phone screen. Stacking the row makes each
+   field a full-width block, and min-width:0 lets fields shrink freely. */
+@media(max-width:640px){
+  .frow{flex-direction:column;align-items:stretch;gap:8px}
+  .frow>.grow{flex:none;width:100%;min-width:0}
+  .frow input,.frow select,.frow textarea{min-width:0;max-width:100%}
+  /* milestone rows: the title takes its own full line, % input sits under it */
+  .ms-row{flex-wrap:wrap}
+  .ms-row .ms-t{flex:1 1 100%;min-width:0;width:100%}
+  /* attempt controls + capability attest rows already wrap; let fields shrink */
+  #att-outcome,#att-dur,[id^="cap-phone-"],[id^="ct-file-"]{min-width:0;max-width:100%}
+  /* nothing inside a panel may force horizontal page scroll */
+  .panel input,.panel select,.panel textarea{max-width:100%}
+}
