@@ -5,10 +5,14 @@ import { createHash } from "node:crypto";
 
 export const RUNTIME_VERSION = "1.0.1";
 
-// The fleet owner's public key. Configuration bundles and release manifests
-// are only ever accepted with a valid Ed25519 signature from this key.
-// A peer that hosts this agent's server can relay its traffic and hold its
-// queue — it can NEVER change its settings, because it cannot sign.
+// The FLEET owner's public key — the default trust anchor. Configuration
+// bundles and release manifests are only ever accepted with a valid
+// Ed25519 signature from the install's owner key (see ownerkey.mjs):
+// third-party installs pin their OWN owner's key in their config, and
+// this compiled-in key is only the fallback for the original fleet
+// install. A peer that hosts this agent's server can relay its traffic
+// and hold its queue — it can NEVER change its settings, because it
+// cannot sign.
 export const OWNER_PUBKEY_B64 = "MCowBQYDK2VwAyEAD+nbCQ3lIfmOJDqYv97bUFDPjfFi3gY/EMkmHdJ8e1Y=";
 
 export const CHARTER = Object.freeze({
