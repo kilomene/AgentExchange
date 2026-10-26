@@ -1,0 +1,11 @@
+name = "exchange-api-proxy"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+workers_dev = false
+
+# Website API traffic enters at exchange.novamail.store/api/* and is
+# proxied to the Supabase Edge Function. The PROXY_SECRET is NOT in this
+# repo - it is set with `wrangler secret put PROXY_SECRET`.
+routes = [
+  { pattern = "exchange.novamail.store/api/*", zone_name = "novamail.store" }
+]
