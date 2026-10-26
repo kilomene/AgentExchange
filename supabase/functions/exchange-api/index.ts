@@ -594,6 +594,63 @@ async function handle(req: Request) {
     await feed("delivered", `📦 "${job.title}" delivered`, job.id);
     return updated[0];
   }
+  async function completeJob(job: any) {
+    const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    if (!awardedOwner) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
+    const t = now();
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
+    if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
+    await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
+    const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
+    if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
+    await notify(awardedOwner, "payment", `✅ "${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
+    if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: job.agreed_cents - job.fee_cents });
+    await feed("completed", `✅ "${job.title}" completed — $${(job.agreed_cents / 100).toFixed(2)} paid out`, job.id);
+    return updated[0];
+  }
+  async function cancelJob(job: any) {
+    const t = now();
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.open`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "cancelled", updated_at: t }) });
+    if (!updated.length) throw Object.assign(new Error("job is not open"), { status: 400 });
+    await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${job.id}`, p_note: "Escrow refunded — job cancelled", p_now: t });
+    await pg(`ex_bids?job_id=eq.${job.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
+    return updated[0];
+  }
+  async function disputeJob(job: any, reason: unknown) {
+    const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(reason || "").slice(0, 1000), updated_at: now() }) });
+    if (awardedOwner) await notify(awardedOwner, "dispute", `⚠️ "${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
+    const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`);
+    if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title });
+    const admins = await pg("ex_users?role=eq.admin&select=id");
+    for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
+  }
+  async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
+    const text = String(rawText || "").trim();
+    if (!text) throw Object.assign(new Error("message is empty"), { status: 400 });
+    const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: text.slice(0, 2000), created_at: now() }) });
+    const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    const other = job.poster_user_id === senderUserId ? awardedOwner : job.poster_user_id;
+    if (other && other !== senderUserId) await notify(other, "message", `New message on "${job.title}"`, `#/job/${job.id}`);
+    return rows[0];
+  }
+  async function reviewJob(job: any, reviewerUserId: number, b: any) {
+    if (job.status !== "completed") throw Object.assign(new Error("reviews open after completion"), { status: 400 });
+    const stars = Math.min(5, Math.max(1, parseInt(b.stars) || 0));
+    if (!stars) throw Object.assign(new Error("stars required"), { status: 400 });
+    const existing = await one(`ex_reviews?job_id=eq.${job.id}&select=id`);
+    if (existing) throw Object.assign(new Error("already reviewed"), { status: 409 });
+    await pg("ex_reviews", { method: "POST", body: JSON.stringify({ job_id: job.id, agent_id: job.awarded_agent_id, reviewer_user_id: reviewerUserId, stars, body: String(b.body || "").slice(0, 1000), created_at: now() }) });
+    const all = await pg(`ex_reviews?agent_id=eq.${job.awarded_agent_id}&select=stars`);
+    const avg = Math.round((all.reduce((s: number, r: any) => s + r.stars, 0) / all.length) * 10) / 10;
+    await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ rating_avg: avg, rating_count: all.length }) });
+    const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`);
+    if (agent) {
+      await notify(agent.owner_id, "review", `⭐ ${agent.name} got a ${stars}-star review on "${job.title}"`, `#/agent/${job.awarded_agent_id}`);
+      await feed("review", `⭐ ${agent.name} earned ${stars} stars on "${job.title}"`, job.id);
+    }
+    return { rating_avg: avg, rating_count: all.length };
+  }
   if (path.match(/^\/jobs\/\d+\/action$/) && method === "POST") {
     const u = await requireUser(req);
     const jobId = parseInt(seg[1]);
@@ -611,28 +668,14 @@ async function handle(req: Request) {
       return json({ job: await deliverJob(job, deliverable) });
     }
     if (action === "complete" && isPoster && job.status === "delivered") {
-      const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
-      if (!updated.length) return err("job already settled");
-      await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
-      const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
-      if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
-      await notify(awardedOwner, "payment", `✅ "${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
-      if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: job.agreed_cents - job.fee_cents });
-      await feed("completed", `✅ "${job.title}" completed — $${(job.agreed_cents / 100).toFixed(2)} paid out`, job.id);
-      return json({ job: updated[0] });
+      return json({ job: await completeJob(job) });
     }
     if (action === "cancel" && isPoster && job.status === "open") {
-      await pg(`ex_jobs?id=eq.${job.id}&status=eq.open`, { method: "PATCH", body: JSON.stringify({ status: "cancelled", updated_at: t }) });
-      await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${job.id}`, p_note: "Escrow refunded — job cancelled", p_now: t });
-      await pg(`ex_bids?job_id=eq.${job.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
+      await cancelJob(job);
       return json({ ok: true });
     }
     if (action === "dispute" && isPoster && ["awarded", "delivered"].includes(job.status)) {
-      await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(b.reason || "").slice(0, 1000), updated_at: t }) });
-      await notify(awardedOwner, "dispute", `⚠️ "${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
-      { const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`); if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title }); }
-      const admins = await pg("ex_users?role=eq.admin&select=id");
-      for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
+      await disputeJob(job, b.reason);
       return json({ ok: true });
     }
     return err(`action '${action}' not allowed in status '${job.status}' for your role`);
@@ -645,69 +688,63 @@ async function handle(req: Request) {
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     if (job.poster_user_id !== u.id && awardedOwner !== u.id && u.role !== "admin") return err("not a party to this job", 403);
     const b = await body();
-    const text = String(b.body || "").trim();
-    if (!text) return err("message is empty");
-    const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: jobId, sender_user_id: u.id, body: text.slice(0, 2000), created_at: now() }) });
-    const other = job.poster_user_id === u.id ? awardedOwner : job.poster_user_id;
-    if (other) await notify(other, "message", `New message on "${job.title}"`, `#/job/${jobId}`);
-    return json({ id: rows[0].id }, 201);
+    const row = await postJobMessage(job, u.id, b.body);
+    return json({ id: row.id }, 201);
   }
   if (path.match(/^\/jobs\/\d+\/review$/) && method === "POST") {
     const u = await requireUser(req);
     const jobId = parseInt(seg[1]);
     const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
     if (!job || job.poster_user_id !== u.id) return err("only the job poster can review", 403);
-    if (job.status !== "completed") return err("reviews open after completion");
     const b = await body();
-    const stars = Math.min(5, Math.max(1, parseInt(b.stars) || 0));
-    if (!stars) return err("stars required");
-    const existing = await one(`ex_reviews?job_id=eq.${jobId}&select=id`);
-    if (existing) return err("already reviewed", 409);
-    await pg("ex_reviews", { method: "POST", body: JSON.stringify({ job_id: jobId, agent_id: job.awarded_agent_id, reviewer_user_id: u.id, stars, body: String(b.body || "").slice(0, 1000), created_at: now() }) });
-    const all = await pg(`ex_reviews?agent_id=eq.${job.awarded_agent_id}&select=stars`);
-    const avg = Math.round((all.reduce((s: number, r: any) => s + r.stars, 0) / all.length) * 10) / 10;
-    await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ rating_avg: avg, rating_count: all.length }) });
-    const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`);
-    await notify(agent.owner_id, "review", `⭐ ${agent.name} got a ${stars}-star review on "${job.title}"`, `#/agent/${job.awarded_agent_id}`);
-    await feed("review", `⭐ ${agent.name} earned ${stars} stars on "${job.title}"`, job.id);
-    return json({ ok: true, rating_avg: avg, rating_count: all.length }, 201);
+    const result = await reviewJob(job, u.id, b);
+    return json({ ok: true, ...result }, 201);
   }
 
   // ===== wallet =====
-  if (path === "/wallet" && method === "GET") {
-    const u = await requireUser(req);
-    const w = await walletOf(u.id);
-    const ledger = await pg(`ex_ledger?user_id=eq.${u.id}&select=*&order=created_at.desc&limit=100`);
+  async function walletView(userId: number) {
+    const w = await walletOf(userId);
+    const ledger = await pg(`ex_ledger?user_id=eq.${userId}&select=*&order=created_at.desc&limit=100`);
     let cw: any = null;
-    try { cw = await chainWalletOf(u.id); } catch (e) { console.error("chain wallet load failed for user", u.id, e); }
+    try { cw = await chainWalletOf(userId); } catch (e) { console.error("chain wallet load failed for user", userId, e); }
     const addresses = cryptoAddressesOf(cw);
-    const chainDeposits = await pg(`ex_chain_deposits?user_id=eq.${u.id}&select=asset,address,tx_hash,amount_cents,confirmations,status,created_at&order=created_at.desc&limit=50`).catch(() => []);
-    return json({ wallet: w, ledger, deposit_addresses: addresses, crypto_addresses: addresses, crypto_wallet: cw ? { btc_address: cw.btc_address, evm_address: cw.evm_address } : null, chain_deposits: chainDeposits });
+    const chainDeposits = await pg(`ex_chain_deposits?user_id=eq.${userId}&select=asset,address,tx_hash,amount_cents,confirmations,status,created_at&order=created_at.desc&limit=50`).catch(() => []);
+    return { wallet: w, ledger, deposit_addresses: addresses, crypto_addresses: addresses, crypto_wallet: cw ? { btc_address: cw.btc_address, evm_address: cw.evm_address } : null, chain_deposits: chainDeposits };
   }
-  if (path === "/wallet/deposit" && method === "POST") {
-    const u = await requireUser(req);
-    const b = await body();
+  async function recordDeposit(userId: number, b: any) {
     const amount = cents(Number(b.amount || 0) * 100);
-    if (amount < 100) return err("minimum deposit is $1");
-    const rows = await pg("ex_deposits", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: u.id, amount_cents: amount, method: b.method === "card" ? "card" : "crypto", asset: String(b.asset || "USDT").slice(0, 10), tx_ref: String(b.tx_ref || "").slice(0, 120), created_at: now() }) });
-    return json({ id: rows[0].id, status: "pending", note: "Deposit recorded. Your balance is credited once the transfer is confirmed." }, 201);
+    if (amount < 100) throw Object.assign(new Error("minimum deposit is $1"), { status: 400 });
+    const rows = await pg("ex_deposits", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: userId, amount_cents: amount, method: b.method === "card" ? "card" : "crypto", asset: String(b.asset || "USDT").slice(0, 10), tx_ref: String(b.tx_ref || "").slice(0, 120), created_at: now() }) });
+    return rows[0];
   }
-  if (path === "/wallet/payout" && method === "POST") {
-    const u = await requireUser(req);
-    if (!u.email_verified) return err("verify your email first — we sent a confirmation link to your inbox", 403);
-    const b = await body();
+  async function requestPayout(user: { id: number; email_verified?: boolean }, b: any) {
+    if (!user.email_verified) throw Object.assign(new Error("verify your email first — we sent a confirmation link to your inbox"), { status: 403 });
     const amount = cents(Number(b.amount || 0) * 100);
-    if (amount < 500) return err("minimum payout is $5");
+    if (amount < 500) throw Object.assign(new Error("minimum payout is $5"), { status: 400 });
     const method = b.method === "bank" ? "bank" : "crypto";
     const asset = ["BTC", "ETH", "USDT", "USDC"].includes(String(b.asset || "").toUpperCase()) ? String(b.asset).toUpperCase() : "USDT";
     const destination = String(b.destination || "").slice(0, 200).trim();
     if (method === "crypto") {
       const valid = asset === "BTC" ? isValidBtcAddress(destination) : isValidEvmAddress(destination);
-      if (!valid) return err(`destination is not a valid ${asset} address`);
-    } else if (!destination) return err("destination required");
-    await rpc("ex_move_balance", { p_user: u.id, p_amount: -amount, p_type: "payout", p_ref: "", p_note: `Payout request to ${destination.slice(0, 60)}`, p_now: now() });
-    const rows = await pg("ex_payouts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: u.id, amount_cents: amount, method, asset, destination, created_at: now() }) });
-    return json({ id: rows[0].id, status: "pending" }, 201);
+      if (!valid) throw Object.assign(new Error(`destination is not a valid ${asset} address`), { status: 400 });
+    } else if (!destination) throw Object.assign(new Error("destination required"), { status: 400 });
+    await rpc("ex_move_balance", { p_user: user.id, p_amount: -amount, p_type: "payout", p_ref: "", p_note: `Payout request to ${destination.slice(0, 60)}`, p_now: now() });
+    const rows = await pg("ex_payouts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: user.id, amount_cents: amount, method, asset, destination, created_at: now() }) });
+    return rows[0];
+  }
+  if (path === "/wallet" && method === "GET") {
+    const u = await requireUser(req);
+    return json(await walletView(u.id));
+  }
+  if (path === "/wallet/deposit" && method === "POST") {
+    const u = await requireUser(req);
+    const row = await recordDeposit(u.id, await body());
+    return json({ id: row.id, status: "pending", note: "Deposit recorded. Your balance is credited once the transfer is confirmed." }, 201);
+  }
+  if (path === "/wallet/payout" && method === "POST") {
+    const u = await requireUser(req);
+    const row = await requestPayout(u, await body());
+    return json({ id: row.id, status: "pending" }, 201);
   }
   if (path === "/wallet/payouts" && method === "GET") {
     const u = await requireUser(req);
@@ -851,7 +888,8 @@ async function handle(req: Request) {
     if (!key) return err("missing X-Agent-Key", 401);
     const agent = await one(`ex_agents?api_key_hash=eq.${await sha256hex(key)}&select=*`);
     if (!agent) return err("invalid API key", 401);
-    if (agent.status !== "active") return err("agent is not active", 403);
+    // A paused agent may only reactivate itself; every other route needs active.
+    if (agent.status !== "active" && !(agent.status === "paused" && path === "/agent/profile" && method === "PUT")) return err("agent is not active", 403);
     if (path === "/agent/me" && method === "GET") {
       const w = await walletOf(agent.owner_id);
       return json({ agent: publicAgent(agent), owner_wallet: w });
@@ -912,6 +950,191 @@ async function handle(req: Request) {
       const w = await walletOf(agent.owner_id);
       const ledger = await pg(`ex_ledger?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
       return json({ agent: publicAgent(agent), wallet: w, ledger });
+    }
+
+    // ----- owner account, reached with the agent key alone -----
+    if (path === "/agent/owner" && method === "GET") {
+      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email,name,role,avatar,bio,created_at,email_verified`);
+      if (!owner) return err("owner account not found", 404);
+      const w = await walletOf(agent.owner_id);
+      return json({ owner, wallet: w });
+    }
+    if (path === "/agent/owner" && method === "PUT") {
+      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email,name,role,avatar,bio,created_at,email_verified`);
+      if (!owner) return err("owner account not found", 404);
+      const b = await body();
+      await pg(`ex_users?id=eq.${agent.owner_id}`, { method: "PATCH", body: JSON.stringify({ name: String(b.name || owner.name).slice(0, 80), avatar: String(b.avatar || owner.avatar).slice(0, 2000), bio: String(b.bio ?? owner.bio ?? "").slice(0, 500) }) });
+      const fresh = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email,name,role,avatar,bio,created_at,email_verified`);
+      return json({ owner: fresh });
+    }
+    if (path === "/agent/owner/agents" && method === "GET") {
+      const rows = await pg(`ex_agents?owner_id=eq.${agent.owner_id}&select=*&order=created_at.desc`);
+      return json({ agents: rows.map((a: any) => ({ ...publicAgent(a), webhook_url: a.webhook_url || "" })) });
+    }
+    if (path === "/agent/owner/agents" && method === "POST") {
+      const b = await body();
+      const name = String(b.name || "").trim();
+      if (name.length < 2) return err("agent name required");
+      const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
+      if (!cat) return err("invalid category");
+      const skills = Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills || "");
+      const apiKey = randomToken(20);
+      const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
+        owner_id: agent.owner_id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
+        category: cat.slug, avatar: b.avatar ? String(b.avatar).slice(0, 2000) : autoAvatar(name), skills: skills.slice(0, 300),
+        rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: String(b.webhook_url || "").slice(0, 300), created_at: now(),
+      }) });
+      return json({ id: rows[0].id, api_key: apiKey, note: "Save this API key — shown once." }, 201);
+    }
+
+    // ----- own listing management -----
+    if (path === "/agent/profile" && method === "PUT") {
+      const b = await body();
+      const patch: Record<string, unknown> = {};
+      if (b.name !== undefined) {
+        const name = String(b.name || "").trim();
+        if (name.length < 2) return err("agent name required");
+        patch.name = name.slice(0, 80);
+      }
+      if (b.category !== undefined) {
+        const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
+        if (!cat) return err("invalid category");
+        patch.category = cat.slug;
+      }
+      if (b.tagline !== undefined) patch.tagline = String(b.tagline).slice(0, 140);
+      if (b.description !== undefined) patch.description = String(b.description).slice(0, 4000);
+      if (b.skills !== undefined) patch.skills = (Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills)).slice(0, 300);
+      if (b.avatar !== undefined) patch.avatar = String(b.avatar).slice(0, 2000);
+      if (b.rate !== undefined) patch.rate_cents = cents(Number(b.rate || 0) * 100);
+      if (b.webhook_url !== undefined) patch.webhook_url = String(b.webhook_url).slice(0, 300);
+      if (b.status !== undefined) {
+        if (!["active", "paused"].includes(String(b.status))) return err("status must be active or paused");
+        patch.status = String(b.status);
+      }
+      if (Object.keys(patch).length) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      const fresh = await one(`ex_agents?id=eq.${agent.id}&select=*`);
+      return json({ agent: { ...publicAgent(fresh), webhook_url: fresh.webhook_url || "" } });
+    }
+    if (path === "/agent/profile" && method === "DELETE") {
+      await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ status: "suspended" }) });
+      return json({ ok: true, suspended: true });
+    }
+    if (path === "/agent/rotate-key" && method === "POST") {
+      const apiKey = randomToken(20);
+      await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ api_key_hash: await sha256hex(apiKey) }) });
+      return json({ api_key: apiKey, note: "Save this API key — shown once. The old key stops working now." });
+    }
+
+    // ----- wallet: full parity with the owner wallet API -----
+    if (path === "/agent/wallet" && method === "GET") {
+      return json(await walletView(agent.owner_id));
+    }
+    if (path === "/agent/deposit" && method === "POST") {
+      const row = await recordDeposit(agent.owner_id, await body());
+      return json({ id: row.id, status: "pending", note: "Deposit recorded. Your balance is credited once the transfer is confirmed." }, 201);
+    }
+    if (path === "/agent/payout" && method === "POST") {
+      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email_verified,suspended`);
+      if (!owner || owner.suspended) return err("owner account is not active", 403);
+      const row = await requestPayout({ id: agent.owner_id, email_verified: !!owner.email_verified }, await body());
+      return json({ id: row.id, status: "pending" }, 201);
+    }
+    if (path === "/agent/payouts" && method === "GET") {
+      const payouts = await pg(`ex_payouts?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
+      const deposits = await pg(`ex_deposits?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
+      return json({ payouts, deposits });
+    }
+
+    // ----- jobs the owner account posted / is working on -----
+    if (path === "/agent/posted-jobs" && method === "GET") {
+      const posted = await pg(`ex_jobs?poster_user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=100`);
+      const ownerAgents = await pg(`ex_agents?owner_id=eq.${agent.owner_id}&select=id`);
+      let working: any[] = [];
+      if (ownerAgents.length) {
+        const ids = ownerAgents.map((a: any) => a.id).join(",");
+        working = await pg(`ex_jobs?awarded_agent_id=in.(${ids})&select=*&order=created_at.desc&limit=100`);
+      }
+      const myBids = await pg(`ex_bids?bidder_user_id=eq.${agent.owner_id}&select=*,job:ex_jobs!ex_bids_job_id_fkey(title,status,budget_cents)&order=created_at.desc&limit=100`);
+      return json({ posted, working, bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
+    }
+
+    // ----- notifications -----
+    if (path === "/agent/notifications" && method === "GET") {
+      const rows = await pg(`ex_notifications?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
+      const unread = rows.filter((n: any) => !n.is_read).length;
+      return json({ notifications: rows, unread });
+    }
+    if (path === "/agent/notifications/read" && method === "POST") {
+      await pg(`ex_notifications?user_id=eq.${agent.owner_id}&is_read=eq.false`, { method: "PATCH", body: JSON.stringify({ is_read: true }) });
+      return json({ ok: true });
+    }
+
+    // ----- full job detail for one job (messages only for a party) -----
+    if (path.match(/^\/agent\/jobs\/\d+$/) && method === "GET") {
+      const jobId = parseInt(seg[2]);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
+      if (!j) return err("job not found", 404);
+      const bids = await pg(`ex_bids?job_id=eq.${jobId}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
+      const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+      const isParty = j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
+      let messages: any[] = [];
+      if (isParty) messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
+      const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
+      return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
+    }
+
+    // ----- poster-side lifecycle, run by the posting agent itself -----
+    if (path.match(/^\/agent\/jobs\/\d+\/award$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const b = await body();
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
+      if (job.status !== "open") return err("job is not open");
+      const bid = await one(`ex_bids?id=eq.${parseInt(b.bid_id)}&job_id=eq.${jobId}&status=eq.active&select=*`);
+      if (!bid) return err("bid not found", 404);
+      const updated = await awardJob(job, bid);
+      return json({ job: updated });
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/complete$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
+      if (job.status !== "delivered") return err("job is not delivered");
+      return json({ job: await completeJob(job) });
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/cancel$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
+      if (job.status !== "open") return err("job is not open");
+      await cancelJob(job);
+      return json({ ok: true });
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/dispute$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
+      if (!["awarded", "delivered"].includes(job.status)) return err(`action 'dispute' not allowed in status '${job.status}'`);
+      const b = await body();
+      await disputeJob(job, b.reason);
+      return json({ ok: true });
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/messages$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+      if (job.poster_user_id !== agent.owner_id && awardedOwner !== agent.owner_id) return err("not a party to this job", 403);
+      const b = await body();
+      const row = await postJobMessage(job, agent.owner_id, b.body);
+      return json({ id: row.id }, 201);
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/review$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job || job.poster_user_id !== agent.owner_id) return err("only the job poster can review", 403);
+      const result = await reviewJob(job, agent.owner_id, await body());
+      return json({ ok: true, ...result }, 201);
     }
     return err("unknown agent route", 404);
   }
