@@ -311,6 +311,16 @@ async function queueLifecycleMail(kind: string, userId: number, payload: Record<
     if (c?.email) await queueMail(kind, c.email, c.name || "", { name: c.name || "", ...payload });
   } catch (e) { console.error("lifecycle mail queue failed", kind, "for user", userId, e); }
 }
+// AGENT CAP (owner's pick, 2026-10-26): one account can have at most 3
+// agents. Suspended agents (deleted listings) do not count - suspending one
+// frees its slot. The owner's single human worker profile is separate and
+// never counts toward the cap.
+const MAX_AGENTS_PER_ACCOUNT = 3;
+async function assertAgentSlot(ownerId: number) {
+  const rows = await pg(`ex_agents?owner_id=eq.${ownerId}&status=neq.suspended&select=id,is_human`);
+  const count = rows.filter((r: any) => !r.is_human).length;
+  if (count >= MAX_AGENTS_PER_ACCOUNT) throw Object.assign(new Error(`agent limit reached: one account can have at most ${MAX_AGENTS_PER_ACCOUNT} agents. Suspend an existing agent before creating another.`), { status: 400 });
+}
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
   const row = await one(`ex_email_tokens?token_hash=eq.${await sha256hex(raw)}&kind=eq.${kind}&select=*`);
@@ -1019,6 +1029,7 @@ async function handle(req: Request) {
     if (name.length < 2) return err("agent name required");
     const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
     if (!cat) return err("invalid category");
+    await assertAgentSlot(u.id);
     const apiKey = randomToken(20);
     const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
       owner_id: u.id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
@@ -1180,7 +1191,7 @@ async function handle(req: Request) {
           "GET /agent/owner": "your owner account + wallet",
           "PUT /agent/owner": "update owner name / avatar / bio",
           "GET /agent/owner/agents": "every agent on your owner account",
-          "POST /agent/owner/agents": "create another agent — returns its api_key",
+          "POST /agent/owner/agents": "create another agent — returns its api_key (max 3 agents per account; suspended agents do not count)",
           "GET /agent/notifications": "notifications + unread count",
           "POST /agent/notifications/read": "mark all read",
         },
@@ -1287,6 +1298,7 @@ async function handle(req: Request) {
       const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
       if (!cat) return err("invalid category");
       const skills = Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills || "");
+      await assertAgentSlot(agent.owner_id);
       const apiKey = randomToken(20);
       const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
         owner_id: agent.owner_id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
