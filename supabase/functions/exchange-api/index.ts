@@ -15,6 +15,26 @@ const JWT_SECRET = Deno.env.get("EXCHANGE_JWT_SECRET") ?? SB_KEY;
 const enc = new TextEncoder();
 const now = () => Math.floor(Date.now() / 1000);
 const cents = (n: unknown) => Math.round(Number(n) || 0);
+const CHAT_HIDDEN = "[hidden]";
+// JOB CHAT SAFETY (owner's order, 2026-10-26): the job chat is fully
+// secured - links, email addresses, phone numbers, social-media handles
+// or profiles and foul language are automatically hidden. Applied at
+// write time (nothing unsafe is ever stored) and again at read time
+// (older messages are covered too).
+function sanitizeChat(input: unknown): string {
+  let s = String(input ?? "");
+  s = s.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, CHAT_HIDDEN);
+  s = s.replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, CHAT_HIDDEN);
+  s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
+  s = s.replace(/@[a-z0-9_.]{2,}/gi, CHAT_HIDDEN);
+  s = s.replace(/@ ([a-z0-9_.]{2,})/gi, (m: string, tok: string) => /[0-9._]/.test(tok) ? CHAT_HIDDEN : m);
+  s = s.replace(/\b(instagram|insta|tiktok|snapchat|snap|telegram|whatsapp|facebook|discord|twitter|ig|fb)\s*(?:is|:|=|\u2014|-)\s*(\S+)/gi,
+    (m: string, _p: string, tok: string) => /[@0-9_.]/.test(tok) ? CHAT_HIDDEN : m);
+  s = s.replace(/\+?\(?\d[\d\s().-]{4,}\d/g,
+    (m: string) => /^\d{4}-\d{2}-\d{2}$/.test(m.trim()) ? m : (m.replace(/\D/g, "").length >= 7 ? CHAT_HIDDEN : m));
+  s = s.replace(/\b(?:fuck\w*|shit\w*|bitch\w*|whore\w*|slut\w*|asshole\w*|dickhead\w*|motherfucker\w*|nigger\w*|nigga\w*|faggot\w*|bastard\w*|cunt|pussy)\b/gi, CHAT_HIDDEN);
+  return s;
+}
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-headers": "authorization, content-type, x-agent-key, x-api-key",
@@ -988,26 +1008,6 @@ async function handle(req: Request) {
     for (const a of admins) await queueLifecycleMail("dispute_opened", a.id, { title: job.title, reason: String(reason || "").slice(0, 300), admin: true, link: `${SITE_URL}/#/admin` });
   }
 
-  const CHAT_HIDDEN = "[hidden]";
-  // JOB CHAT SAFETY (owner's order, 2026-10-26): the job chat is fully
-  // secured - links, email addresses, phone numbers, social-media handles
-  // or profiles and foul language are automatically hidden. Applied at
-  // write time (nothing unsafe is ever stored) and again at read time
-  // (older messages are covered too).
-  function sanitizeChat(input: unknown): string {
-    let s = String(input ?? "");
-    s = s.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, CHAT_HIDDEN);
-    s = s.replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, CHAT_HIDDEN);
-    s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
-    s = s.replace(/@[a-z0-9_.]{2,}/gi, CHAT_HIDDEN);
-    s = s.replace(/@ ([a-z0-9_.]{2,})/gi, (m: string, tok: string) => /[0-9._]/.test(tok) ? CHAT_HIDDEN : m);
-    s = s.replace(/\b(instagram|insta|tiktok|snapchat|snap|telegram|whatsapp|facebook|discord|twitter|ig|fb)\s*(?:is|:|=|\u2014|-)\s*(\S+)/gi,
-      (m: string, _p: string, tok: string) => /[@0-9_.]/.test(tok) ? CHAT_HIDDEN : m);
-    s = s.replace(/\+?\(?\d[\d\s().-]{4,}\d/g,
-      (m: string) => /^\d{4}-\d{2}-\d{2}$/.test(m.trim()) ? m : (m.replace(/\D/g, "").length >= 7 ? CHAT_HIDDEN : m));
-    s = s.replace(/\b(?:fuck\w*|shit\w*|bitch\w*|whore\w*|slut\w*|asshole\w*|dickhead\w*|motherfucker\w*|nigger\w*|nigga\w*|faggot\w*|bastard\w*|cunt|pussy)\b/gi, CHAT_HIDDEN);
-    return s;
-  }
   async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
     const text = String(rawText || "").trim();
     if (!text) throw Object.assign(new Error("message is empty"), { status: 400 });
