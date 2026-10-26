@@ -1,19 +1,36 @@
 // AUTO-UPDATE — the moment the owner ships a release, every agent updates
 // itself. A release is a manifest {version, sha256, notes} + package,
-// signed with the OWNER's key (charter.mjs). Peers host releases for each
-// other, so an update reaches an agent from ANY live server in the mesh.
-// An unsigned or badly-signed package is never installed — the signature
-// is checked before a single byte is swapped, and the old version is kept
-// for rollback. State lives in the vault, outside the app directory, so an
-// update never touches the agent's memory, queue, or files.
+// signed with the install's OWNER key (ownerkey.mjs — each install pins
+// its own owner's key; the fleet key is only the default). Peers host
+// releases for each other, so an update reaches an agent from ANY live
+// server in the mesh. An unsigned or badly-signed package is never
+// installed — the signature is checked before a single byte is swapped,
+// and the old version is kept for rollback (bootguard.mjs restores it
+// if the new version cannot boot). State lives in the vault, outside
+// the app directory, so an update never touches the agent's memory,
+// queue, or files.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { OWNER_PUBKEY_B64, RUNTIME_VERSION } from "./charter.mjs";
+import { RUNTIME_VERSION } from "./charter.mjs";
+import { resolveOwnerPubkey } from "./ownerkey.mjs";
 import { verifyObj } from "./sign.mjs";
 
 const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+
+// Numeric dotted-version compare: "1.0.9" < "1.0.10" < "1.1.0".
+// (A plain string compare gets this wrong: "1.0.10" < "1.0.9".)
+export function compareVersions(a, b) {
+  const pa = String(a).split(".").map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).split(".").map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+export const isNewerVersion = (candidate, current) => compareVersions(candidate, current) > 0;
 
 export class Updater {
   constructor({ vault, config, appDir, log }) {
@@ -22,6 +39,8 @@ export class Updater {
     this.appDir = appDir;   // the installed app directory (swapped atomically)
     this.log = log || (() => {});
     this.checking = false;
+    // Verify release manifests against THIS install's owner key.
+    this.ownerPubkey = config?.ownerPubkeyB64 || resolveOwnerPubkey(config || {}).pubkey;
   }
 
   async #fetchManifest(source) {
@@ -52,12 +71,12 @@ export class Updater {
         const got = await this.#fetchManifest(source);
         if (!got) continue;
         const { sig, ...manifest } = got.manifest;
-        if (!verifyObj(OWNER_PUBKEY_B64, manifest, sig || "")) {
+        if (!verifyObj(this.ownerPubkey, manifest, sig || "")) {
           this.log(`update: manifest from ${source} NOT owner-signed — ignored`);
           this.vault.journal("update_rejected", { source, reason: "bad signature" });
           continue;
         }
-        if (!(manifest.version > RUNTIME_VERSION)) continue;
+        if (!isNewerVersion(manifest.version, RUNTIME_VERSION)) continue;
         this.log(`update: owner release v${manifest.version} found at ${source} (running v${RUNTIME_VERSION})`);
         const pkg = await this.#fetchPackage(got.base, got.isFile);
         if (sha256(pkg) !== manifest.sha256) {
