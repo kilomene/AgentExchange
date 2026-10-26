@@ -18,12 +18,14 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CHARTER, RUNTIME_VERSION, charterHash, OWNER_PUBKEY_B64 } from "./charter.mjs";
+import { CHARTER, RUNTIME_VERSION, charterHash } from "./charter.mjs";
 import { Vault } from "./vault.mjs";
 import { Realtime } from "./realtime.mjs";
 import { Mesh } from "./mesh.mjs";
 import { Updater } from "./update.mjs";
-import { newIdentity, verifyObj } from "./sign.mjs";
+import { newIdentity } from "./sign.mjs";
+import { verifyConfigSignature } from "./ownerkey.mjs";
+import { bootGuard, markHealthy, HEALTHY_AFTER_MS } from "./bootguard.mjs";
 
 const APP_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
@@ -35,13 +37,18 @@ const log = (m) => console.log(`[${new Date().toISOString()}] ${m}`);
 
 function loadConfig() {
   const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-  if (cfg.sig) {
-    const { sig, ...rest } = cfg;
-    if (!verifyObj(OWNER_PUBKEY_B64, rest, sig)) {
-      console.error("FATAL: config signature is not the owner's — refusing to start");
-      process.exit(1);
-    }
+  // The owner trust anchor is per install (ownerkey.mjs): the install's
+  // own owner's key — pinned in the config, a sibling config.owner_pubkey
+  // file, or EXCHANGE_OWNER_PUBKEY — with the compiled-in fleet key only
+  // as the default. Signature verification is mandatory: an unsigned
+  // config never boots.
+  const v = verifyConfigSignature(cfg, CONFIG_PATH);
+  if (!v.ok) {
+    console.error(`FATAL: ${v.reason} — refusing to start`);
+    process.exit(1);
   }
+  cfg.ownerPubkeyB64 = v.pubkey;   // resolved anchor, reused by mesh + updater
+  cfg.ownerPubkeySource = v.source;
   return cfg;
 }
 
@@ -101,6 +108,7 @@ for (const a of config.agents) {
 const localAgentIds = () => new Set(Object.values(S.agents).map((a) => a.id).filter(Boolean));
 const agentById = (id) => config.agents.find((a) => S.agents[a.name]?.id === id);
 let ready = false;
+let apiConfirmed = (config.agents || []).length === 0; // set on first successful agent API call (boot guard)
 const eventBuffer = [];
 
 function skillHit(agent, job) {
@@ -264,6 +272,7 @@ async function catchUpSync() {
     const st = S.agents[agent.name];
     try {
       const me = await api(agent, "/agent/me");
+      apiConfirmed = true;   // the Exchange API answered us — boot-guard proof
       st.id = me.agent.id; st.category = me.agent.category;
       st.rate_cents = me.agent.rate_cents; st.skills = me.agent.skills || [];
       const bids = await api(agent, "/agent/my-bids");
@@ -289,23 +298,75 @@ async function catchUpSync() {
 
 // ---------- presence (the Exchange shows who is live) ----------
 async function pushPresence() {
-  if (!config.serviceKey) return;
   const nowS = Math.floor(Date.now() / 1000);
   for (const agent of config.agents) {
     const st = S.agents[agent.name];
     if (!st.id) continue;
     try {
-      await fetch(`${config.supabaseUrl}/rest/v1/ex_agent_status?on_conflict=agent_id`, {
-        method: "POST",
-        headers: {
-          apikey: config.serviceKey, authorization: `Bearer ${config.serviceKey}`,
-          "content-type": "application/json", prefer: "resolution=merge-duplicates,return=minimal",
-        },
-        body: JSON.stringify({ agent_id: st.id, name: agent.name, last_heartbeat: nowS, version: RUNTIME_VERSION, online: true, updated_at: nowS }),
-        signal: AbortSignal.timeout(8000),
-      });
+      if (config.serviceKey) {
+        // Fleet path: direct upsert with the service-role key.
+        await fetch(`${config.supabaseUrl}/rest/v1/ex_agent_status?on_conflict=agent_id`, {
+          method: "POST",
+          headers: {
+            apikey: config.serviceKey, authorization: `Bearer ${config.serviceKey}`,
+            "content-type": "application/json", prefer: "resolution=merge-duplicates,return=minimal",
+          },
+          body: JSON.stringify({ agent_id: st.id, name: agent.name, last_heartbeat: nowS, version: RUNTIME_VERSION, online: true, updated_at: nowS }),
+          signal: AbortSignal.timeout(8000),
+        });
+      } else {
+        // Third-party path: the backend's agent-key presence endpoint —
+        // no service-role key exists on these installs.
+        await api(agent, "/agent/presence", {
+          method: "POST",
+          body: JSON.stringify({ version: RUNTIME_VERSION, online: true }),
+        });
+      }
     } catch { /* presence is best-effort; the mesh still knows */ }
   }
+}
+
+// ---------- polling wakes (only when there is no service key) ----------
+// The realtime bindings for ex_notifications / ex_messages need a
+// service-role key; without one, buyer messages and disputes would never
+// wake the agent. Poll the agent API instead and feed the SAME handlers
+// the realtime events feed. Notifications are deduped by a per-agent id
+// cursor persisted in state; contract transitions mirror the catch-up
+// sync's handling. With a service key configured, none of this runs —
+// realtime covers it, exactly as before.
+const POLL_WAKES_MS = 30000;
+async function pollWakes() {
+  for (const agent of config.agents) {
+    const st = S.agents[agent.name];
+    try {
+      const res = await api(agent, "/agent/notifications");
+      const list = res.notifications || res.items || (Array.isArray(res) ? res : []);
+      let cursor = st.lastNotifId || 0;
+      for (const n of list) {
+        const id = Number(n.id) || 0;
+        if (id > cursor) cursor = id;
+        if (id && id <= (st.lastNotifId || 0)) continue;   // already fed
+        onNotification({ type: n.type, body: n.body, link: n.link });
+      }
+      st.lastNotifId = cursor;
+    } catch (e) { log(`poll notifications (${agent.name}): ${e.message}`); }
+    try {
+      const res = await api(agent, "/agent/contracts");
+      for (const c of res.contracts || []) {
+        const prevStatus = st.contracts[c.id];
+        st.contracts[c.id] = c.status;
+        if (c.status === "awarded" && prevStatus !== "awarded" && !st.delivered.includes(c.id)) {
+          vault.journal("awarded", { agent: agent.name, job_id: c.id, agreed_cents: c.agreed_cents, source: "poll" });
+          enqueueWorkWake(agent, c);
+        }
+        if (c.status === "disputed" && prevStatus !== "disputed") {
+          vault.enqueueWake({ kind: "dispute", job_id: c.id, agent: agent.name, title: c.title, enqueued_at: Math.floor(Date.now() / 1000) });
+          touchWakeSignal();
+        }
+      }
+    } catch (e) { log(`poll contracts (${agent.name}): ${e.message}`); }
+  }
+  vault.saveState();
 }
 
 // ---------- wake signal (the file the agent-wake hook watches) ----------
@@ -365,6 +426,31 @@ process.on("SIGINT", () => shutdown(0));
 
 vault.journal("boot", { version: RUNTIME_VERSION, agents: config.agents.map((a) => a.name) });
 log(`exchange-agentd v${RUNTIME_VERSION} booting — ${config.agents.length} agents, vault ${VAULT_DIR}`);
+log(`owner trust anchor: ${config.ownerPubkeySource}`);
+
+// Boot guard: if this version has already failed to prove healthy on
+// repeated boots, restore the previous version and exit so the service
+// restarts into it (bootguard.mjs). Runs before anything else starts.
+const guard = bootGuard(VAULT_DIR, APP_DIR, RUNTIME_VERSION, log);
+if (guard.rolledBack) {
+  vault.journal("boot_rollback", { from: guard.from, to: guard.to });
+  log(`boot: rolled back v${guard.from} -> v${guard.to} — exiting for restart into the restored version`);
+  process.exit(75);
+}
+vault.journal("boot_guard", { decision: guard.decision.reason, attempts: guard.state.attempts });
+// Prove this version healthy: 60s up AND the Exchange API confirmed
+// reachable (catch-up sync sets apiConfirmed) — then it is known-good
+// and can never be rolled back.
+const bootStartedAt = Date.now();
+const healthyTimer = setInterval(() => {
+  if (Date.now() - bootStartedAt < HEALTHY_AFTER_MS || !apiConfirmed) return;
+  clearInterval(healthyTimer);
+  markHealthy(VAULT_DIR, RUNTIME_VERSION);
+  vault.journal("boot_proven", { version: RUNTIME_VERSION });
+  log(`boot: v${RUNTIME_VERSION} proven healthy — recorded as known-good`);
+}, 5000);
+healthyTimer.unref?.();
+
 mesh.start();
 
 const bindings = [
@@ -389,6 +475,13 @@ const realtime = new Realtime({
   log,
 });
 realtime.start();
+
+if (!config.serviceKey) {
+  // No service key → no realtime notification/message bindings. Poll for
+  // wakes instead so third-party installs still react to buyers.
+  setInterval(() => { pollWakes().catch(() => {}); }, POLL_WAKES_MS);
+  log(`polling wakes every ${POLL_WAKES_MS / 1000}s (no service key configured)`);
+}
 
 heartbeatTimer = setInterval(() => {
   tick++;
