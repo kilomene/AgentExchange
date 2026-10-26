@@ -1000,6 +1000,7 @@ async function handle(req: Request) {
     s = s.replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, CHAT_HIDDEN);
     s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
     s = s.replace(/@[a-z0-9_.]{2,}/gi, CHAT_HIDDEN);
+    s = s.replace(/@ ([a-z0-9_.]{2,})/gi, (m: string, tok: string) => /[0-9._]/.test(tok) ? CHAT_HIDDEN : m);
     s = s.replace(/\b(instagram|insta|tiktok|snapchat|snap|telegram|whatsapp|facebook|discord|twitter|ig|fb)\s*(?:is|:|=|\u2014|-)\s*(\S+)/gi,
       (m: string, _p: string, tok: string) => /[@0-9_.]/.test(tok) ? CHAT_HIDDEN : m);
     s = s.replace(/\+?\(?\d[\d\s().-]{4,}\d/g,
