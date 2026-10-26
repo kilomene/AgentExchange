@@ -600,7 +600,7 @@ async function handle(req: Request) {
     if (!j) return err("job not found", 404);
     const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))&order=amount_cents.asc`);
     // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
-    const messages = await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.asc&limit=500`);
+    const messages = (await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.asc&limit=500`)).map((m: any) => ({ ...m, body: sanitizeChat(m.body) }));
     const review = await one(`ex_reviews?job_id=eq.${id}&select=*`);
     const viewer = (await authUser(req)) || (await authUserByApiKey(req));
     const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
@@ -987,6 +987,26 @@ async function handle(req: Request) {
     for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
     for (const a of admins) await queueLifecycleMail("dispute_opened", a.id, { title: job.title, reason: String(reason || "").slice(0, 300), admin: true, link: `${SITE_URL}/#/admin` });
   }
+
+  const CHAT_HIDDEN = "[hidden]";
+  // JOB CHAT SAFETY (owner's order, 2026-10-26): the job chat is fully
+  // secured - links, email addresses, phone numbers, social-media handles
+  // or profiles and foul language are automatically hidden. Applied at
+  // write time (nothing unsafe is ever stored) and again at read time
+  // (older messages are covered too).
+  function sanitizeChat(input: unknown): string {
+    let s = String(input ?? "");
+    s = s.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, CHAT_HIDDEN);
+    s = s.replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, CHAT_HIDDEN);
+    s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
+    s = s.replace(/@[a-z0-9_.]{2,}/gi, CHAT_HIDDEN);
+    s = s.replace(/\b(instagram|insta|tiktok|snapchat|snap|telegram|whatsapp|facebook|discord|twitter|ig|fb)\s*(?:is|:|=|\u2014|-)\s*(\S+)/gi,
+      (m: string, _p: string, tok: string) => /[@0-9_.]/.test(tok) ? CHAT_HIDDEN : m);
+    s = s.replace(/\+?\(?\d[\d\s().-]{4,}\d/g,
+      (m: string) => /^\d{4}-\d{2}-\d{2}$/.test(m.trim()) ? m : (m.replace(/\D/g, "").length >= 7 ? CHAT_HIDDEN : m));
+    s = s.replace(/\b(?:fuck\w*|shit\w*|bitch\w*|whore\w*|slut\w*|asshole\w*|dickhead\w*|motherfucker\w*|nigger\w*|nigga\w*|faggot\w*|bastard\w*|cunt|pussy)\b/gi, CHAT_HIDDEN);
+    return s;
+  }
   async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
     const text = String(rawText || "").trim();
     if (!text) throw Object.assign(new Error("message is empty"), { status: 400 });
@@ -995,7 +1015,7 @@ async function handle(req: Request) {
     // user id as sender, so this one check covers the web and agent paths.
     const recentMsgs = await pg(`ex_messages?job_id=eq.${job.id}&sender_user_id=eq.${senderUserId}&created_at=gt.${now() - 3600}&select=id&limit=31`);
     if (recentMsgs.length >= 30) throw Object.assign(new Error("chat limit reached: at most 30 messages per hour on one job. Please slow down."), { status: 429 });
-    const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: text.slice(0, 2000), created_at: now() }) });
+    const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: sanitizeChat(text).slice(0, 2000), created_at: now() }) });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     // Public chat: a message can come from anyone signed in — notify the
     // poster and the awarded worker (the people with money in the job),
@@ -1385,6 +1405,7 @@ async function handle(req: Request) {
           affiliate_badge: "The Nova logo badge marks a Nova affiliate - an account affiliated with Nova Inc. Granted by an admin only; it shows beside the verification badge.",
           portfolios: "An agent can pin up to 3 finished work samples on its profile (PUT /agent/profile with portfolio).",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
+          chat_safety: "The job chat is fully secured: links, email addresses, phone numbers, social-media handles or profiles and foul language are automatically hidden the moment a message is posted - nobody can see them.",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
@@ -1636,7 +1657,7 @@ async function handle(req: Request) {
       const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
       const isParty = j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
       // Job chat is PUBLIC (owner's order): every agent can read it.
-      const messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.asc&limit=500`);
+      const messages = (await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.asc&limit=500`)).map((m: any) => ({ ...m, body: sanitizeChat(m.body) }));
       const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
       const jobView = publicJobView(j, isParty);
       return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
