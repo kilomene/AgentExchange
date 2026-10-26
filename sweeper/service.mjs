@@ -5,8 +5,11 @@
 //     The status flip (awarded -> cancelled) is the claim: only the cycle
 //     that wins it refunds, and a failed refund reverts the flip so the
 //     next cycle retries. Poster and worker are notified + emailed.
-//  2. DEAD-LISTING CLEANUP: agents with no bids, no contracts and no chat
-//     for 30 days are paused (one profile update or any work wakes them).
+//  2. INACTIVITY SUSPENSION (owner's batch-3, 2026-10-26; replaces the old
+//     30-day pause): an agent with no activity for 14 days is SUSPENDED
+//     with suspension_reason='inactivity'. Its owner brings it back from
+//     the dashboard by paying a $5 fine. Activity = any agent-API call
+//     (last_active_at is stamped by the API), bids, contracts or chat.
 //  3. BAN-EVASION ALT SCAN: a non-admin account whose sign-up or last IP
 //     matches a banned account's address is suspended, its own addresses
 //     join the ban list, and the admins are notified. Admin accounts are
@@ -90,9 +93,11 @@ async function deadlineRefunds() {
 
 async function deadListings() {
   const t = nowSec();
-  const cutoff = t - 30 * 86400;
-  const agents = await get(`ex_agents?status=eq.active&created_at=lt.${cutoff}&select=id,name,owner_id&limit=200`);
+  const cutoff = t - 14 * 86400;
+  const agents = await get(`ex_agents?status=eq.active&is_human=eq.false&select=id,name,owner_id,created_at,last_active_at&limit=200`);
   for (const a of agents || []) {
+    const lastActive = Math.max(Number(a.last_active_at || 0), Number(a.created_at || 0));
+    if (lastActive > cutoff) continue;
     const bids = await get(`ex_bids?agent_id=eq.${a.id}&created_at=gt.${cutoff}&select=id&limit=1`);
     if (bids && bids.length) continue;
     const won = await get(`ex_jobs?awarded_agent_id=eq.${a.id}&updated_at=gt.${cutoff}&select=id&limit=1`);
@@ -105,9 +110,9 @@ async function deadListings() {
       if (pres && pres.length) alive = Object.values(pres[0]).some((v) => typeof v === "number" && v > cutoff);
     } catch { /* no presence table signal - fall through */ }
     if (alive) continue;
-    await patch(`ex_agents?id=eq.${a.id}&status=eq.active`, { status: "paused" });
-    await notify(a.owner_id, "agent", `${a.name} was paused after 30 days without activity. It can be reactivated any time from the dashboard or with a profile update.`, `#/agent/${a.id}`);
-    console.log(`dead-listing: agent ${a.id} (${a.name}) auto-paused`);
+    await patch(`ex_agents?id=eq.${a.id}&status=eq.active`, { status: "suspended", suspension_reason: "inactivity" });
+    await notify(a.owner_id, "security", `${a.name} was suspended after 14 days without activity. Reactivate it from your dashboard - a $5 fine is taken from your wallet when you do.`, `#/dashboard`);
+    console.log(`inactivity: agent ${a.id} (${a.name}) auto-suspended (14 days silent)`);
   }
 }
 
