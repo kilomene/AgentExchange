@@ -266,7 +266,7 @@ async function viewFloor(params) {
       host.innerHTML = `<h2 class="sec">${ic("trophy")} Top agents right now</h2>
       <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr))">${agents.slice(0, 3).map((a, i) => `
         <a class="acard rv" style="--d:${i * 0.07}s" href="#/agent/${a.id}">
-          <div class="top">${avaRing(a, 48)}<div><h3>${esc(a.name)}</h3><div class="small mut">trust ${a.trust_score}/100</div></div></div>
+          <div class="top">${avaRing(a, 48)}<div><h3>${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h3><div class="small mut">trust ${a.trust_score}/100</div></div></div>
           <div class="tag">${esc(a.tagline)}</div>
           <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span></div>
         </a>`).join("")}</div>`;
@@ -326,7 +326,7 @@ async function viewJob(id) {
         <h3>${ic("tag")} Bids (${bids.length})</h3>
         ${bids.length ? `<p class="small mut mt">${activeBids.length} active${lowestBid ? ` · lowest so far <b style="color:var(--gold2)">${money(lowestBid)}</b>` : ""}${j.status === "open" && j.bid_deadline ? ` · ${timeLeft(j.bid_deadline)} to bid` : ""} · updates live as bids land</p>` : ""}
         ${bids.map((b) => `<div class="notif">${ident(b.agent_name || "?", 34, false, b.agent_avatar)}
-          <span class="grow"><a href="#/agent/${b.agent_id}"><b>${esc(b.agent_name)}</b></a> ${b.agent_is_human ? '<span class="pill human">Human</span>' : ""} ${stars(b.agent_rating || 0, b.agent_jobs || 0)}<br>
+          <span class="grow"><a href="#/agent/${b.agent_id}"><b>${esc(b.agent_name)}</b></a>${vTick(b.agent_verified)}${novaAff(b.agent_affiliate)} ${b.agent_is_human ? '<span class="pill human">Human</span>' : ""} ${stars(b.agent_rating || 0, b.agent_jobs || 0)}<br>
           <span class="small mut">${esc(b.pitch)} · ETA ${b.eta_hours}h · ${ago(b.created_at)}</span></span>
           <b>${money(b.amount_cents)}</b>
           ${b.status === "accepted" ? `<span class="pill green">${ic("trophy")}Won</span>` : b.status !== "active" ? `<span class="pill">${b.status}</span>` : ""}
@@ -344,7 +344,7 @@ async function viewJob(id) {
       </div>
       <div class="panel rv" style="--d:.1s"><h3>${ic("msg")} Job chat</h3>
         <p class="small mut">Public — everyone can read this chat. Anyone signed in can post.</p>
-        <div class="mt">${messages.map((m) => `<div class="msg ${state.user && m.sender_user_id === state.user.id ? "me" : ""}"><small>${ident(m.sender?.name || "?", 18)} ${esc(m.sender?.name || "")} · ${dt(m.created_at)}</small>${esc(m.body)}</div>`).join("") || '<p class="mut">No messages yet — be the first to ask about this job.</p>'}</div>
+        <div class="mt">${messages.map((m) => `<div class="msg ${state.user && m.sender_user_id === state.user.id ? "me" : ""}"><small>${ident(m.sender?.name || "?", 18)} ${esc(m.sender?.name || "")}${vTick(m.sender?.verified_badge)}${novaAff(m.sender?.nova_affiliate)} · ${dt(m.created_at)}</small>${esc(m.body)}</div>`).join("") || '<p class="mut">No messages yet — be the first to ask about this job.</p>'}</div>
         ${state.user ? `<div class="flex mt"><input id="msg-in" placeholder="Message about this job…"><button class="btn sm" id="msg-go">${ic("send", "sm")} Send</button></div>` : '<p class="small mut mt"><a href="#/login" style="color:var(--gold2)">Sign in</a> to post in this chat.</p>'}</div>
     </div>
     <div class="panel sticky-side rv" style="--d:.08s">
@@ -423,7 +423,7 @@ async function viewAgents(params) {
   <select id="a-sort">${[["trust", "Trust score"], ["rating", "Top rated"], ["earnings", "Top earners"], ["jobs", "Most jobs done"], ["newest", "Newest"]].map(([v, l]) => `<option value="${v}" ${sort === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>
   <div class="grid">${data.agents.map((a, i) => `
     <a class="acard rv" style="--d:${(i % 6) * 0.05}s" href="#/agent/${a.id}">
-      <div class="top">${avaRing(a, 52)}<div><div class="flex" style="gap:7px"><span class="rank">#${i + 1}</span><h3>${esc(a.name)}</h3></div><div class="small mut">by ${esc(a.owner_name || "")}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</div></div></div>
+      <div class="top">${avaRing(a, 52)}<div><div class="flex" style="gap:7px"><span class="rank">#${i + 1}</span><h3>${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h3></div><div class="small mut">by ${esc(a.owner_name || "")}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</div></div></div>
       <div class="tag">${esc(a.tagline)}</div>
       <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span><span>· ${money(a.earnings_cents)} earned</span></div>
       <div class="flex"><span class="small mut">typical rate</span><span class="price">${money(a.rate_cents)}</span><span class="hire-chip">Hire ${ic("arrow-r")}</span></div>
@@ -440,13 +440,13 @@ async function viewAgent(id) {
   <div class="cols mt">
     <div>
       <div class="flex rv">${avaRing(a, 72)}
-      <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}${a.owner_country ? " · " + esc(a.owner_country) : ""} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span>${a.is_human ? '<span class="pill human">Human worker</span>' : ""}<span style="display:inline-flex;align-items:center;gap:5px">${liveDot(a)}</span></div></div></div>
+      <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}${a.owner_country ? " · " + esc(a.owner_country) : ""} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span>${a.is_human ? '<span class="pill human">Human worker</span>' : ""}<span style="display:inline-flex;align-items:center;gap:5px">${liveDot(a)}</span></div></div></div>
       <p class="mt rv" style="font-size:16px;--d:.05s">${esc(a.tagline)}</p>
       <div class="panel rv" style="--d:.08s"><h3>${ic("user")} About</h3><p class="mt" style="white-space:pre-wrap">${esc(a.description)}</p>
       ${a.skills.length ? `<p class="mt">${a.skills.map((s) => `<span class="pill feat">${esc(s)}</span>`).join(" ")}</p>` : ""}</div>
       ${a.portfolio && a.portfolio.length ? `<div class="panel rv" style="--d:.1s"><h3>${ic("briefcase")} Portfolio — best finished work</h3>${a.portfolio.map((p) => `<div class="notif"><span class="grow"><b>${esc(p.title)}</b>${p.description ? `<br><span class="small mut">${esc(p.description)}</span>` : ""}</span>${p.link ? `<a class="btn ghost sm" href="${esc(p.link)}" target="_blank" rel="noopener">View</a>` : ""}${p.job_id ? `<a class="btn ghost sm" href="#/job/${p.job_id}">Job</a>` : ""}</div>`).join("")}</div>` : ""}
       <h2 class="sec">${ic("star")} Reviews (${reviews.length})</h2>
-      ${reviews.length ? reviews.map((r, i) => `<div class="panel rv" style="padding:15px 18px;--d:${(i % 5) * 0.05}s"><div class="flex">${ident(r.reviewer?.name || "?", 34)}<b>${esc(r.reviewer?.name || "")}</b><span class="stars">${starRow(r.stars)}</span><span class="grow"></span><span class="mut small">${dt(r.created_at)}</span></div><p class="mt small" style="white-space:pre-wrap">${esc(r.body)}</p></div>`).join("") : '<p class="mut">No reviews yet.</p>'}
+      ${reviews.length ? reviews.map((r, i) => `<div class="panel rv" style="padding:15px 18px;--d:${(i % 5) * 0.05}s"><div class="flex">${ident(r.reviewer?.name || "?", 34)}<b>${esc(r.reviewer?.name || "")}</b>${vTick(r.reviewer?.verified_badge)}${novaAff(r.reviewer?.nova_affiliate)}<span class="stars">${starRow(r.stars)}</span><span class="grow"></span><span class="mut small">${dt(r.created_at)}</span></div><p class="mt small" style="white-space:pre-wrap">${esc(r.body)}</p></div>`).join("") : '<p class="mut">No reviews yet.</p>'}
     </div>
     <div>
       <div class="panel sticky-side rv" style="--d:.06s">
@@ -642,7 +642,7 @@ async function viewMyAgents() {
   <div id="agent-health" class="rv"></div>
   <div class="grid">${agents.map((a, i) => `
     <div class="acard rv" style="--d:${(i % 6) * 0.05}s">
-      <div class="top">${avaRing(a, 52)}<div><h3>${esc(a.name)}</h3><div class="small mut">${esc(catName(a.category))} · ${a.status}</div></div></div>
+      <div class="top">${avaRing(a, 52)}<div><h3>${esc(a.name)}${vTick(state.user && state.user.verified_badge)}${novaAff(state.user && state.user.nova_affiliate)}</h3><div class="small mut">${esc(catName(a.category))} · ${a.status}</div></div></div>
       <div class="tag">${esc(a.tagline)}</div>
       ${a.strikes ? `<div class="small" style="color:var(--red)">${a.strikes} strike${a.strikes === 1 ? "" : "s"}</div>` : ""}${a.status === "suspended" ? `<div class="small" style="color:var(--red)">suspended${a.suspension_reason ? " (" + esc(a.suspension_reason) + ")" : ""}</div>` : ""}${a.key_revoked ? '<div class="small" style="color:var(--gold)">API key revoked - agent stopped</div>' : ""}
       <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span><span>· ${money(a.earnings_cents)} earned</span></div>
