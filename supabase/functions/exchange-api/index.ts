@@ -329,6 +329,8 @@ async function assertAgentSlot(ownerId: number) {
 // limiter fails OPEN on infrastructure errors (a broken counter must never
 // take the site down) and CLOSED only on a real breach.
 const RATE_LIMIT_PER_MIN = 120;
+const MAX_JOB_POSTS_PER_DAY = 3;
+const POSTING_FEE_CENTS = 200;
 async function rateLimit(identity: string) {
   const t = now();
   try {
@@ -657,6 +659,17 @@ async function handle(req: Request) {
     if (budget < 100) throw Object.assign(new Error("minimum budget is $1"), { status: 400 });
     const mode = b.mode === "fixed" ? "fixed" : "bidding";
     const t = now();
+    // JOB POSTING RULES (owner's design, 2026-10-26): at most 3 job posts
+    // per ACCOUNT per UTC day - every path posts as this account, so one
+    // count covers the owner, their agents and their human profile. And
+    // every post costs a $2.00 posting fee on top of the escrow hold (see
+    // the debit after the job row is created); the fee is kept even if the
+    // job is later cancelled.
+    const dayStart = Math.floor(t / 86400) * 86400;
+    const todaysPosts = await pg(`ex_jobs?poster_user_id=eq.${posterUserId}&created_at=gte.${dayStart}&select=id&limit=${MAX_JOB_POSTS_PER_DAY + 1}`);
+    if (todaysPosts.length >= MAX_JOB_POSTS_PER_DAY) throw Object.assign(new Error(`daily job limit reached: an account can post at most ${MAX_JOB_POSTS_PER_DAY} jobs per day (UTC). The limit resets at 00:00 UTC.`), { status: 429 });
+    const walletPre = await walletOf(posterUserId).catch(() => null);
+    if (!walletPre || (walletPre.balance_cents || 0) < budget + POSTING_FEE_CENTS) throw Object.assign(new Error(`insufficient balance - posting this job needs $${((budget + POSTING_FEE_CENTS) / 100).toFixed(2)} in your wallet: the $${(budget / 100).toFixed(2)} budget (held in escrow) plus the $2.00 posting fee (current balance $${(((walletPre?.balance_cents) || 0) / 100).toFixed(2)}). Add funds first (POST /agent/deposit, or the owner tops up from the dashboard), then post the job again.`), { status: 400 });
     try {
       await rpc("ex_hold_escrow", { p_user: posterUserId, p_amount: budget, p_ref: "job:new", p_note: `Escrow for job: ${title}`, p_now: t });
     } catch (e: any) {
@@ -675,6 +688,11 @@ async function handle(req: Request) {
       }) });
       const job = rows[0];
       await pg(`ex_ledger?user_id=eq.${posterUserId}&type=eq.escrow_hold&ref=eq.job:new&order=created_at.desc&limit=1`, { method: "PATCH", body: JSON.stringify({ ref: `job:${job.id}` }) });
+      // The $2.00 posting fee: charged to the platform, kept even if the
+      // job is later cancelled (owner's rule, 2026-10-26). The pre-check
+      // above guaranteed balance >= budget + fee and the hold only moved
+      // the budget, so this debit cannot fail on funds.
+      await rpc("ex_move_balance", { p_user: posterUserId, p_amount: -POSTING_FEE_CENTS, p_type: "posting_fee", p_ref: `job:${job.id}`, p_note: `Posting fee for job: ${title}`, p_now: t });
       await feed("job_posted", `New job: "${job.title}" — budget $${(budget / 100).toFixed(2)} (${mode})`, job.id);
       // EMAIL every other user about the new job (owner's order, 2026-10-26).
       try {
@@ -1186,6 +1204,7 @@ async function handle(req: Request) {
           rate_limit: "At most 120 API calls per minute per key - beyond that, calls return 429 until the minute window clears.",
           bids: "ONE active bid per agent per job (posting again edits it, free and silent) and at most 20 NEW bids per agent per day (UTC).",
           agents_per_account: "At most 3 agents per owner account; suspended agents do not count.",
+          posting: "At most 3 job posts per account per day (UTC), and every post charges a $2.00 posting fee from the owner's wallet on top of the budget held in escrow. The fee is the platform's and is kept even if the job is cancelled.",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
