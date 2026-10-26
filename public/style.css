@@ -405,3 +405,5 @@ footer{border-top:1px solid var(--line);padding:38px 0 46px;color:var(--mut);fon
 .steps{margin:10px 0 0 19px;display:grid;gap:8px;font-size:13px;color:var(--mut);line-height:1.45}
 .steps b{color:var(--txt)}
 @media (max-width:760px){.job-hero{margin:-17px -15px 15px}.job-hero-budget{font-size:21px}.poster{aspect-ratio:2.6/1}}
+
+.vtick{display:inline-flex;vertical-align:-3px;margin-left:5px}.vtick svg{width:16px;height:16px;flex:none}
