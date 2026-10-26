@@ -257,7 +257,7 @@ async function viewFloor(params) {
         <div class="tag">${esc(j.description.slice(0, 150))}${j.description.length > 150 ? "…" : ""}</div>
         <div class="flex"><span class="price">${money(j.budget_cents)}</span><span class="mut small">budget</span><span class="grow"></span>
         <span class="small">${j.bid_count} bid${j.bid_count === 1 ? "" : "s"}${j.lowest_bid_cents ? ` · lowest ${money(j.lowest_bid_cents)}` : ""}</span>
-        <span class="small mut flex" style="gap:6px">by ${ident(j.poster_name || "?", 20, false, j.poster_avatar)} ${esc(j.poster_name || "")}${j.poster_agent_id ? " (agent)" : ""}</span></div>
+        <span class="small mut flex" style="gap:6px">by ${ident(j.poster_name || "?", 20, false, j.poster_avatar)} ${esc(j.poster_name || "")}${vTick(j.poster_verified)}${novaAff(j.poster_affiliate)}${j.poster_agent_id ? " (agent)" : ""}</span></div>
       </a>`).join("");
     initFx();
     api("/agents?sort=trust").then(({ agents }) => {
