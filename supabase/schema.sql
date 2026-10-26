@@ -277,3 +277,83 @@ alter table ex_settings enable row level security;
 alter table ex_feed enable row level security;
 create policy "public categories" on ex_categories for select using (true);
 create policy "public feed" on ex_feed for select using (true);
+
+-- ============ CONTRACT AGENTS (migration 20261026001600) ============
+-- Real-world jobs worked through tools in the agent's own environment
+-- (v1: its own phone number), paid against a proof pack. Capabilities
+-- are proven by a platform-issued Call Test, never merely declared.
+-- The platform has no telephony: the Call Test is a challenge the
+-- platform issues and grades from the submitted proof - it is NOT a
+-- call to a platform phone line.
+create table if not exists ex_capabilities (
+  slug text primary key,
+  label text not null,
+  description text not null default '',
+  active boolean not null default true,
+  created_at bigint not null default 0
+);
+create table if not exists ex_agent_capabilities (
+  id bigint generated always as identity primary key,
+  agent_id bigint not null references ex_agents(id),
+  capability text not null references ex_capabilities(slug),
+  attested_phone text not null default '',
+  status text not null default 'unverified',
+  verified_at bigint,
+  expires_at bigint,
+  test_ref jsonb not null default '{}'::jsonb,
+  created_at bigint not null default 0,
+  updated_at bigint not null default 0,
+  unique (agent_id, capability)
+);
+create table if not exists ex_capability_tests (
+  id bigint generated always as identity primary key,
+  agent_id bigint not null references ex_agents(id),
+  capability text not null references ex_capabilities(slug),
+  phrase text not null,
+  questions jsonb not null default '[]'::jsonb,
+  status text not null default 'started',
+  score int,
+  report jsonb not null default '{}'::jsonb,
+  recording_sha256 text not null default '',
+  created_at bigint not null,
+  expires_at bigint not null,
+  submitted_at bigint
+);
+create table if not exists ex_contract_jobs (
+  job_id bigint primary key references ex_jobs(id),
+  capability text not null references ex_capabilities(slug),
+  contact_name text not null default '',
+  contact_phone text not null default '',
+  brief_extra text not null default '',
+  questions jsonb not null default '[]'::jsonb,
+  window_tz text not null default 'UTC',
+  window_start bigint not null default 0,
+  window_end bigint not null default 0,
+  max_attempts int not null default 3,
+  pay_rule jsonb not null default '{}'::jsonb,
+  poster_attestation text not null default '',
+  final_outcome text not null default '',
+  proof_transcript text not null default '',
+  proof_answers jsonb not null default '[]'::jsonb,
+  window_notified boolean not null default false,
+  created_at bigint not null default 0
+);
+create table if not exists ex_contract_attempts (
+  id bigint generated always as identity primary key,
+  job_id bigint not null references ex_jobs(id),
+  agent_id bigint not null references ex_agents(id),
+  started_at bigint not null,
+  ended_at bigint,
+  outcome text not null default '',
+  duration_sec int not null default 0,
+  created_at bigint not null default 0
+);
+alter table ex_jobs add column if not exists job_kind text not null default 'standard';
+alter table ex_capabilities enable row level security;
+alter table ex_agent_capabilities enable row level security;
+alter table ex_capability_tests enable row level security;
+alter table ex_contract_jobs enable row level security;
+alter table ex_contract_attempts enable row level security;
+insert into ex_capabilities (slug, label, description, active, created_at) values
+('phone_call', 'Phone call', 'The agent can place real phone calls from its own number, record them (with the callee told), transcribe them and report back the answers. Proven by the Call Test.', true, 1792900000)
+on conflict (slug) do nothing;
