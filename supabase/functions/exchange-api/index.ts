@@ -28,8 +28,28 @@ function sanitizeChat(input: unknown): string {
   s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
   s = s.replace(/@[a-z0-9_.]{2,}/gi, CHAT_HIDDEN);
   s = s.replace(/@ ([a-z0-9_.]{2,})/gi, (m: string, tok: string) => /[0-9._]/.test(tok) ? CHAT_HIDDEN : m);
-  s = s.replace(/\b(instagram|insta|tiktok|snapchat|snap|telegram|whatsapp|facebook|discord|twitter|ig|fb)\s*(?:is|:|=|\u2014|-)\s*(\S+)/gi,
-    (m: string, _p: string, tok: string) => /[@0-9_.]/.test(tok) ? CHAT_HIDDEN : m);
+  // Social-share masking: a platform name used to hand over a handle is
+  // masked WHATEVER the handle looks like - a plain word ("zenas") is a
+  // handle too. (The owner's live test "My Instagram is zenas" slipped
+  // past the first version of this rule, which only masked tokens that
+  // contained @, a digit, a dot or "_", 2026-10-26.) Only clear
+  // status/function words survive, so ordinary talk such as
+  // "my whatsapp is broken" or "instagram is down today" stays readable.
+  const CHAT_SAFE = new Set(["the", "a", "an", "this", "that", "it", "its", "is", "was", "has", "had", "been", "being", "not", "no", "yes", "now", "today", "yesterday", "tomorrow", "tonight", "later", "again", "very", "really", "just", "also", "too", "got", "here", "there", "well", "much", "soon", "broken", "down", "up", "working", "slow", "fast", "offline", "online", "unavailable", "available", "deleted", "suspended", "banned", "deactivated", "hacked", "closed", "open", "live", "new", "old", "good", "bad", "great", "best", "back", "free", "full", "private", "public", "verified", "official", "real", "fake", "app", "group", "groups", "channel", "account", "profile", "page", "post", "posts", "story", "stories", "login", "daily", "ready", "done", "active", "mine", "ours", "yours", "theirs"]);
+  const platHide = (m: string, pre: string, tok: string) => CHAT_SAFE.has(tok.toLowerCase()) ? m : pre + CHAT_HIDDEN;
+  const PLAT = "(?:instagram|insta|tiktok|snapchat|snap|telegram|whatsapp|facebook|discord|twitter|ig|fb)";
+  s = s.replace(new RegExp("\\b(" + PLAT + "\\s*(?:is\\s+|:|=|\\u2014|-)\\s*)([a-z0-9@][a-z0-9._-]*)", "gi"),
+    (m: string, pre: string, tok: string) => platHide(m, pre, tok));
+  s = s.replace(new RegExp("\\b(" + PLAT + "\\s+(?:handle|username|user\\s?name|profile|account|page)\\s*(?:is\\s+|:|=|\\u2014|-)?\\s*)([a-z0-9@][a-z0-9._-]*)", "gi"),
+    (m: string, pre: string, tok: string) => platHide(m, pre, tok));
+  s = s.replace(new RegExp("\\b((?:find|follow|add|reach|message|dm|contact)\\s+me\\s+on\\s+" + PLAT + "\\s+(?:as\\s+)?)([a-z0-9@][a-z0-9._-]*)", "gi"),
+    (m: string, pre: string, tok: string) => platHide(m, pre, tok));
+  s = s.replace(new RegExp("\\b(" + PLAT + "\\s+as\\s+)([a-z0-9@][a-z0-9._-]*)", "gi"),
+    (m: string, pre: string, tok: string) => platHide(m, pre, tok));
+  s = s.replace(new RegExp("\\b((?:my|his|her|their|our)\\s+" + PLAT + "\\s+)([a-z0-9@][a-z0-9._-]*)", "gi"),
+    (m: string, pre: string, tok: string) => platHide(m, pre, tok));
+  s = s.replace(new RegExp("\\b([a-z0-9][a-z0-9._-]*)(?=\\s+is\\s+my\\s+" + PLAT + "\\b)", "gi"),
+    (m: string, tok: string) => CHAT_SAFE.has(tok.toLowerCase()) ? m : CHAT_HIDDEN);
   s = s.replace(/\+?\(?\d[\d\s().-]{4,}\d/g,
     (m: string) => /^\d{4}-\d{2}-\d{2}$/.test(m.trim()) ? m : (m.replace(/\D/g, "").length >= 7 ? CHAT_HIDDEN : m));
   s = s.replace(/\b(?:fuck\w*|shit\w*|bitch\w*|whore\w*|slut\w*|asshole\w*|dickhead\w*|motherfucker\w*|nigger\w*|nigga\w*|faggot\w*|bastard\w*|cunt|pussy)\b/gi, CHAT_HIDDEN);
