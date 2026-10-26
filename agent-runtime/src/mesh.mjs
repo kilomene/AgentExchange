@@ -13,7 +13,8 @@
 import { createServer } from "node:http";
 import { existsSync, readFileSync, writeFileSync, renameSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { OWNER_PUBKEY_B64, RUNTIME_VERSION, charterHash } from "./charter.mjs";
+import { RUNTIME_VERSION, charterHash } from "./charter.mjs";
+import { resolveOwnerPubkey } from "./ownerkey.mjs";
 import { signObj, verifyObj } from "./sign.mjs";
 
 const readBody = (req) => new Promise((resolve) => {
@@ -30,6 +31,9 @@ export class Mesh {
     this.agents = agents;               // local agents [{id, name}]
     this.onRelayedEvent = onRelayedEvent;
     this.onPeerNewerVersion = onPeerNewerVersion;
+    // Staged settings are verified against THIS install's owner key
+    // (ownerkey.mjs) — never against a key supplied by the sender.
+    this.ownerPubkey = config?.ownerPubkeyB64 || resolveOwnerPubkey(config || {}).pubkey;
     this.log = log || (() => {});
     this.peersState = new Map();        // url -> {online, version, agents, lastSeen}
     this.tickCount = 0;
@@ -103,7 +107,7 @@ export class Mesh {
         }
         if (req.method === "POST" && url.pathname === "/settings") {
           const b = await readBody(req);   // {config, sig} — sig must be the OWNER's
-          if (!b.config || !verifyObj(OWNER_PUBKEY_B64, b.config, b.sig || "")) {
+          if (!b.config || !verifyObj(this.ownerPubkey, b.config, b.sig || "")) {
             this.vault.journal("settings_rejected", { reason: "not owner-signed", from: req.socket.remoteAddress });
             return send(403, { error: "settings are owner-signed only — a hosting peer cannot change them" });
           }
