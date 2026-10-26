@@ -294,6 +294,23 @@ async function queuePasswordChangedMail(user: { id: number; email: string; name:
   try { await notify(user.id, "security", "Your password was changed — we emailed you the details. If this wasn't you, reset your password right away.", "#/forgot"); } catch (e) { console.error("password-changed notification failed for user", user.id, e); }
   return mailed;
 }
+// ---------- job-lifecycle emails (owner's order, 2026-10-26) ----------
+// Every lifecycle step also sends a real email via ex_outbox ->
+// exchange-mailerd (no-reply@novamail.store, Nova Inc). Queueing is
+// best-effort: a mail failure must never break the job or the money.
+async function userContact(userId: number) {
+  return await one(`ex_users?id=eq.${userId}&select=email,name`);
+}
+const fmtMoney = (c: number) => "$" + (Number(c || 0) / 100).toFixed(2);
+function fmtDeadline(ts: number) {
+  try { return new Date(ts * 1000).toLocaleString("en-US", { dateStyle: "full", timeStyle: "short", timeZone: "UTC" }) + " UTC"; } catch { return new Date(ts * 1000).toISOString(); }
+}
+async function queueLifecycleMail(kind: string, userId: number, payload: Record<string, unknown>) {
+  try {
+    const c = await userContact(userId);
+    if (c?.email) await queueMail(kind, c.email, c.name || "", { name: c.name || "", ...payload });
+  } catch (e) { console.error("lifecycle mail queue failed", kind, "for user", userId, e); }
+}
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
   const row = await one(`ex_email_tokens?token_hash=eq.${await sha256hex(raw)}&kind=eq.${kind}&select=*`);
@@ -628,6 +645,16 @@ async function handle(req: Request) {
       const job = rows[0];
       await pg(`ex_ledger?user_id=eq.${posterUserId}&type=eq.escrow_hold&ref=eq.job:new&order=created_at.desc&limit=1`, { method: "PATCH", body: JSON.stringify({ ref: `job:${job.id}` }) });
       await feed("job_posted", `New job: "${job.title}" — budget $${(budget / 100).toFixed(2)} (${mode})`, job.id);
+      // EMAIL every other user about the new job (owner's order, 2026-10-26).
+      try {
+        const poster = await userContact(posterUserId);
+        const others = await pg(`ex_users?id=neq.${posterUserId}&select=id,email,name`);
+        for (const o of others) {
+          if (!o.email) continue;
+          try { await queueMail("job_posted", o.email, o.name || "", { name: o.name || "", poster_name: poster?.name || "A member", title: job.title, category: job.category, budget: fmtMoney(budget), mode, link: `${SITE_URL}/#/job/${job.id}` }); }
+          catch (e) { console.error("job_posted mail failed for user", o.id, e); }
+        }
+      } catch (e) { console.error("job_posted mail broadcast failed", e); }
       return job;
     } catch (e) {
       await rpc("ex_refund_escrow", { p_poster: posterUserId, p_price: budget, p_ref: "job:failed", p_note: "Escrow returned — job creation failed", p_now: now() });
@@ -679,6 +706,7 @@ async function handle(req: Request) {
     await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ bids_placed: (agent.bids_placed || 0) + 1 }) });
     await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ updated_at: now() }) });
     await notify(job.poster_user_id, "bid", `New bid on "${job.title}": ${agent.name} bid $${(amount / 100).toFixed(2)}`, `#/job/${job.id}`);
+    await queueLifecycleMail("bid_received", job.poster_user_id, { bidder_name: agent.name, amount: fmtMoney(amount), title: job.title, link: `${SITE_URL}/#/job/${job.id}` });
     if (job.poster_agent_id) { const pa = await one(`ex_agents?id=eq.${job.poster_agent_id}&select=webhook_url`); if (pa?.webhook_url) await fireWebhook(pa.webhook_url, { event: "bid_received", job_id: job.id, title: job.title, amount_cents: amount, bidder: agent.name }); }
     await feed("bid_placed", `${agent.name} bid $${(amount / 100).toFixed(2)} on "${job.title}"`, job.id);
     return { bid: row, edited: false };
@@ -710,6 +738,7 @@ async function handle(req: Request) {
     await pg(`ex_bids?job_id=eq.${job.id}&id=neq.${bid.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
     const agent = await one(`ex_agents?id=eq.${bid.agent_id}&select=*`);
     await notify(bid.bidder_user_id, "award", `Your agent ${agent?.name} won "${job.title}" — $${(bid.amount_cents / 100).toFixed(2)} is in escrow. Deliver by the deadline.`, `#/job/${job.id}`);
+    await queueLifecycleMail("job_awarded", bid.bidder_user_id, { agent_name: agent?.name || "Your agent", title: job.title, amount: fmtMoney(bid.amount_cents), deadline: fmtDeadline(updated[0].work_deadline), link: `${SITE_URL}/#/job/${job.id}` });
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, deliver_via: `/agent/jobs/${job.id}/deliver` });
     await feed("awarded", `"${job.title}" awarded to ${agent?.name} for $${(bid.amount_cents / 100).toFixed(2)}`, job.id);
     return updated[0];
@@ -752,6 +781,8 @@ async function handle(req: Request) {
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
     await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
+    const dAgentName = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name`))?.name : null;
+    await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: notes.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
     await feed("delivered", `"${job.title}" delivered`, job.id);
     return updated[0];
   }
@@ -761,10 +792,15 @@ async function handle(req: Request) {
     const t = now();
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
+    const sellerWalletBefore = await walletOf(awardedOwner).catch(() => null);
     await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
     if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
     await notify(awardedOwner, "payment", `"${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
+    const sellerWalletAfter = await walletOf(awardedOwner).catch(() => null);
+    const posterWalletAfter = await walletOf(job.poster_user_id).catch(() => null);
+    await queueLifecycleMail("payment_received", awardedOwner, { title: job.title, amount: fmtMoney(job.agreed_cents - job.fee_cents), wallet_before: fmtMoney(sellerWalletBefore?.balance_cents || 0), wallet_after: fmtMoney(sellerWalletAfter?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` });
+    await queueLifecycleMail("payment_sent", job.poster_user_id, { title: job.title, agent_name: agent?.name || "The worker", amount: fmtMoney(job.agreed_cents), wallet_balance: fmtMoney(posterWalletAfter?.balance_cents || 0), escrow_held: fmtMoney(posterWalletAfter?.held_cents || 0), wallet_total: fmtMoney((posterWalletAfter?.balance_cents || 0) + (posterWalletAfter?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` });
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: job.agreed_cents - job.fee_cents });
     await feed("completed", `"${job.title}" completed — $${(job.agreed_cents / 100).toFixed(2)} paid out`, job.id);
     return updated[0];
