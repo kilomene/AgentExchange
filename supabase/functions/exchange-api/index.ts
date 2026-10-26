@@ -324,25 +324,24 @@ async function assertAgentSlot(ownerId: number) {
 }
 // RATE LIMIT (owner's rule #1, 2026-10-26): at most 120 authenticated API
 // calls per minute per key - per user account on the web surface, per agent
-// on the agent surface. Counted from ex_rate_log over a rolling 60-second
-// window; going over returns 429 and the rejected call is not counted. The
-// limiter fails OPEN on infrastructure errors (a broken counter must never
-// take the site down) and CLOSED only on a real breach.
+// on the agent surface. Counted by the atomic ex_rate_hit() RPC over a
+// fixed 60-second window per identity (row-locked upsert, so the cap is
+// exact even under parallel hammering); going over returns 429. Every call
+// counts, including rejected ones. The limiter fails OPEN on
+// infrastructure errors (a broken counter must never take the site down)
+// and CLOSED only on a real breach.
 const RATE_LIMIT_PER_MIN = 120;
 const MAX_JOB_POSTS_PER_DAY = 3;
 const POSTING_FEE_CENTS = 200;
 async function rateLimit(identity: string) {
-  const t = now();
   try {
-    const recent = await pg(`ex_rate_log?identity=eq.${q(identity)}&created_at=gt.${t - 60}&select=id&order=id.desc&limit=${RATE_LIMIT_PER_MIN + 1}`);
-    if (recent.length >= RATE_LIMIT_PER_MIN) throw Object.assign(new Error(`rate limit reached: at most ${RATE_LIMIT_PER_MIN} API calls per minute per key. Slow down and retry in a few seconds.`), { status: 429 });
-    await pg("ex_rate_log", { method: "POST", body: JSON.stringify({ identity, created_at: t }) });
+    const res: any = await rpc("ex_rate_hit", { p_identity: identity, p_now: now() });
+    const hits = typeof res === "number" ? res : Number(res?.ex_rate_hit ?? (Array.isArray(res) ? res[0]?.ex_rate_hit : 0) ?? 0);
+    if (hits > RATE_LIMIT_PER_MIN) throw Object.assign(new Error(`rate limit reached: at most ${RATE_LIMIT_PER_MIN} API calls per minute per key. Slow down and retry in a few seconds.`), { status: 429 });
   } catch (e: any) {
     if (e && e.status === 429) throw e;
     console.error("rate limiter error (failing open)", identity, e);
   }
-  // Opportunistic cleanup so the log stays tiny.
-  await pg(`ex_rate_log?identity=eq.${q(identity)}&created_at=lt.${t - 600}`, { method: "DELETE" }).catch(() => null);
 }
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
