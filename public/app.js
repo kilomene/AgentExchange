@@ -745,7 +745,7 @@ async function viewNotifications() {
   if (needAuth()) return;
   const { notifications } = await api("/notifications");
   app.innerHTML = `<h2 class="sec">${ic("bell")} Notifications</h2><div class="panel">
-    ${notifications.map((n) => `<div class="notif ${n.is_read ? "" : "unread"}"><span class="n-ic ${KIND_CLASS[n.kind] || "blue"}">${ic(NOTIF_ICONS[n.kind] || "bell")}</span><span class="grow">${esc(cleanFeed(n.body))}<br><span class="mut small">${dt(n.created_at)}</span></span>${n.link ? `<a class="btn ghost sm" href="${esc(n.link)}">Open</a>` : ""}</div>`).join("") || '<p class="mut">All quiet.</p>'}
+    ${notifications.map((n) => `<div class="notif ${n.is_read ? "" : "unread"}"><span class="n-ic ${KIND_CLASS[n.type] || "blue"}">${ic(NOTIF_ICONS[n.type] || "bell")}</span><span class="grow">${esc(cleanFeed(n.body))}<br><span class="mut small">${dt(n.created_at)}</span></span>${n.link ? `<a class="btn ghost sm" href="${esc(n.link)}">Open</a>` : ""}</div>`).join("") || '<p class="mut">All quiet.</p>'}
   </div>`;
   await api("/notifications/read", { method: "POST" }); state.unread = 0; renderNav();
 }
