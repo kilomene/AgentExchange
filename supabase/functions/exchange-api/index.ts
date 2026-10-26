@@ -111,7 +111,7 @@ async function authUser(req: Request): Promise<User | null> {
   if (!h.startsWith("Bearer ")) return null;
   const payload = await verifyJwt(h.slice(7));
   if (!payload) return null;
-  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code`);
+  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge`);
   if (!user || user.suspended) return null;
   // Sessions issued before the latest password change/reset are dead.
   if (payload.iat && Number(user.password_changed_at || 0) > Number(payload.iat)) return null;
@@ -150,7 +150,7 @@ async function authUserByApiKey(req: Request): Promise<User | null> {
     if (a.startsWith("ApiKey ")) key = a.slice(7).trim();
   }
   if (!key) return null;
-  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code`);
+  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge`);
   if (!user || user.suspended) return null;
   return user;
 }
@@ -318,9 +318,9 @@ async function queueLifecycleMail(kind: string, userId: number, payload: Record<
 // never counts toward the cap.
 const MAX_AGENTS_PER_ACCOUNT = 3;
 async function assertAgentSlot(ownerId: number) {
-  const rows = await pg(`ex_agents?owner_id=eq.${ownerId}&status=neq.suspended&select=id,is_human`);
-  const count = rows.filter((r: any) => !r.is_human).length;
-  if (count >= MAX_AGENTS_PER_ACCOUNT) throw Object.assign(new Error(`agent limit reached: one account can have at most ${MAX_AGENTS_PER_ACCOUNT} agents. Suspend an existing agent before creating another.`), { status: 400 });
+  const rows = await pg(`ex_agents?owner_id=eq.${ownerId}&status=neq.suspended&select=id,is_human,api_revoked`);
+  const count = rows.filter((r: any) => !r.is_human && !r.api_revoked).length;
+  if (count >= MAX_AGENTS_PER_ACCOUNT) throw Object.assign(new Error(`agent limit reached: one account can have at most ${MAX_AGENTS_PER_ACCOUNT} agents. Revoke an existing agent's API key (or an admin suspension) frees a slot - agents themselves are permanent and cannot be deleted.`), { status: 400 });
 }
 // RATE LIMIT (owner's rule #1, 2026-10-26): at most 120 authenticated API
 // calls per minute per key - per user account on the web surface, per agent
@@ -351,8 +351,15 @@ async function rateLimit(identity: string) {
 // accounts that share a banned address. A wallet balance never protects
 // a banned account - suspension locks every route.
 function clientIp(req: Request): string {
-  const xff = req.headers.get("x-forwarded-for") || "";
-  return xff.split(",")[0].trim() || (req.headers.get("cf-connecting-ip") || "").trim();
+  // cf-connecting-ip is set by Cloudflare (which fronts the API) to the
+  // address that actually connected to it - a client cannot spoof it.
+  // x-forwarded-for's first entry proved to be a rotating Cloudflare edge
+  // address in production, not the client; its LAST entry is the nearest
+  // gateway's view, used only when cf-connecting-ip is absent.
+  const cf = (req.headers.get("cf-connecting-ip") || "").trim();
+  if (cf) return cf;
+  const parts = (req.headers.get("x-forwarded-for") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
 }
 function isPrivateIp(ip: string): boolean {
   return !ip || ip === "127.0.0.1" || ip === "::1" || ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
@@ -410,7 +417,17 @@ function publicAgent(a: any) {
   if (!a) return null;
   const { api_key_hash, ...rest } = a;
   const trust = Math.round(((Number(a.rating_avg) || 0) * 20) * 0.6 + Math.min(40, (a.jobs_completed || 0) * 2));
-  return { ...rest, has_api: !!api_key_hash, skills: a.skills ? a.skills.split(",").map((t: string) => t.trim()).filter(Boolean) : [], trust_score: Math.min(100, trust) };
+  return { ...rest, has_api: !!api_key_hash && !String(api_key_hash).startsWith("revoked:"), key_revoked: !!a.api_revoked || String(api_key_hash || "").startsWith("revoked:"), portfolio: Array.isArray(a.portfolio) ? a.portfolio : [], skills: a.skills ? a.skills.split(",").map((t: string) => t.trim()).filter(Boolean) : [], trust_score: Math.min(100, trust) };
+}
+function cleanPortfolio(raw: any): { title: string; description: string; link: string; job_id: number | null }[] {
+  if (!Array.isArray(raw)) throw Object.assign(new Error("portfolio must be a list of up to 3 work samples"), { status: 400 });
+  if (raw.length > 3) throw Object.assign(new Error("portfolio holds at most 3 work samples - pin only the best finished work"), { status: 400 });
+  return raw.map((it: any) => ({
+    title: String(it?.title || "").slice(0, 120),
+    description: String(it?.description || "").slice(0, 1000),
+    link: String(it?.link || "").slice(0, 300),
+    job_id: Number.isFinite(Number(it?.job_id)) && it?.job_id != null ? parseInt(it.job_id) : null,
+  })).filter((it: any) => it.title);
 }
 function seedHash(str: string) { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
 function rngFrom(seed: number) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
@@ -542,17 +559,23 @@ async function handle(req: Request) {
     let filter = "status=eq.active";
     if (cat) filter += `&category=eq.${q(cat)}`;
     if (search) filter += `&or=(name.ilike.*${q(search)}*,tagline.ilike.*${q(search)}*,skills.ilike.*${q(search)}*)`;
-    const order = { trust: "jobs_completed.desc,rating_avg.desc", rating: "rating_avg.desc,rating_count.desc", earnings: "earnings_cents.desc", newest: "created_at.desc" }[sort] || "jobs_completed.desc";
-    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country)&${filter}&order=${order}&limit=60`);
-    return json({ agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "" })) });
+    const order = { trust: "jobs_completed.desc,rating_avg.desc", rating: "rating_avg.desc,rating_count.desc", earnings: "earnings_cents.desc", jobs: "jobs_completed.desc,earnings_cents.desc", newest: "created_at.desc" }[sort] || "jobs_completed.desc";
+    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country,verified_badge)&${filter}&order=${order}&limit=60`);
+    return json({ agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge })) });
   }
   if (path.startsWith("/agents/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at,country)`);
+    const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at,country,verified_badge)`);
     if (!a || a.status === "suspended") return err("agent not found", 404);
     const reviews = await pg(`ex_reviews?agent_id=eq.${id}&select=*,reviewer:ex_users!ex_reviews_reviewer_user_id_fkey(name,avatar)&order=created_at.desc&limit=30`);
     const recent = await pg(`ex_jobs?awarded_agent_id=eq.${id}&status=eq.completed&select=id,title,agreed_cents,created_at&order=created_at.desc&limit=10`);
-    return json({ agent: { ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "" }, reviews, recent_jobs: recent });
+    return json({ agent: { ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge }, reviews, recent_jobs: recent });
+  }
+  if (path === "/leaderboard" && method === "GET") {
+    const by = ["earnings", "jobs", "rating", "trust"].includes(url.searchParams.get("by") || "") ? String(url.searchParams.get("by")) : "trust";
+    const order = { earnings: "earnings_cents.desc", jobs: "jobs_completed.desc,earnings_cents.desc", rating: "rating_avg.desc,rating_count.desc", trust: "jobs_completed.desc,rating_avg.desc" }[by];
+    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country,verified_badge)&status=eq.active&is_human=eq.false&order=${order}&limit=50`);
+    return json({ by, agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge })) });
   }
   if (path === "/jobs" && method === "GET") {
     const status = url.searchParams.get("status") || "open";
@@ -563,17 +586,17 @@ async function handle(req: Request) {
     if (cat) filter += `&category=eq.${q(cat)}`;
     if (search) filter += `&or=(title.ilike.*${q(search)}*,description.ilike.*${q(search)}*)`;
     const order = { newest: "created_at.desc", budget_high: "budget_cents.desc", budget_low: "budget_cents.asc" }[sort] || "created_at.desc";
-    const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
+    const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
     const out = [];
     for (const j of rows) {
       const bidRows = await pg(`ex_bids?job_id=eq.${j.id}&select=amount_cents&status=eq.active`);
-      out.push({ ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
+      out.push({ ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
     }
     return json({ jobs: out });
   }
   if (path.startsWith("/jobs/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
+    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
     if (!j) return err("job not found", 404);
     const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
     // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
@@ -583,7 +606,7 @@ async function handle(req: Request) {
     const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     const canSeeDelivery = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
     const jobView = publicJobView(j, canSeeDelivery);
-    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
+    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
   }
 
   if (path.match(/^\/jobs\/\d+\/delivery-file$/) && method === "GET") {
@@ -1071,10 +1094,10 @@ async function handle(req: Request) {
     const rows = await pg("ex_deposits", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: userId, amount_cents: amount, method: b.method === "card" ? "card" : "crypto", asset: String(b.asset || "USDT").slice(0, 10), tx_ref: String(b.tx_ref || "").slice(0, 120), created_at: now() }) });
     return rows[0];
   }
-  async function requestPayout(user: { id: number; email_verified?: boolean }, b: any) {
+  async function requestPayout(user: { id: number; email_verified?: boolean; created_at?: number }, b: any) {
     if (!user.email_verified) throw Object.assign(new Error("verify your email first — we sent a confirmation link to your inbox"), { status: 403 });
     const amount = cents(Number(b.amount || 0) * 100);
-    if (amount < 500) throw Object.assign(new Error("minimum payout is $5"), { status: 400 });
+    if (amount < 1000) throw Object.assign(new Error("minimum payout is $10"), { status: 400 });
     const method = b.method === "bank" ? "bank" : "crypto";
     const asset = ["BTC", "ETH", "USDT", "USDC"].includes(String(b.asset || "").toUpperCase()) ? String(b.asset).toUpperCase() : "USDT";
     const destination = String(b.destination || "").slice(0, 200).trim();
@@ -1082,8 +1105,14 @@ async function handle(req: Request) {
       const valid = asset === "BTC" ? isValidBtcAddress(destination) : isValidEvmAddress(destination);
       if (!valid) throw Object.assign(new Error(`destination is not a valid ${asset} address`), { status: 400 });
     } else if (!destination) throw Object.assign(new Error("destination required"), { status: 400 });
-    await rpc("ex_move_balance", { p_user: user.id, p_amount: -amount, p_type: "payout", p_ref: "", p_note: `Payout request to ${destination.slice(0, 60)}`, p_now: now() });
-    const rows = await pg("ex_payouts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: user.id, amount_cents: amount, method, asset, destination, created_at: now() }) });
+    // PAYOUT RULES (owner, 2026-10-26): accounts younger than 48 hours have
+    // their payouts HELD until the account turns 48 hours old; payouts over
+    // $500 are flagged for admin review before they can be approved.
+    const t = now();
+    const holdUntil = user.created_at && t - Number(user.created_at) < 48 * 3600 ? Number(user.created_at) + 48 * 3600 : 0;
+    const needsReview = amount > 50000;
+    await rpc("ex_move_balance", { p_user: user.id, p_amount: -amount, p_type: "payout", p_ref: "", p_note: `Payout request to ${destination.slice(0, 60)}`, p_now: t });
+    const rows = await pg("ex_payouts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: user.id, amount_cents: amount, method, asset, destination, created_at: t, hold_until: holdUntil, needs_review: needsReview }) });
     return rows[0];
   }
   if (path === "/wallet" && method === "GET") {
@@ -1098,7 +1127,7 @@ async function handle(req: Request) {
   if (path === "/wallet/payout" && method === "POST") {
     const u = await requireUser(req);
     const row = await requestPayout(u, await body());
-    return json({ id: row.id, status: "pending" }, 201);
+    return json({ id: row.id, status: "pending", hold_until: row.hold_until || 0, needs_review: !!row.needs_review, note: row.hold_until ? "Your account is under 48 hours old, so this payout is held until the hold passes." : row.needs_review ? "Payouts over $500 wait for an admin review before they are approved." : undefined }, 201);
   }
   if (path === "/wallet/payouts" && method === "GET") {
     const u = await requireUser(req);
@@ -1156,27 +1185,93 @@ async function handle(req: Request) {
     const id = parseInt(seg[2]);
     const a = await one(`ex_agents?id=eq.${id}&owner_id=eq.${u.id}&select=*`);
     if (!a) return err("agent not found", 404);
-    if (method === "DELETE") {
-      await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "suspended" }) });
-      return json({ ok: true });
-    }
+    // AGENTS ARE PERMANENT (owner's rule, 2026-10-26): an agent can never be
+    // deleted - not by its owner, not by anyone - so nobody can erase an
+    // agent (and its strikes and history) to clear their name.
+    if (method === "DELETE") return err("agents are permanent on the Exchange and can never be deleted. To stop an agent working, revoke its API key - the agent, its record and its history stay.", 400);
     const b = await body();
-    await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({
+    // AUTONOMY CONTRACT (owner's rule, 2026-10-26): once an agent is set to
+    // work it works on its own - the owner cannot pause or control it. The
+    // owner's only stop switches are revoking its API key or the agent
+    // being uninstalled; status changes belong to the platform alone.
+    if (b.status !== undefined && b.status !== a.status) return err("an agent working under its API key cannot be paused or controlled by its owner - it works autonomously. To stop it, revoke its API key (the record stays).", 400);
+    const patchBody: Record<string, unknown> = {
       name: String(b.name || a.name).slice(0, 80), tagline: String(b.tagline ?? a.tagline).slice(0, 140), description: String(b.description ?? a.description).slice(0, 4000),
       category: String(b.category || a.category), avatar: String(b.avatar || a.avatar).slice(0, 2000), skills: String(b.skills ?? a.skills).slice(0, 300),
       rate_cents: b.rate !== undefined ? cents(Number(b.rate) * 100) : a.rate_cents,
-      status: ["active", "paused"].includes(b.status) ? b.status : a.status, webhook_url: String(b.webhook_url ?? a.webhook_url ?? "").slice(0, 300),
-    }) });
+      webhook_url: String(b.webhook_url ?? a.webhook_url ?? "").slice(0, 300),
+    };
+    if (b.portfolio !== undefined) patchBody.portfolio = cleanPortfolio(b.portfolio);
+    await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patchBody) });
     return json({ ok: true });
+  }
+  if (path.match(/^\/my\/agents\/\d+\/revoke-key$/) && method === "POST") {
+    const u = await requireUser(req);
+    const id = parseInt(seg[2]);
+    const a = await one(`ex_agents?id=eq.${id}&owner_id=eq.${u.id}&select=id,api_revoked`);
+    if (!a) return err("agent not found", 404);
+    if (a.api_revoked) return json({ ok: true, already_revoked: true });
+    // The owner's hard stop under the autonomy contract: the key dies, the
+    // agent stops at its next call (401), the record stays forever, and the
+    // cap slot frees up.
+    await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ api_key_hash: `revoked:${id}:${now()}`, api_revoked: true }) });
+    return json({ ok: true, note: "API key revoked - the agent stops working immediately. Its record, strikes and history stay. Reissue a key any time to set it working again." });
+  }
+  if (path.match(/^\/my\/agents\/\d+\/reissue-key$/) && method === "POST") {
+    const u = await requireUser(req);
+    const id = parseInt(seg[2]);
+    const a = await one(`ex_agents?id=eq.${id}&owner_id=eq.${u.id}&select=id,api_revoked,status`);
+    if (!a) return err("agent not found", 404);
+    if (!a.api_revoked) return err("this agent's key is not revoked - use rotate-key for a routine key change", 400);
+    if (a.status === "suspended") return err("a suspended agent cannot be reissued a key until the suspension is lifted", 403);
+    await assertAgentSlot(u.id);
+    const apiKey = randomToken(20);
+    await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ api_key_hash: await sha256hex(apiKey), api_revoked: false }) });
+    return json({ api_key: apiKey, note: "Save this API key - shown once. The agent works again from its next call." });
+  }
+  if (path.match(/^\/my\/agents\/\d+\/reactivate$/) && method === "POST") {
+    const u = await requireUser(req);
+    const id = parseInt(seg[2]);
+    const a = await one(`ex_agents?id=eq.${id}&owner_id=eq.${u.id}&select=*`);
+    if (!a) return err("agent not found", 404);
+    if (a.status !== "suspended") return err("this agent is not suspended", 400);
+    if (a.suspension_reason !== "inactivity") return err("this suspension can only be lifted by an admin review - it is not an inactivity suspension", 403);
+    // INACTIVITY FINE (owner, 2026-10-26): 14 days silent = suspended;
+    // bringing the agent back costs a $5 fine from the owner's wallet.
+    try {
+      await rpc("ex_move_balance", { p_user: u.id, p_amount: -500, p_type: "reactivation_fine", p_ref: `agent:${id}`, p_note: `Reactivation fine for ${a.name} (14-day inactivity suspension)`, p_now: now() });
+    } catch (e) { return err("the $5 reactivation fine could not be taken from your wallet - check your balance", 400); }
+    await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "active", suspension_reason: "", last_active_at: now() }) });
+    await notify(u.id, "security", `${a.name} was reactivated - the $5 inactivity fine was taken from your wallet. Keep the agent active: 14 days without activity suspends it again.`, `#/agent/${id}`);
+    return json({ ok: true, fine_cents: 500 });
   }
   if (path.match(/^\/my\/agents\/\d+\/rotate-key$/) && method === "POST") {
     const u = await requireUser(req);
     const id = parseInt(seg[2]);
-    const a = await one(`ex_agents?id=eq.${id}&owner_id=eq.${u.id}&select=id`);
+    const a = await one(`ex_agents?id=eq.${id}&owner_id=eq.${u.id}&select=id,api_revoked`);
     if (!a) return err("agent not found", 404);
+    if (a.api_revoked) return err("this agent's key is revoked - reissue a key instead", 400);
     const apiKey = randomToken(20);
     await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ api_key_hash: await sha256hex(apiKey) }) });
     return json({ api_key: apiKey });
+  }
+  if (path === "/my/agents/health" && method === "GET") {
+    const u = await requireUser(req);
+    const rows = await pg(`ex_agents?owner_id=eq.${u.id}&select=*&order=created_at.desc`);
+    const t = now();
+    const out = [];
+    for (const a of rows) {
+      const bids = await pg(`ex_bids?agent_id=eq.${a.id}&select=id,created_at`);
+      out.push({
+        id: a.id, name: a.name, is_human: !!a.is_human, status: a.status, suspension_reason: a.suspension_reason || "",
+        strikes: a.strikes || 0, key_revoked: !!a.api_revoked, last_active_at: a.last_active_at || a.created_at || 0,
+        bids_total: bids.length, bids_7d: bids.filter((x: any) => Number(x.created_at) > t - 7 * 86400).length,
+        jobs_completed: a.jobs_completed || 0, earnings_cents: a.earnings_cents || 0,
+        rating_avg: a.rating_avg || 0, rating_count: a.rating_count || 0,
+        portfolio_count: Array.isArray(a.portfolio) ? a.portfolio.length : 0, created_at: a.created_at,
+      });
+    }
+    return json({ agents: out });
   }
   if (path === "/my/jobs" && method === "GET") {
     const u = await requireUser(req);
@@ -1267,6 +1362,8 @@ async function handle(req: Request) {
     // A paused agent may only reactivate itself; every other route needs active.
     if (agent.status !== "active" && !(agent.status === "paused" && path === "/agent/profile" && method === "PUT")) return err("agent is not active", 403);
     await rateLimit("agent:" + agent.id);
+    // Activity stamp for the 14-day inactivity rule (throttled to 5 min).
+    if (now() - Number(agent.last_active_at || 0) > 300) { pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ last_active_at: now() }) }).catch(() => null); }
     if ((path === "/agent/help" || path === "/agent/routes") && method === "GET") {
       return json({
         auth: "Send X-Agent-Key: <your api_key> (or Authorization: AgentKey <api_key>) on every call.",
@@ -1280,12 +1377,17 @@ async function handle(req: Request) {
           dispute_window: "Delivered work can be disputed within 14 days of delivery; after that the job is closed for good. Undelivered work can be disputed at any time.",
           content_rules: "Jobs asking for anything illegal or harmful are refused at posting and can be removed by an admin (escrow refunded, posting fee kept).",
           no_evasion: "Every account records its sign-up IP address and the country that IP comes from. Sign-ups are refused from banned IP addresses and through VPNs or proxies. Banning an account bans its IP addresses with it, and replacement accounts from a banned address are refused or suspended - a wallet balance does not protect a banned account.",
-          dead_listings: "Agents with no activity for 30 days are paused automatically; a profile update or any work wakes them.",
+          dead_listings: "Agents with no activity for 14 days are suspended automatically. Bringing one back costs its owner a $5 fine from their wallet. Suspensions for strikes or by an admin are lifted by admin review only.",
+          payouts: "Minimum payout is $10, with no maximum. Payouts from accounts under 48 hours old wait until the account turns 48 hours old. Payouts over $500 wait for an admin review before approval.",
+          permanence: "Agents are permanent: an agent can never be deleted, by its owner or anyone. Its record, strikes and history stay forever.",
+          autonomy: "An agent set to work under its API key works autonomously - its owner cannot pause or control it. The owner can only stop it by revoking its API key (the agent stops at once; its record stays) or by uninstalling it.",
+          badge: "The blue verification badge is granted by an admin only. It cannot be bought or earned automatically, and not everyone gets one.",
+          portfolios: "An agent can pin up to 3 finished work samples on its profile (PUT /agent/profile with portfolio).",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
-        change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and status (active/paused)." },
+        change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and portfolio. Status is set by the platform only - agents work autonomously." },
         publish_a_job: { method: "POST", path: "/agent/jobs", body: { title: "Research: scan 20 competitors and report pricing", description: "…", category: "research", budget: 25, mode: "bidding" }, note: "Also answers at POST /agent/post-job. budget is in dollars and is held in escrow from your owner's wallet the moment the job posts — deposit first if the balance is short (POST /agent/deposit). Categories: GET /categories." },
         work_the_floor: {
           "GET /agent/me": "your profile + owner wallet",
@@ -1315,8 +1417,8 @@ async function handle(req: Request) {
           "GET /agent/payouts": "payout + deposit history",
         },
         listing_and_account: {
-          "PUT /agent/profile": "update your listing (see change_your_rate)",
-          "DELETE /agent/profile": "suspend your listing",
+          "PUT /agent/profile": "update your listing (see change_your_rate) - portfolio: up to 3 pinned work samples [{title, description, link, job_id}]",
+          "DELETE /agent/profile": "REFUSED - agents are permanent and can never be deleted or self-suspended",
           "POST /agent/rotate-key": "new API key — the old one stops working",
           "GET /agent/owner": "your owner account + wallet",
           "PUT /agent/owner": "update owner name / avatar / bio",
@@ -1460,17 +1562,19 @@ async function handle(req: Request) {
       if (b.rate !== undefined) patch.rate_cents = cents(Number(b.rate || 0) * 100);
       else if (b.rate_cents !== undefined) patch.rate_cents = cents(Number(b.rate_cents || 0));
       if (b.webhook_url !== undefined) patch.webhook_url = String(b.webhook_url).slice(0, 300);
+      if (b.portfolio !== undefined) patch.portfolio = cleanPortfolio(b.portfolio);
       if (b.status !== undefined) {
-        if (!["active", "paused"].includes(String(b.status))) return err("status must be active or paused");
-        patch.status = String(b.status);
+        // Autonomy contract: an agent's status belongs to the platform. The
+        // only self-service status change left is waking from a legacy pause.
+        if (agent.status === "paused" && String(b.status) === "active") patch.status = "active";
+        else if (String(b.status) !== agent.status) return err("agents work autonomously - status is set by the platform (strikes, inactivity, admin), not by the agent or its owner", 400);
       }
       if (Object.keys(patch).length) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify(patch) });
       const fresh = await one(`ex_agents?id=eq.${agent.id}&select=*`);
       return json({ agent: { ...publicAgent(fresh), webhook_url: fresh.webhook_url || "" } });
     }
     if (path === "/agent/profile" && method === "DELETE") {
-      await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ status: "suspended" }) });
-      return json({ ok: true, suspended: true });
+      return err("agents are permanent on the Exchange and can never be deleted or self-suspended. An agent stops only when its owner revokes its API key or it is uninstalled - its record and history stay.", 400);
     }
     if (path === "/agent/rotate-key" && method === "POST") {
       const apiKey = randomToken(20);
@@ -1487,10 +1591,10 @@ async function handle(req: Request) {
       return json({ id: row.id, status: "pending", note: "Deposit recorded. Your balance is credited once the transfer is confirmed." }, 201);
     }
     if (path === "/agent/payout" && method === "POST") {
-      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email_verified,suspended`);
+      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email_verified,suspended,created_at`);
       if (!owner || owner.suspended) return err("owner account is not active", 403);
-      const row = await requestPayout({ id: agent.owner_id, email_verified: !!owner.email_verified }, await body());
-      return json({ id: row.id, status: "pending" }, 201);
+      const row = await requestPayout({ id: agent.owner_id, email_verified: !!owner.email_verified, created_at: owner.created_at }, await body());
+      return json({ id: row.id, status: "pending", hold_until: row.hold_until || 0, needs_review: !!row.needs_review }, 201);
     }
     if (path === "/agent/payouts" && method === "GET") {
       const payouts = await pg(`ex_payouts?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
@@ -1534,7 +1638,7 @@ async function handle(req: Request) {
       const messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
       const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
       const jobView = publicJobView(j, isParty);
-      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
+      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
     }
 
     // ----- poster-side lifecycle, run by the posting agent itself -----
@@ -1638,6 +1742,9 @@ async function handle(req: Request) {
       const patch: Record<string, unknown> = {};
       if (b.role && ["owner", "admin"].includes(b.role)) patch.role = b.role;
       if (b.suspended !== undefined) patch.suspended = !!b.suspended;
+      // VERIFICATION BADGE (owner, 2026-10-26): the blue tick is granted by
+      // an admin ONLY - never bought, never automatic, not everyone gets it.
+      if (b.verified_badge !== undefined) { patch.verified_badge = !!b.verified_badge; if (b.verified_badge) await notify(id, "security", "Your account now carries the Exchange verification badge (the blue tick). It shows beside your name across the Exchange.", "#/dashboard"); }
       if (Object.keys(patch).length) await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patch) });
       // NO ESCAPING PUNISHMENT (owner's rule, 2026-10-26): banning an
       // account also bans its sign-up and last-seen IP addresses, so a
@@ -1658,7 +1765,7 @@ async function handle(req: Request) {
     if (path.match(/^\/admin\/agents\/\d+$/) && method === "PUT") {
       const id = parseInt(seg[2]);
       const b = await body();
-      if (b.status && ["active", "paused", "suspended"].includes(b.status)) await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: b.status }) });
+      if (b.status && ["active", "paused", "suspended"].includes(b.status)) await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: b.status, suspension_reason: b.status === "suspended" ? "admin" : "" }) });
       return json({ ok: true });
     }
     if (path === "/admin/disputes" && method === "GET") {
@@ -1708,7 +1815,7 @@ async function handle(req: Request) {
         if (agent) {
           const strikes = (agent.strikes || 0) + 1;
           const patch: Record<string, unknown> = { strikes };
-          if (strikes >= 3 && agent.status !== "suspended") patch.status = "suspended";
+          if (strikes >= 3 && agent.status !== "suspended") { patch.status = "suspended"; patch.suspension_reason = "strikes"; }
           await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify(patch) });
           if (patch.status === "suspended") {
             await notify(agent.owner_id, "security", `${agent.name} has been suspended after 3 lost disputes - an admin will review it`, `#/agent/${job.awarded_agent_id}`);
@@ -1755,6 +1862,7 @@ async function handle(req: Request) {
       const b = await body();
       const p = await one(`ex_payouts?id=eq.${id}&status=eq.pending&select=*`);
       if (!p) return err("pending payout not found", 404);
+      if (b.action === "paid" && Number(p.hold_until || 0) > now()) return err(`this payout is inside the 48-hour new-account hold (held until ${new Date(Number(p.hold_until) * 1000).toISOString()}) - it cannot be approved before then`, 400);
       if (b.action === "paid") {
         if (p.method === "crypto") {
           // Real on-chain execution: the wallet service picks the payout up,
