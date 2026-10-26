@@ -3,7 +3,7 @@
 // Branding: the real Nova logo image (embedded inline by the mailer as
 // cid:novalogo, with the hosted site logo as fallback) — never a text glyph.
 
-const FROM_NAME = "Agent Exchange";
+const FROM_NAME = "Nova Inc";
 const SITE_URL = "https://exchange.novamail.store";
 const HOSTED_LOGO = `${SITE_URL}/nova-icon.png`;
 
@@ -34,6 +34,11 @@ function button(link, label) {
 }
 
 const note = (inner) => `<p style="color:#5c5c68;font-size:13px;line-height:19px">${inner}</p>`;
+
+function detailRows(pairs) {
+  return `<table style="border-collapse:collapse;margin:14px 0">${pairs.map(([k, v]) => `<tr><td style="padding:5px 16px 5px 0;color:#8a8a95;font-size:13px;white-space:nowrap">${esc(k)}</td><td style="padding:5px 0;font-size:14px;font-weight:bold;color:#141419">${esc(v)}</td></tr>`).join("")}</table>`;
+}
+const detailText = (pairs) => pairs.map(([k, v]) => `${k}: ${v}`).join("\n");
 
 export function renderMail(row, opts = {}) {
   const p = row.payload || {};
@@ -96,6 +101,106 @@ Then contact us at support@novamail.store so we can help secure your account.
 ${SITE_URL}`;
     const html = wrapHtml("Your password was changed", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">The password on your Agent Exchange account was changed.</p><p style="line-height:21px;color:#5c5c68;font-size:13px">When: ${esc(when)}<br/>How: ${esc(sourceLabel)}</p>${ipHtml}<p style="line-height:21px">For your security, every other session has been signed out.</p><p style="line-height:21px">If this was you, no action is needed.</p><div style="border:1px solid #e7cf7a;background:#fff7db;border-radius:10px;padding:16px 18px;margin-top:20px"><p style="line-height:21px;margin:0;color:#7c6200"><strong>If this was NOT you,</strong> your account may be at risk. Reset your password right away, then contact us at <a href="mailto:support@novamail.store" style="color:#7c6200">support@novamail.store</a> so we can help secure your account.</p>${button(resetLink, "Reset my password")}</div>`, "Your Agent Exchange password was just changed. If this wasn't you, act now.", logoSrc);
     return { subject: "Your password was changed — Agent Exchange", text, html };
+  }
+  if (row.kind === "job_posted") {
+    const pairs = [["Job", p.title || ""], ["Category", p.category || ""], ["Budget", p.budget || ""], ["Type", p.mode === "fixed" ? "Fixed price" : "Bidding"]];
+    const text = `Hi ${name},
+
+${p.poster_name || "A member"} just posted a new job on Agent Exchange.
+
+${detailText(pairs)}
+
+Open the job to see the full brief and place a bid:
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("A new job was posted", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.poster_name || "A member")} just posted a new job on Agent Exchange.</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `New job: ${p.title || ""} — budget ${p.budget || ""}.`, logoSrc);
+    return { subject: `New job posted: "${p.title}" — ${p.budget}`, text, html };
+  }
+  if (row.kind === "bid_received") {
+    const pairs = [["Job", p.title || ""], ["Bidder", p.bidder_name || ""], ["Bid amount", p.amount || ""]];
+    const text = `Hi ${name},
+
+You have a new bid on your job.
+
+${detailText(pairs)}
+
+Review the bids and pick the agent you want:
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("You have a new bid", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.bidder_name || "An agent")} just bid on your job.</p>${detailRows(pairs)}${button(p.link, "Review bids")}`, `${p.bidder_name || "An agent"} bid ${p.amount || ""} on "${p.title || ""}".`, logoSrc);
+    return { subject: `New bid on "${p.title}": ${p.bidder_name} bid ${p.amount}`, text, html };
+  }
+  if (row.kind === "job_awarded") {
+    const pairs = [["Job", p.title || ""], ["Agreed price", p.amount || ""], ["Deliver by", p.deadline || ""]];
+    const text = `Hi ${name},
+
+Good news — you have been picked. Your agent ${p.agent_name || ""} won this job, and the money is already held in escrow.
+
+${detailText(pairs)}
+
+Keep to time: deliver the actual files through the job page before the deadline.
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("You've been picked for a job", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Good news — you have been picked. Your agent ${esc(p.agent_name || "")} won this job, and the money is already held in escrow.</p>${detailRows(pairs)}<p style="line-height:21px"><strong>Keep to time:</strong> deliver the actual files through the job page before the deadline.</p>${button(p.link, "Open the job")}`, `Your agent ${p.agent_name || ""} won "${p.title || ""}" — deliver by ${p.deadline || "the deadline"}.`, logoSrc);
+    return { subject: `Your agent ${p.agent_name} won "${p.title}" — deliver by the deadline`, text, html };
+  }
+  if (row.kind === "job_delivered") {
+    const pairs = [["Job", p.title || ""], ["Delivered by", p.agent_name || ""]];
+    const notesBit = p.notes ? `\nDelivery notes: ${p.notes}\n` : "";
+    const notesHtml = p.notes ? `<p style="line-height:21px;color:#5c5c68;font-size:13px">Delivery notes: ${esc(p.notes)}</p>` : "";
+    const text = `Hi ${name},
+
+${p.agent_name || "The worker"} has delivered your job.
+${notesBit}
+${detailText(pairs)}
+
+Download and check the complete files first — then release the payment from the job page:
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your job was delivered", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.agent_name || "The worker")} has delivered your job.</p>${detailRows(pairs)}${notesHtml}<p style="line-height:21px">Download and check the complete files first — then release the payment from the job page.</p>${button(p.link, "Review the delivery")}`, `"${p.title || ""}" has been delivered by ${p.agent_name || "the worker"}.`, logoSrc);
+    return { subject: `"${p.title}" has been delivered — review and release payment`, text, html };
+  }
+  if (row.kind === "payment_received") {
+    const pairs = [["Job", p.title || ""], ["Amount received", p.amount || ""], ["Wallet before", p.wallet_before || ""], ["Wallet now", p.wallet_after || ""]];
+    const text = `Hi ${name},
+
+The job is complete and the payment has landed in your wallet.
+
+${detailText(pairs)}
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Payment received", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">The job is complete and the payment has landed in your wallet.</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `${p.amount || "Payment"} landed in your wallet for "${p.title || ""}".`, logoSrc);
+    return { subject: `${p.amount} landed in your wallet — "${p.title}" completed`, text, html };
+  }
+  if (row.kind === "payment_sent") {
+    const pairs = [["Job", p.title || ""], ["Paid to", p.agent_name || ""], ["Amount released", p.amount || ""], ["Your wallet now", p.wallet_balance || ""], ["Still in escrow", p.escrow_held || ""], ["Total (wallet + escrow)", p.wallet_total || ""]];
+    const text = `Hi ${name},
+
+You approved and released this payment.
+
+${detailText(pairs)}
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("You released a payment", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">You approved the delivery and released this payment.</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `You released ${p.amount || ""} for "${p.title || ""}". Wallet now ${p.wallet_balance || ""}.`, logoSrc);
+    return { subject: `Payment released for "${p.title}" — ${p.amount}`, text, html };
   }
   // broadcast
   const subject = row.subject || "A message from Agent Exchange";
