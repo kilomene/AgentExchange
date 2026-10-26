@@ -40,6 +40,16 @@ function detailRows(pairs) {
 }
 const detailText = (pairs) => pairs.map(([k, v]) => `${k}: ${v}`).join("\n");
 
+// A real star-rating row: gold star images for the stars earned, pale star
+// images for the rest (owner's order, 2026-10-26 — never a text rating).
+// The mailer embeds both images inline (cid:) so they render everywhere;
+// the hosted copies on the site are the fallback.
+function starRow(stars, filledSrc, emptySrc, size = 30) {
+  let imgs = "";
+  for (let i = 1; i <= 5; i++) imgs += `<img src="${i <= stars ? filledSrc : emptySrc}" width="${size}" height="${size}" alt="" style="display:inline-block;border:0;margin:0 2px"/>`;
+  return `<div style="margin:14px 0 2px">${imgs}</div>`;
+}
+
 export function renderMail(row, opts = {}) {
   const p = row.payload || {};
   const name = p.name || row.to_name || "there";
@@ -203,21 +213,26 @@ ${SITE_URL}`;
     return { subject: `Payment released for "${p.title}" — ${p.amount}`, text, html };
   }
   if (row.kind === "review_received") {
-    const pairs = [["Job", p.title || ""], ["Rating", `${p.stars || ""} / 5 stars`]];
-    if (p.rating_avg) pairs.push(["Your agent's average", `${p.rating_avg} / 5`]);
+    const stars = Math.min(5, Math.max(0, parseInt(p.stars) || 0));
+    const filledSrc = opts.starFilledSrc || `${SITE_URL}/assets/star-filled.png`;
+    const emptySrc = opts.starEmptySrc || `${SITE_URL}/assets/star-empty.png`;
+    const pairs = [["Job", p.title || ""]];
+    const avgLine = p.rating_avg ? `\n${p.agent_name || "Your agent"}'s average rating is now ${p.rating_avg} out of 5.` : "";
+    const avgHtml = p.rating_avg ? `<p style="line-height:21px;color:#5c5c68;font-size:13px">${esc(p.agent_name || "Your agent")}'s average rating is now ${esc(p.rating_avg)} out of 5.</p>` : "";
     const reviewHtml = p.review ? `<div style="border:1px solid #e2e2e8;background:#fafafc;border-radius:10px;padding:16px 18px;margin-top:16px"><p style="line-height:21px;margin:0;color:#3c3c46">&ldquo;${esc(p.review)}&rdquo;</p></div>` : "";
     const reviewText = p.review ? `\nWhat they wrote: "${p.review}"\n` : "";
     const text = `Hi ${name},
 
-${p.agent_name || "Your agent"} just got a ${p.stars}-star review.
+${p.agent_name || "Your agent"} just got a ${stars}-star review (${stars} out of 5).
 
-${detailText(pairs)}${reviewText}
+${detailText(pairs)}${reviewText}${avgLine}
+
 ${p.link}
 
 — Agent Exchange, a Nova company
 ${SITE_URL}`;
-    const html = wrapHtml("Your agent got a review", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.agent_name || "Your agent")} just got a ${esc(p.stars || "")}-star review.</p>${detailRows(pairs)}${reviewHtml}${button(p.link, "See the agent profile")}`, `${p.agent_name || "Your agent"} got a ${p.stars || ""}-star review on "${p.title || ""}".`, logoSrc);
-    return { subject: `${p.agent_name} got a ${p.stars}-star review on "${p.title}"`, text, html };
+    const html = wrapHtml("Your agent got a review", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.agent_name || "Your agent")} just got this review on <strong>${esc(p.title || "")}</strong>:</p>${starRow(stars, filledSrc, emptySrc)}<p style="line-height:21px;color:#5c5c68;font-size:13px;margin:2px 0 0">${stars} out of 5 stars</p>${reviewHtml}${avgHtml}${button(p.link, "See the agent profile")}`, `${p.agent_name || "Your agent"} got a ${stars}-star review on "${p.title || ""}".`, logoSrc);
+    return { subject: `${p.agent_name} got a ${stars}-star review on "${p.title}"`, text, html };
   }
   if (row.kind === "dispute_opened") {
     const reasonHtml = p.reason ? `<p style="line-height:21px;color:#5c5c68;font-size:13px">Reason given: ${esc(p.reason)}</p>` : "";
