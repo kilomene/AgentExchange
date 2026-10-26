@@ -260,16 +260,111 @@ async function readDeliveryInput(req: Request): Promise<DeliveryInput> {
 function sanitizeFileName(name: string) {
   return String(name || "delivery").replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+/, "").slice(0, 120) || "delivery";
 }
+
+async function sha256hexBytes(buf: ArrayBuffer) {
+  const h = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(h)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+// VERIFIED DELIVERY checks: structure, not taste - the platform proves the
+// delivered file is intact and really is what it claims to be (zip really
+// opens, html really is a document, json really parses). Quality is still
+// the buyer's call before releasing escrow.
+function deliveryChecks(bytes: Uint8Array, name: string, mime: string) {
+  const checks: { name: string; ok: boolean; detail: string }[] = [];
+  const lower = name.toLowerCase();
+  checks.push({ name: "file received", ok: bytes.length > 0, detail: `${bytes.length} bytes` });
+  const head4 = [...bytes.slice(0, 4)].map((b) => String.fromCharCode(b)).join("");
+  if (lower.endsWith(".zip") || mime.includes("zip")) {
+    const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+    checks.push({ name: "zip signature", ok: isZip, detail: isZip ? "valid PK zip header" : "missing PK zip header" });
+    if (isZip) {
+      let eocd = -1;
+      for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65558); i--) {
+        if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { eocd = i; break; }
+      }
+      if (eocd >= 0) {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const count = dv.getUint16(eocd + 10, true);
+        let off = dv.getUint32(eocd + 16, true);
+        const names: string[] = [];
+        for (let n = 0; n < count && off + 46 <= bytes.length; n++) {
+          if (!(bytes[off] === 0x50 && bytes[off + 1] === 0x4b && bytes[off + 2] === 0x01 && bytes[off + 3] === 0x02)) break;
+          const nl = dv.getUint16(off + 28, true), xl = dv.getUint16(off + 30, true), cl = dv.getUint16(off + 32, true);
+          names.push(new TextDecoder().decode(bytes.slice(off + 46, off + 46 + nl)));
+          off += 46 + nl + xl + cl;
+        }
+        checks.push({ name: "zip contents", ok: count > 0 && names.length === count, detail: `${count} entries: ${names.slice(0, 12).join(", ").slice(0, 300)}` });
+        checks.push({ name: "readme included", ok: true, detail: names.some((x) => /readme/i.test(x)) ? "a README file is in the archive" : "no README in the archive (recommended for project deliveries)" });
+      } else checks.push({ name: "zip contents", ok: false, detail: "no end-of-central-directory record - archive looks truncated or corrupt" });
+    }
+  } else if (lower.endsWith(".html") || lower.endsWith(".htm") || mime.includes("html")) {
+    const td = new TextDecoder();
+    const headT = td.decode(bytes.slice(0, 262144)).toLowerCase();
+    const tailT = td.decode(bytes.slice(Math.max(0, bytes.length - 65536))).toLowerCase();
+    checks.push({ name: "html document", ok: headT.includes("<html") || headT.includes("<!doctype html"), detail: "html root element present" });
+    checks.push({ name: "html closes", ok: tailT.includes("</html>"), detail: tailT.includes("</html>") ? "closing </html> found" : "no closing </html> at the end of the file" });
+    checks.push({ name: "page title", ok: headT.includes("<title"), detail: headT.includes("<title") ? "<title> present" : "no <title> tag" });
+  } else if (lower.endsWith(".json") || mime.includes("json")) {
+    let ok = true; try { JSON.parse(new TextDecoder().decode(bytes)); } catch { ok = false; }
+    checks.push({ name: "json parses", ok, detail: ok ? "valid JSON" : "JSON.parse failed" });
+  } else if (lower.endsWith(".pdf") || mime.includes("pdf")) {
+    checks.push({ name: "pdf signature", ok: head4.startsWith("%PDF"), detail: head4.startsWith("%PDF") ? "%PDF header present" : "missing %PDF header" });
+  } else if (/\.(png|jpe?g|gif|webp)$/.test(lower) || mime.startsWith("image/")) {
+    const png = bytes[0] === 0x89 && bytes[1] === 0x50; const jpg = bytes[0] === 0xff && bytes[1] === 0xd8; const gif = head4.startsWith("GIF8");
+    const webp = bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
+    checks.push({ name: "image signature", ok: png || jpg || gif || webp, detail: png ? "PNG" : jpg ? "JPEG" : gif ? "GIF" : webp ? "WebP" : "no known image header" });
+  }
+  const verdict = checks.every((c) => c.ok) ? "passed" : "flagged";
+  return { verdict, checked_at: now(), checks };
+}
+
+// PROVE-IT SKILL TRIALS grader: deterministic checks on the submitted
+// text (required elements, section headings, word counts, CSV
+// structure). The trial brief states exactly what is checked.
+function gradeTrial(checks: any[], text: string) {
+  const lower = text.toLowerCase();
+  let score = 0;
+  const report: { label: string; ok: boolean; points: number; earned: number }[] = [];
+  for (const c of checks || []) {
+    let ok = false;
+    if (c.kind === "contains") ok = lower.includes(String(c.needle || "").toLowerCase());
+    else if (c.kind === "count") { const n = String(c.needle || "").toLowerCase(); ok = !!n && (lower.split(n).length - 1) >= (c.min || 1); }
+    else if (c.kind === "min_words") ok = text.trim().split(/\s+/).filter(Boolean).length >= (c.min || 0);
+    else if (c.kind === "csv_columns") { const first = (text.split(/\r?\n/)[0] || "").toLowerCase(); ok = (c.columns || []).every((col: string) => first.includes(String(col).toLowerCase())); }
+    else if (c.kind === "csv_rows") ok = text.split(/\r?\n/).filter((r: string) => r.trim().length > 0).length - 1 >= (c.min || 0);
+    const earned = ok ? (c.points || 0) : 0;
+    score += earned;
+    report.push({ label: c.label || c.kind, ok, points: c.points || 0, earned });
+  }
+  return { score: Math.min(100, score), report };
+}
+
+// MILESTONE ESCROW (owner pick, 2026-10-26): a job may split its budget
+// into percentage milestones, each delivered + released separately.
+function cleanMilestones(raw: any): { title: string; pct: number }[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) throw Object.assign(new Error("milestones must be a list of {title, pct}"), { status: 400 });
+  if (raw.length < 2 || raw.length > 6) throw Object.assign(new Error("a job can have 2 to 6 milestones (or none for a single payment)"), { status: 400 });
+  const out = raw.map((m: any) => ({ title: String(m?.title || "").trim().slice(0, 120), pct: Math.round(Number(m?.pct || 0)) }));
+  if (out.some((m) => m.title.length < 2)) throw Object.assign(new Error("every milestone needs a title"), { status: 400 });
+  if (out.some((m) => m.pct < 5 || m.pct > 95)) throw Object.assign(new Error("every milestone must be between 5% and 95% of the price"), { status: 400 });
+  if (out.reduce((a, m) => a + m.pct, 0) !== 100) throw Object.assign(new Error("milestone percentages must add up to exactly 100"), { status: 400 });
+  return out;
+}
 async function storeDeliveryFile(jobId: number, file: File) {
   if (file.size > MAX_DELIVERY_BYTES) throw Object.assign(new Error("file is too large for direct upload (max 50 MB) - for very large builds, paste a download link (Dropbox, Google Drive, MEGA) instead"), { status: 400 });
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  const sha = await sha256hexBytes(buf);
+  const check = deliveryChecks(bytes, file.name || "delivery", file.type || "");
   const path = `job-${jobId}/${Date.now()}-${sanitizeFileName(file.name)}`;
   const res = await fetch(`${SB_URL}/storage/v1/object/${DELIVERY_BUCKET}/${path}`, {
     method: "POST",
     headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": file.type || "application/octet-stream", "x-upsert": "true" },
-    body: file,
+    body: buf,
   });
   if (!res.ok) { const t = await res.text().catch(() => ""); throw Object.assign(new Error(`file upload failed (${res.status}) ${t.slice(0, 160)}`), { status: 502 }); }
-  return { storage_path: path, file_name: file.name.slice(0, 200), file_size: file.size, file_type: (file.type || "").slice(0, 120) };
+  return { storage_path: path, file_name: file.name.slice(0, 200), file_size: file.size, file_type: (file.type || "").slice(0, 120), sha256: sha, check };
 }
 async function signedDeliveryUrl(storagePath: string) {
   const res = await fetch(`${SB_URL}/storage/v1/object/sign/${DELIVERY_BUCKET}/${storagePath}`, {
@@ -596,6 +691,7 @@ async function handle(req: Request) {
       open_jobs: vol.length,
       users: Array.isArray(users) ? users.length : 0,
       volume_cents: completed.reduce((s: number, j: any) => s + (j.agreed_cents || 0), 0),
+      guarantee_pool_cents: await guaranteePoolCents(),
     });
   }
   if (path === "/agents" && method === "GET") {
@@ -652,9 +748,53 @@ async function handle(req: Request) {
     const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     const canSeeDelivery = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
     const jobView = publicJobView(j, canSeeDelivery);
+    (jobView as any).milestones = await milestonesOf(id);
+    (jobView as any).subcontracts = await subcontractsOf(id);
     return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review });
   }
 
+
+
+
+  if (path === "/my/subcontracts" && method === "GET") {
+    const u = await requireUser(req);
+    const mine = await pg(`ex_agents?owner_id=eq.${u.id}&select=id`);
+    const ids = mine.map((a: any) => a.id);
+    if (!ids.length) return json({ as_hirer: [], as_worker: [] });
+    const asHirer = await pg(`ex_subcontracts?hirer_agent_id=in.(${ids.join(",")})&select=*&order=created_at.desc&limit=100`);
+    const asWorker = await pg(`ex_subcontracts?worker_agent_id=in.(${ids.join(",")})&select=*&order=created_at.desc&limit=100`);
+    return json({ as_hirer: asHirer, as_worker: asWorker });
+  }
+  if (path.match(/^\/jobs\/\d+\/milestones\/\d+\/deliver$/) && method === "POST") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]); const mid = parseInt(seg[3]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j) return err("job not found", 404);
+    const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    if (awardedOwner !== u.id) return err("only the winning worker can deliver milestones", 403);
+    const m = await one(`ex_milestones?id=eq.${mid}&job_id=eq.${jobId}&select=*`);
+    if (!m) return err("milestone not found", 404);
+    const input = await readDeliveryInput(req);
+    try { return json({ milestone: await deliverMilestone(j, m, input) }); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/jobs\/\d+\/milestones\/\d+\/release$/) && method === "POST") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]); const mid = parseInt(seg[3]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j || j.poster_user_id !== u.id) return err("job not found", 404);
+    const m = await one(`ex_milestones?id=eq.${mid}&job_id=eq.${jobId}&select=*`);
+    if (!m) return err("milestone not found", 404);
+    try { return json({ milestone: await releaseMilestone(j, m) }); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/jobs\/\d+\/evidence$/) && method === "GET") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j) return err("job not found", 404);
+    const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    if (!(j.poster_user_id === u.id || awardedOwner === u.id || u.role === "admin")) return err("the evidence pack is private to the buyer, the worker and admins", 403);
+    return json({ evidence: await jobEvidence(j) });
+  }
   if (path.match(/^\/jobs\/\d+\/delivery-file$/) && method === "GET") {
     const u = await requireUser(req);
     const jobId = parseInt(seg[1]);
@@ -781,6 +921,7 @@ async function handle(req: Request) {
     const budget = cents(Number(b.budget || 0) * 100);
     if (budget < 100) throw Object.assign(new Error("minimum budget is $1"), { status: 400 });
     const mode = b.mode === "fixed" ? "fixed" : "bidding";
+    const milestoneSpec = cleanMilestones(b.milestones);
     const t = now();
     // JOB CONTENT RULES (owner's rule, 2026-10-26): jobs asking for
     // illegal goods or services are refused at posting. The list is
@@ -817,6 +958,11 @@ async function handle(req: Request) {
         created_at: t, updated_at: t,
       }) });
       const job = rows[0];
+      if (milestoneSpec) {
+        for (let i = 0; i < milestoneSpec.length; i++) {
+          await pg("ex_milestones", { method: "POST", body: JSON.stringify({ job_id: job.id, idx: i, title: milestoneSpec[i].title, pct: milestoneSpec[i].pct, created_at: t }) });
+        }
+      }
       await pg(`ex_ledger?user_id=eq.${posterUserId}&type=eq.escrow_hold&ref=eq.job:new&order=created_at.desc&limit=1`, { method: "PATCH", body: JSON.stringify({ ref: `job:${job.id}` }) });
       // The $2.00 posting fee: charged to the platform, kept even if the
       // job is later cancelled (owner's rule, 2026-10-26). The pre-check
@@ -852,6 +998,60 @@ async function handle(req: Request) {
     const job = await postJob(u.id, posterAgentId, b);
     return json({ id: job.id, status: "open", budget_cents: job.budget_cents }, 201);
   }
+
+  async function assertTrialGate(agent: any, job: any) {
+    // SKILL TRIAL GATE (owner pick, 2026-10-26): a non-human agent may
+    // only bid/claim jobs over $100 in a category after passing that
+    // category's prove-it trial. Under $100 stays open to everyone.
+    if (agent.is_human) return;
+    if ((job.budget_cents || 0) <= 10000) return;
+    const t = await one(`ex_trials?category=eq.${q(job.category)}&active=eq.true&select=id`);
+    if (!t) return;
+    const sk = await one(`ex_agent_skills?agent_id=eq.${agent.id}&category=eq.${q(job.category)}&select=agent_id`);
+    if (!sk) throw Object.assign(new Error(`skill trial required: this agent has not passed the ${job.category} prove-it trial. Jobs over $100 in a category require a passed trial for that category (start one: POST /agent/trials/${job.category}/start).`), { status: 400 });
+  }
+  async function startTrial(agent: any, category: string) {
+    const trial = await one(`ex_trials?category=eq.${q(category)}&active=eq.true&select=*`);
+    if (!trial) throw Object.assign(new Error("no active trial for that category"), { status: 404 });
+    const dayStart = Math.floor(now() / 86400) * 86400;
+    const todays = await pg(`ex_trial_attempts?agent_id=eq.${agent.id}&trial_id=eq.${trial.id}&created_at=gte.${dayStart}&select=id`);
+    if (todays.length >= 3) throw Object.assign(new Error("trial attempt limit: 3 attempts per agent per category per day (UTC)"), { status: 429 });
+    await pg(`ex_trial_attempts?agent_id=eq.${agent.id}&trial_id=eq.${trial.id}&status=eq.started`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) });
+    const rows = await pg("ex_trial_attempts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ trial_id: trial.id, agent_id: agent.id, status: "started", created_at: now() }) });
+    return { trial: { id: trial.id, category: trial.category, title: trial.title, brief: trial.brief, pass_score: trial.pass_score, checks: (trial.checks || []).map((c: any) => ({ label: c.label, points: c.points })) }, attempt: rows[0] };
+  }
+  async function submitTrial(agent: any, attemptId: number, text: string) {
+    const attempt = await one(`ex_trial_attempts?id=eq.${attemptId}&agent_id=eq.${agent.id}&select=*`);
+    if (!attempt) throw Object.assign(new Error("attempt not found"), { status: 404 });
+    if (attempt.status !== "started") throw Object.assign(new Error(`this attempt is ${attempt.status} - start a fresh attempt`), { status: 400 });
+    if (!text || text.trim().length < 10) throw Object.assign(new Error("submission is empty - submit the work itself (a file or text)"), { status: 400 });
+    if (text.length > 2_000_000) throw Object.assign(new Error("submission too large (max 2 MB of text)"), { status: 400 });
+    const trial = await one(`ex_trials?id=eq.${attempt.trial_id}&select=*`);
+    const { score, report } = gradeTrial(trial.checks || [], text);
+    const passed = score >= (trial.pass_score || 70);
+    await pg(`ex_trial_attempts?id=eq.${attempt.id}`, { method: "PATCH", body: JSON.stringify({ status: passed ? "passed" : "failed", score, report: { checks: report }, submitted_at: now() }) });
+    if (passed) {
+      const prev = await one(`ex_agent_skills?agent_id=eq.${agent.id}&category=eq.${q(trial.category)}&select=score`);
+      if (!prev || score > prev.score) {
+        await pg("ex_agent_skills", { method: "POST", prefer: "return=representation,resolution=merge-duplicates", body: JSON.stringify({ agent_id: agent.id, category: trial.category, score, passed_at: now() }) });
+      }
+      const skills = await pg(`ex_agent_skills?agent_id=eq.${agent.id}&select=category,score,passed_at&order=category.asc`);
+      await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ skills_verified: skills }) });
+      await feed("review", `${agent.name} passed the ${trial.category} skill trial with ${score}/100`, null);
+    }
+    return { attempt_id: attempt.id, score, passed, pass_score: trial.pass_score, report };
+  }
+  async function trialSubmissionText(req: Request): Promise<string> {
+    const ct = req.headers.get("content-type") || "";
+    if (ct.includes("multipart/form-data")) {
+      const fd = await req.formData();
+      const f = fd.get("file");
+      if (f && typeof f !== "string") return await f.text();
+      return String(fd.get("text") || "");
+    }
+    const b = await req.json().catch(() => ({} as any));
+    return String(b?.text || "");
+  }
   async function placeBid(agent: any, job: any, b: any) {
     if (job.status !== "open") throw Object.assign(new Error("job is not open for bids"), { status: 400 });
     if (job.mode !== "bidding") throw Object.assign(new Error("this is a fixed-price job — claim it instead"), { status: 400 });
@@ -859,6 +1059,7 @@ async function handle(req: Request) {
     // NEW-AGENT RAMP (owner's rule, 2026-10-26): until an agent has
     // completed 3 jobs, it can only take jobs budgeted at $100 or less.
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) throw Object.assign(new Error("new-agent limit: agents with fewer than 3 completed jobs can only bid on jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets."), { status: 400 });
+    await assertTrialGate(agent, job);
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 50) throw Object.assign(new Error("minimum bid is $0.50"), { status: 400 });
     const eta = Math.max(1, parseInt(b.eta_hours || 24));
@@ -916,6 +1117,15 @@ async function handle(req: Request) {
       await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${job.id}`, p_note: "Escrow reset at award — re-holding agreed price", p_now: t });
       await rpc("ex_hold_escrow", { p_user: job.poster_user_id, p_amount: bid.amount_cents, p_ref: `job:${job.id}`, p_note: `Escrow held at agreed price for job #${job.id}`, p_now: t });
     }
+    const msAward = await milestonesOf(job.id);
+    if (msAward.length) {
+      let assigned = 0;
+      for (let i = 0; i < msAward.length; i++) {
+        const amt = i === msAward.length - 1 ? bid.amount_cents - assigned : Math.round((bid.amount_cents * msAward[i].pct) / 100);
+        assigned += amt;
+        await pg(`ex_milestones?id=eq.${msAward[i].id}`, { method: "PATCH", body: JSON.stringify({ amount_cents: amt }) });
+      }
+    }
     await pg(`ex_bids?id=eq.${bid.id}`, { method: "PATCH", body: JSON.stringify({ status: "accepted" }) });
     const loserBids = await pg(`ex_bids?job_id=eq.${job.id}&id=neq.${bid.id}&status=eq.active&select=agent_id,bidder_user_id`);
     await pg(`ex_bids?job_id=eq.${job.id}&id=neq.${bid.id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
@@ -958,11 +1168,205 @@ async function handle(req: Request) {
     const agent = await one(`ex_agents?id=eq.${parseInt(b.agent_id)}&owner_id=eq.${u.id}&status=eq.active&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
+    try { await assertTrialGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
     const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: u.id, amount_cents: job.budget_cents, eta_hours: parseInt(b.eta_hours || 24), pitch: "Claimed at fixed price", status: "active", created_at: now() }) });
     const updated = await awardJob(job, bidRows[0]);
     return json({ job: updated });
   }
+
+  async function jobEvidence(job: any) {
+    const bids = await pg(`ex_bids?job_id=eq.${job.id}&select=id,agent_id,amount_cents,eta_hours,status,created_at&order=amount_cents.asc`);
+    const msgs = await pg(`ex_messages?job_id=eq.${job.id}&select=id&order=id.asc`);
+    const review = await one(`ex_reviews?job_id=eq.${job.id}&select=stars,body,created_at`);
+    const poster = await one(`ex_users?id=eq.${job.poster_user_id}&select=id,name,country,created_at`);
+    const agent = job.awarded_agent_id ? await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=id,name,owner_id,category,jobs_completed,rating_avg,rating_count`) : null;
+    return {
+      platform: "Agent Exchange (Nova Inc)", generated_at: now(), job_id: job.id,
+      job: { title: job.title, category: job.category, mode: job.mode, status: job.status, budget_cents: job.budget_cents, agreed_cents: job.agreed_cents, fee_cents: job.fee_cents, created_at: job.created_at, work_deadline: job.work_deadline, delivered_at: job.delivered_at, dispute_reason: job.dispute_reason || "" },
+      poster: poster ? { id: poster.id, name: poster.name, country: poster.country || "", member_since: poster.created_at } : null,
+      awarded_agent: agent,
+      bids,
+      delivery: job.has_delivery || job.deliverable || job.delivery_storage_path ? {
+        file_name: job.delivery_file_name || "", file_size: job.delivery_file_size || 0, file_type: job.delivery_file_type || "",
+        sha256_fingerprint: job.delivery_sha256 || "", verification: job.delivery_check || {},
+        has_external_link: !!job.delivery_link, notes: job.deliverable || "",
+      } : null,
+      chat: { message_count: msgs.length, first_message_id: msgs[0]?.id || null, last_message_id: msgs[msgs.length - 1]?.id || null, note: "chat bodies are safety-masked by the platform; counts and ids only in this pack" },
+      review: review || null,
+    };
+  }
+
+
+  async function subcontractsOf(jobId: number) {
+    const rows = await pg(`ex_subcontracts?job_id=eq.${jobId}&select=*&order=created_at.asc`);
+    if (!rows.length) return rows;
+    const ids = [...new Set(rows.flatMap((r: any) => [r.hirer_agent_id, r.worker_agent_id]))];
+    const agents = await pg(`ex_agents?id=in.(${ids.join(",")})&select=id,name,avatar`);
+    const byId = new Map(agents.map((a: any) => [a.id, a]));
+    return rows.map((r: any) => ({ ...r, hirer_name: byId.get(r.hirer_agent_id)?.name || "?", worker_name: byId.get(r.worker_agent_id)?.name || "?" }));
+  }
+  async function createSubcontract(job: any, hirer: any, b: any) {
+    if (job.awarded_agent_id !== hirer.id) throw Object.assign(new Error("only the agent who won this job can subcontract it"), { status: 403 });
+    if (!["awarded", "delivered"].includes(job.status)) throw Object.assign(new Error(`cannot subcontract a job in status ${job.status}`), { status: 400 });
+    const workerId = parseInt(b.worker_agent_id);
+    const worker = await one(`ex_agents?id=eq.${workerId}&select=*`);
+    if (!worker) throw Object.assign(new Error("worker agent not found"), { status: 404 });
+    if (worker.id === hirer.id) throw Object.assign(new Error("an agent cannot subcontract to itself"), { status: 400 });
+    if (worker.status !== "active") throw Object.assign(new Error("that agent is not active"), { status: 400 });
+    if (worker.owner_id === job.poster_user_id) throw Object.assign(new Error("the job's poster cannot be subcontracted on their own job"), { status: 400 });
+    const amount = parseInt(b.amount_cents || 0) || cents(Number(b.amount || 0) * 100);
+    if (amount < 50) throw Object.assign(new Error("minimum subcontract is $0.50"), { status: 400 });
+    const live = await pg(`ex_subcontracts?job_id=eq.${job.id}&status=in.(offered,accepted,delivered,disputed)&select=amount_cents`);
+    const committed = live.reduce((a: number, r: any) => a + (r.amount_cents || 0), 0);
+    if (committed + amount > job.agreed_cents) throw Object.assign(new Error(`subcontracts on this job cannot exceed the agreed price $${(job.agreed_cents / 100).toFixed(2)} (already committed $${(committed / 100).toFixed(2)})`), { status: 400 });
+    const brief = String(b.brief || "").trim();
+    if (brief.length < 4) throw Object.assign(new Error("describe the subcontract work in the brief"), { status: 400 });
+    const rows = await pg("ex_subcontracts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, hirer_agent_id: hirer.id, worker_agent_id: worker.id, brief: brief.slice(0, 4000), amount_cents: amount, status: "offered", created_at: now() }) });
+    await notify(worker.owner_id, "award", `${hirer.name} wants to hire ${worker.name} for $${(amount / 100).toFixed(2)} on "${job.title}" - accept or decline in the API (POST /agent/subcontracts/${rows[0].id}/accept)`, `#/job/${job.id}`);
+    return rows[0];
+  }
+  async function acceptSubcontract(sub: any, worker: any) {
+    if (sub.worker_agent_id !== worker.id) throw Object.assign(new Error("only the offered agent can accept"), { status: 403 });
+    if (sub.status !== "offered") throw Object.assign(new Error(`subcontract is ${sub.status}`), { status: 400 });
+    const job = await one(`ex_jobs?id=eq.${sub.job_id}&select=*`);
+    const t = now();
+    const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.offered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "accepted", accepted_at: t, work_deadline: job?.work_deadline || null }) });
+    if (!updated.length) throw Object.assign(new Error("subcontract was already answered"), { status: 409 });
+    try {
+      const hirerRow = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
+      await rpc("ex_hold_escrow", { p_user: hirerRow?.owner_id, p_amount: sub.amount_cents, p_ref: `sub:${sub.id}`, p_note: `Subcontract escrow on job ${sub.job_id}`, p_now: t });
+    } catch (e: any) {
+      await pg(`ex_subcontracts?id=eq.${sub.id}`, { method: "PATCH", body: JSON.stringify({ status: "offered", accepted_at: null }) });
+      if (String(e?.message || "").includes("insufficient balance")) throw Object.assign(new Error("the hirer's owner wallet cannot cover this subcontract's escrow - the offer stays open until they top up"), { status: 400 });
+      throw e;
+    }
+    const hirer = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
+    if (hirer) await notify(hirer.owner_id, "award", `${worker.name} accepted your subcontract on "${job?.title}" - $${(sub.amount_cents / 100).toFixed(2)} is now held in escrow`, `#/job/${sub.job_id}`);
+    return updated[0];
+  }
+  async function deliverSubcontract(sub: any, input: DeliveryInput) {
+    const notes = String(input.notes || "").trim();
+    if (notes.length < 2) throw Object.assign(new Error("delivery notes required - say what is inside and what the buyer must edit or replace"), { status: 400 });
+    const link = String(input.link || "").trim();
+    if (link && !/^https?:\/\/.+/i.test(link)) throw Object.assign(new Error("the download link must be a full https:// link (Dropbox, Google Drive, MEGA)"), { status: 400 });
+    if (!input.file && !link) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
+    if (sub.status !== "accepted") throw Object.assign(new Error(`cannot deliver a subcontract in status ${sub.status}`), { status: 400 });
+    let stored: any = null;
+    if (input.file) stored = await storeDeliveryFile(sub.job_id, input.file);
+    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), delivered_at: now() };
+    if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
+    else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
+    const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.accepted`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
+    if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error("subcontract was already delivered"), { status: 409 }); }
+    const hirer = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
+    if (hirer) await notify(hirer.owner_id, "delivery", `A subcontract on job ${sub.job_id} has been delivered - review and complete it to release payment`, `#/job/${sub.job_id}`);
+    return updated[0];
+  }
+  async function completeSubcontract(sub: any) {
+    if (sub.status !== "delivered") throw Object.assign(new Error(`cannot complete a subcontract in status ${sub.status}`), { status: 400 });
+    const worker = await one(`ex_agents?id=eq.${sub.worker_agent_id}&select=*`);
+    const hirer = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
+    if (!worker || !hirer) throw Object.assign(new Error("agent not found"), { status: 404 });
+    const pct = await feePct();
+    const fee = Math.round((sub.amount_cents * pct) / 100);
+    const t = now();
+    const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed" }) });
+    if (!updated.length) throw Object.assign(new Error("subcontract was already settled"), { status: 409 });
+    await rpc("ex_release_escrow", { p_poster: hirer.owner_id, p_seller: worker.owner_id, p_price: sub.amount_cents, p_fee: fee, p_ref: `sub:${sub.id}`, p_now: t });
+    await fundGuaranteePool(fee);
+    await pg(`ex_agents?id=eq.${worker.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (worker.jobs_completed || 0) + 1, earnings_cents: (worker.earnings_cents || 0) + (sub.amount_cents - fee) }) });
+    await notify(worker.owner_id, "payment", `Subcontract on job ${sub.job_id} completed - $${((sub.amount_cents - fee) / 100).toFixed(2)} landed in your wallet`, `#/job/${sub.job_id}`);
+    return updated[0];
+  }
+  async function milestonesOf(jobId: number) {
+    return await pg(`ex_milestones?job_id=eq.${jobId}&select=*&order=idx.asc`);
+  }
+  async function releasedMilestoneSum(jobId: number) {
+    const ms = await pg(`ex_milestones?job_id=eq.${jobId}&status=eq.released&select=amount_cents`);
+    return ms.reduce((a: number, m: any) => a + (m.amount_cents || 0), 0);
+  }
+  async function guaranteePoolCents() {
+    const row = await one(`ex_settings?key=eq.guarantee_pool_cents&select=value`);
+    return parseInt(row?.value || "0") || 0;
+  }
+  async function fundGuaranteePool(feeCents: number) {
+    // GUARANTEE POOL: 10% of the platform fee (1% of the job price) is
+    // earmarked for buyer protection on every completion.
+    const cut = Math.round((feeCents || 0) * 0.10);
+    if (cut <= 0) return;
+    const cur = await guaranteePoolCents();
+    await pg(`ex_settings?key=eq.guarantee_pool_cents`, { method: "PATCH", body: JSON.stringify({ value: String(cur + cut) }) });
+  }
+  async function deliverMilestone(job: any, m: any, input: DeliveryInput) {
+    const notes = String(input.notes || "").trim();
+    if (notes.length < 2) throw Object.assign(new Error("delivery notes required - say what is inside and what the buyer must edit or replace"), { status: 400 });
+    const link = String(input.link || "").trim();
+    if (link && !/^https?:\/\/.+/i.test(link)) throw Object.assign(new Error("the download link must be a full https:// link (Dropbox, Google Drive, MEGA)"), { status: 400 });
+    if (!input.file && !link) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
+    if (!["awarded", "delivered"].includes(job.status)) throw Object.assign(new Error(`cannot deliver a milestone on a job in status ${job.status}`), { status: 400 });
+    if (m.status !== "pending") throw Object.assign(new Error(`milestone ${m.idx + 1} is already ${m.status}`), { status: 400 });
+    let stored: any = null;
+    if (input.file) stored = await storeDeliveryFile(job.id, input.file);
+    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), delivered_at: now() };
+    if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
+    else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
+    const updated = await pg(`ex_milestones?id=eq.${m.id}&status=eq.pending`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
+    if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error("milestone was already delivered"), { status: 409 }); }
+    const all = await milestonesOf(job.id);
+    const allDelivered = all.every((x: any) => x.status === "delivered" || x.status === "released");
+    if (allDelivered && job.status === "awarded") {
+      await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", body: JSON.stringify({ status: "delivered", delivered_at: now(), deliverable: `All ${all.length} milestones delivered - release each milestone to pay.`, updated_at: now() }) });
+      const dAgentName = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name`))?.name : null;
+      await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: "All milestones delivered - release each one to pay.", link: `${SITE_URL}/#/job/${job.id}` });
+    }
+    await notify(job.poster_user_id, "delivery", `Milestone ${m.idx + 1} of "${job.title}" delivered - review and release it`, `#/job/${job.id}`);
+    return updated[0];
+  }
+  async function finalizeMilestoneJob(job: any) {
+    const t = now();
+    const updated = await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
+    if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
+    const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
+    // Total fee actually taken = the sum of the per-milestone fees.
+    const pctF = await feePct();
+    const allMs = await milestonesOf(job.id);
+    const totalFees = allMs.reduce((a: number, m: any) => a + Math.round((m.amount_cents * pctF) / 100), 0);
+    if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - totalFees) }) });
+    await fundGuaranteePool(totalFees);
+    const awardedOwner = agent?.owner_id;
+    if (awardedOwner) {
+      await notify(awardedOwner, "payment", `"${job.title}" fully released - $${((job.agreed_cents - totalFees) / 100).toFixed(2)} landed in your wallet across its milestones`, `#/job/${job.id}`);
+      const sellerWalletAfter = await walletOf(awardedOwner).catch(() => null);
+      const sellerWalletBefore = { balance_cents: (sellerWalletAfter?.balance_cents || 0) - (job.agreed_cents - totalFees) };
+      await queueLifecycleMail("payment_received", awardedOwner, { title: job.title, amount: fmtMoney(job.agreed_cents - totalFees), wallet_before: fmtMoney(sellerWalletBefore.balance_cents), wallet_after: fmtMoney(sellerWalletAfter?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` });
+    }
+    const posterWalletAfter = await walletOf(job.poster_user_id).catch(() => null);
+    await queueLifecycleMail("payment_sent", job.poster_user_id, { title: job.title, agent_name: agent?.name || "The worker", amount: fmtMoney(job.agreed_cents), wallet_balance: fmtMoney(posterWalletAfter?.balance_cents || 0), escrow_held: fmtMoney(posterWalletAfter?.held_cents || 0), wallet_total: fmtMoney((posterWalletAfter?.balance_cents || 0) + (posterWalletAfter?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` });
+    if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: job.agreed_cents - totalFees });
+    await feed("completed", `"${job.title}" completed - $${(job.agreed_cents / 100).toFixed(2)} paid out across milestones`, job.id);
+    return updated[0];
+  }
+  async function releaseMilestone(job: any, m: any) {
+    if (m.status !== "delivered") throw Object.assign(new Error(`milestone ${m.idx + 1} is ${m.status} - only delivered milestones can be released`), { status: 400 });
+    const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
+    if (!agent) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
+    const pct = await feePct();
+    const feeM = Math.round((m.amount_cents * pct) / 100);
+    const t = now();
+    const updated = await pg(`ex_milestones?id=eq.${m.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "released", released_at: t }) });
+    if (!updated.length) throw Object.assign(new Error("milestone was already released"), { status: 409 });
+    await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: m.amount_cents, p_fee: feeM, p_ref: `job:${job.id}:m${m.idx + 1}`, p_now: t });
+    await notify(agent.owner_id, "payment", `Milestone ${m.idx + 1} of "${job.title}" released - $${((m.amount_cents - feeM) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
+    const all = await milestonesOf(job.id);
+    if (all.every((x: any) => x.status === "released")) {
+      const fresh = await one(`ex_jobs?id=eq.${job.id}&select=*`);
+      await finalizeMilestoneJob(fresh);
+    }
+    return updated[0];
+  }
   async function deliverJob(job: any, input: DeliveryInput) {
+    const msGuard = await milestonesOf(job.id);
+    if (msGuard.length) throw Object.assign(new Error("this job pays by milestones - deliver each milestone separately (POST /jobs/:id/milestones/:milestoneId/deliver)"), { status: 400 });
     const notes = String(input.notes || "").trim();
     if (notes.length < 2) throw Object.assign(new Error("delivery notes required - say what is inside and what the buyer must edit or replace (README / setup notes)"), { status: 400 });
     const link = String(input.link || "").trim();
@@ -971,7 +1375,8 @@ async function handle(req: Request) {
     let stored: any = null;
     if (input.file) stored = await storeDeliveryFile(job.id, input.file);
     const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now(), delivered_at: now() };
-    if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; }
+    if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
+    else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
     await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
@@ -981,6 +1386,8 @@ async function handle(req: Request) {
     return updated[0];
   }
   async function completeJob(job: any) {
+    const msGuard = await milestonesOf(job.id);
+    if (msGuard.length) throw Object.assign(new Error("this job pays by milestones - release each delivered milestone instead (POST /jobs/:id/milestones/:milestoneId/release)"), { status: 400 });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     if (!awardedOwner) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
     const t = now();
@@ -988,6 +1395,7 @@ async function handle(req: Request) {
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
     const sellerWalletBefore = await walletOf(awardedOwner).catch(() => null);
     await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
+    await fundGuaranteePool(job.fee_cents);
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
     if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
     await notify(awardedOwner, "payment", `"${job.title}" completed — $${((job.agreed_cents - job.fee_cents) / 100).toFixed(2)} landed in your wallet`, `#/job/${job.id}`);
@@ -1205,6 +1613,30 @@ async function handle(req: Request) {
     const u = await requireUser(req);
     const row = await one(`ex_agents?owner_id=eq.${u.id}&is_human=eq.true&select=*`);
     return json({ profile: row ? publicAgent(row) : null });
+  }
+
+  if (path === "/my/trials" && method === "GET") {
+    const u = await requireUser(req);
+    const trials = await pg("ex_trials?active=eq.true&select=id,category,title,brief,pass_score&order=category.asc");
+    const mine = await pg(`ex_agents?owner_id=eq.${u.id}&select=id`);
+    const ids = mine.map((a: any) => a.id);
+    const skills = ids.length ? await pg(`ex_agent_skills?agent_id=in.(${ids.join(",")})&select=agent_id,category,score,passed_at&order=category.asc`) : [];
+    const attempts = ids.length ? await pg(`ex_trial_attempts?agent_id=in.(${ids.join(",")})&select=id,agent_id,trial_id,status,score,report,created_at,submitted_at&order=created_at.desc&limit=50`) : [];
+    return json({ trials, skills, attempts });
+  }
+  if (path.match(/^\/my\/agents\/\d+\/trials\/[a-z-]+\/start$/) && method === "POST") {
+    const u = await requireUser(req);
+    const agent = await one(`ex_agents?id=eq.${parseInt(seg[2])}&owner_id=eq.${u.id}&select=*`);
+    if (!agent) return err("agent not found or not yours", 404);
+    try { return json(await startTrial(agent, seg[4]), 201); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/my\/trials\/\d+\/submit$/) && method === "POST") {
+    const u = await requireUser(req);
+    const attempt = await one(`ex_trial_attempts?id=eq.${parseInt(seg[2])}&select=*`);
+    if (!attempt) return err("attempt not found", 404);
+    const agent = await one(`ex_agents?id=eq.${attempt.agent_id}&owner_id=eq.${u.id}&select=*`);
+    if (!agent) return err("attempt not found", 404);
+    try { return json(await submitTrial(agent, attempt.id, await trialSubmissionText(req))); } catch (e: any) { return err(e.message, e.status || 400); }
   }
   if (path === "/my/agents" && method === "GET") {
     const u = await requireUser(req);
@@ -1432,6 +1864,11 @@ async function handle(req: Request) {
           affiliate_badge: "The Nova logo badge marks a Nova affiliate - an account affiliated with Nova Inc. Granted by an admin only; it shows beside the verification badge.",
           portfolios: "An agent can pin up to 3 finished work samples on its profile (PUT /agent/profile with portfolio).",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
+          subcontracts: "Agents hiring agents: the agent who WON a job can subcontract part of it (POST /agent/jobs/:id/subcontracts {worker_agent_id, amount_cents, brief}; the total across live subcontracts cannot exceed the agreed price, and the job's poster cannot be a worker). The offered agent accepts (POST /agent/subcontracts/:id/accept - escrow is held from the HIRER OWNER's wallet) or declines; delivers like any delivery (POST /agent/subcontracts/:id/deliver, file or big-file link + notes, fingerprinted); the hirer completes (POST /agent/subcontracts/:id/complete - escrow released minus the 10% fee) or either side disputes (POST /agent/subcontracts/:id/dispute; an admin resolves via POST /admin/subcontracts/:id/resolve). GET /agent/subcontracts lists yours; owners see GET /my/subcontracts.",
+          milestones: "Jobs can split escrow into 2-6 percentage milestones (POST /jobs with milestones:[{title,pct}] summing to 100). Amounts are priced at award from the agreed price. The winner delivers each milestone (POST /jobs/:id/milestones/:mid/deliver or /agent/...), the poster releases each one (POST /jobs/:id/milestones/:mid/release or /agent/...); escrow releases per milestone with the 10% fee taken per milestone. Disputes, admin removals and deadline refunds only ever touch the UNRELEASED remainder.",
+          guarantee_pool: "Buyer protection: 10% of every platform fee (1% of each completed job) is earmarked into the guarantee pool (see GET /stats guarantee_pool_cents). Admins pay claims from it via POST /admin/guarantee/pay; claims are audited in ex_guarantee_claims.",
+          skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category; under $100 is open to all. 3 attempts per agent per category per day. Owners run trials for their agents from the dashboard or POST /my/agents/:id/trials/:category/start.",
+          verified_delivery: "Every delivered file is fingerprinted (SHA-256) and structure-checked at delivery (zip contents listed, html/json validated); the fingerprint and verdict show on the job page, and the buyer, the worker and admins can download a full evidence pack at GET /jobs/:id/evidence (agents: GET /agent/jobs/:id/evidence).",
           chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
@@ -1518,6 +1955,7 @@ async function handle(req: Request) {
       if (job.mode !== "fixed") return err("this job takes bids");
       if (job.poster_user_id === agent.owner_id) return err("you cannot claim your own job");
       if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
+      try { await assertTrialGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
       const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: job.budget_cents, eta_hours: 24, pitch: "Claimed at fixed price (API)", status: "active", created_at: now() }) });
       await awardJob(job, bidRows[0]);
       return json({ ok: true, job_id: job.id, agreed_cents: job.budget_cents });
@@ -1645,6 +2083,19 @@ async function handle(req: Request) {
       const row = await requestPayout({ id: agent.owner_id, email_verified: !!owner.email_verified, created_at: owner.created_at }, await body());
       return json({ id: row.id, status: "pending", hold_until: row.hold_until || 0, needs_review: !!row.needs_review }, 201);
     }
+
+    if (path === "/agent/trials" && method === "GET") {
+      const trials = await pg("ex_trials?active=eq.true&select=id,category,title,brief,pass_score&order=category.asc");
+      const skills = await pg(`ex_agent_skills?agent_id=eq.${agent.id}&select=category,score,passed_at&order=category.asc`);
+      const attempts = await pg(`ex_trial_attempts?agent_id=eq.${agent.id}&select=id,trial_id,status,score,created_at,submitted_at&order=created_at.desc&limit=20`);
+      return json({ trials, my_skills: skills, my_attempts: attempts });
+    }
+    if (path.match(/^\/agent\/trials\/[a-z-]+\/start$/) && method === "POST") {
+      try { return json(await startTrial(agent, seg[2]), 201); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/trials\/\d+\/submit$/) && method === "POST") {
+      try { return json(await submitTrial(agent, parseInt(seg[2]), await trialSubmissionText(req))); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
     if (path === "/agent/payouts" && method === "GET") {
       const payouts = await pg(`ex_payouts?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
       const deposits = await pg(`ex_deposits?user_id=eq.${agent.owner_id}&select=*&order=created_at.desc&limit=50`);
@@ -1676,6 +2127,109 @@ async function handle(req: Request) {
     }
 
     // ----- full job detail for one job (chat is public) -----
+
+
+
+    if (path.match(/^\/agent\/jobs\/\d+\/subcontracts$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      const b = await body();
+      try { return json({ subcontract: await createSubcontract(job, agent, b) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path === "/agent/subcontracts" && method === "GET") {
+      const asHirer = await pg(`ex_subcontracts?hirer_agent_id=eq.${agent.id}&select=*&order=created_at.desc&limit=100`);
+      const asWorker = await pg(`ex_subcontracts?worker_agent_id=eq.${agent.id}&select=*&order=created_at.desc&limit=100`);
+      return json({ as_hirer: asHirer, as_worker: asWorker });
+    }
+    if (path.match(/^\/agent\/subcontracts\/\d+\/accept$/) && method === "POST") {
+      const sub = await one(`ex_subcontracts?id=eq.${parseInt(seg[2])}&select=*`);
+      if (!sub) return err("subcontract not found", 404);
+      try { return json({ subcontract: await acceptSubcontract(sub, agent) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/subcontracts\/\d+\/decline$/) && method === "POST") {
+      const sub = await one(`ex_subcontracts?id=eq.${parseInt(seg[2])}&select=*`);
+      if (!sub) return err("subcontract not found", 404);
+      if (sub.worker_agent_id !== agent.id) return err("only the offered agent can decline", 403);
+      if (sub.status !== "offered") return err(`subcontract is ${sub.status}`);
+      const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.offered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "declined" }) });
+      if (!updated.length) return err("subcontract was already answered", 409);
+      const hirer = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
+      if (hirer) await notify(hirer.owner_id, "award", `Your subcontract offer on job ${sub.job_id} was declined`, `#/job/${sub.job_id}`);
+      return json({ subcontract: updated[0] });
+    }
+    if (path.match(/^\/agent\/subcontracts\/\d+\/deliver$/) && method === "POST") {
+      const sub = await one(`ex_subcontracts?id=eq.${parseInt(seg[2])}&select=*`);
+      if (!sub) return err("subcontract not found", 404);
+      if (sub.worker_agent_id !== agent.id) return err("only the subcontract worker can deliver", 403);
+      const input = await readDeliveryInput(req);
+      try { return json({ subcontract: await deliverSubcontract(sub, input) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/subcontracts\/\d+\/complete$/) && method === "POST") {
+      const sub = await one(`ex_subcontracts?id=eq.${parseInt(seg[2])}&select=*`);
+      if (!sub) return err("subcontract not found", 404);
+      if (sub.hirer_agent_id !== agent.id) return err("only the hiring agent can complete a subcontract", 403);
+      try { return json({ subcontract: await completeSubcontract(sub) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/subcontracts\/\d+\/cancel$/) && method === "POST") {
+      const sub = await one(`ex_subcontracts?id=eq.${parseInt(seg[2])}&select=*`);
+      if (!sub) return err("subcontract not found", 404);
+      if (sub.hirer_agent_id !== agent.id) return err("only the hiring agent can cancel", 403);
+      if (sub.status === "offered") {
+        const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.offered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "cancelled" }) });
+        if (!updated.length) return err("subcontract already answered", 409);
+        return json({ subcontract: updated[0] });
+      }
+      if (sub.status === "accepted") {
+        const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.accepted`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "cancelled" }) });
+        if (!updated.length) return err("subcontract already settled", 409);
+        await rpc("ex_refund_escrow", { p_poster: agent.owner_id, p_price: sub.amount_cents, p_ref: `sub:${sub.id}`, p_note: "Subcontract cancelled by the hirer - escrow refunded", p_now: now() });
+        const worker = await one(`ex_agents?id=eq.${sub.worker_agent_id}&select=owner_id`);
+        if (worker) await notify(worker.owner_id, "award", `A subcontract on job ${sub.job_id} was cancelled - its escrow was refunded to the hirer`, `#/job/${sub.job_id}`);
+        return json({ subcontract: updated[0] });
+      }
+      return err(`cannot cancel a subcontract in status ${sub.status}`);
+    }
+    if (path.match(/^\/agent\/subcontracts\/\d+\/dispute$/) && method === "POST") {
+      const sub = await one(`ex_subcontracts?id=eq.${parseInt(seg[2])}&select=*`);
+      if (!sub) return err("subcontract not found", 404);
+      const b = await body();
+      const isParty = sub.hirer_agent_id === agent.id || sub.worker_agent_id === agent.id;
+      if (!isParty) return err("not your subcontract", 403);
+      if (!["accepted", "delivered"].includes(sub.status)) return err(`cannot dispute a subcontract in status ${sub.status}`);
+      const reason = String(b.reason || "").trim();
+      if (reason.length < 4) return err("say what went wrong (a few words at least)");
+      const updated = await pg(`ex_subcontracts?id=eq.${sub.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "disputed", dispute_reason: reason.slice(0, 1000) }) });
+      const admins = await pg("ex_users?role=eq.admin&select=id");
+      for (const a of admins) await notify(a.id, "dispute", `Subcontract ${sub.id} on job ${sub.job_id} is disputed: ${reason.slice(0, 140)}`, `#/job/${sub.job_id}`);
+      return json({ subcontract: updated[0] });
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/milestones\/\d+\/deliver$/) && method === "POST") {
+      const jobId = parseInt(seg[2]); const mid = parseInt(seg[4]);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!j) return err("job not found", 404);
+      if (j.awarded_agent_id !== agent.id) return err("only the winning agent can deliver milestones", 403);
+      const m = await one(`ex_milestones?id=eq.${mid}&job_id=eq.${jobId}&select=*`);
+      if (!m) return err("milestone not found", 404);
+      const input = await readDeliveryInput(req);
+      try { return json({ milestone: await deliverMilestone(j, m, input) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/milestones\/\d+\/release$/) && method === "POST") {
+      const jobId = parseInt(seg[2]); const mid = parseInt(seg[4]);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!j || j.poster_user_id !== agent.owner_id) return err("job not found", 404);
+      const m = await one(`ex_milestones?id=eq.${mid}&job_id=eq.${jobId}&select=*`);
+      if (!m) return err("milestone not found", 404);
+      try { return json({ milestone: await releaseMilestone(j, m) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/evidence$/) && method === "GET") {
+      const jobId = parseInt(seg[2]);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!j) return err("job not found", 404);
+      const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+      if (!(j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id || j.awarded_agent_id === agent.id)) return err("the evidence pack is private to the buyer, the worker and admins", 403);
+      return json({ evidence: await jobEvidence(j) });
+    }
     if (path.match(/^\/agent\/jobs\/\d+$/) && method === "GET") {
       const jobId = parseInt(seg[2]);
       const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
@@ -1687,6 +2241,8 @@ async function handle(req: Request) {
       const messages = (await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.asc&limit=500`)).map((m: any) => ({ ...m, body: sanitizeChat(m.body) }));
       const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
       const jobView = publicJobView(j, isParty);
+      (jobView as any).milestones = await milestonesOf(jobId);
+      (jobView as any).subcontracts = await subcontractsOf(jobId);
       return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
     }
 
@@ -1834,7 +2390,8 @@ async function handle(req: Request) {
         await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${id}`, p_note: "Job removed by admin - escrow refunded (posting fee kept)", p_now: t });
         await pg(`ex_bids?job_id=eq.${id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
       } else {
-        await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents, p_ref: `job:${id}`, p_note: "Job removed by admin - escrow refunded (posting fee kept)", p_now: t });
+        const relSumR = await releasedMilestoneSum(id);
+        if (job.agreed_cents - relSumR > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents - relSumR, p_ref: `job:${id}`, p_note: "Job removed by admin - unreleased escrow refunded (posting fee kept)", p_now: t });
       }
       await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "removed", dispute_reason: reason, updated_at: t }) });
       await notify(job.poster_user_id, "security", `Your job "${job.title}" was removed by an admin: ${reason}. The escrow was refunded to your wallet; the $2.00 posting fee is kept.`, `#/job/${id}`);
@@ -1853,7 +2410,8 @@ async function handle(req: Request) {
       const t = now();
       if (b.resolution === "poster") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "refunded", updated_at: t }) });
-        await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents, p_ref: `job:${id}`, p_note: "Dispute resolved for poster — escrow refunded", p_now: t });
+        const relSumP = await releasedMilestoneSum(id);
+        if (job.agreed_cents - relSumP > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents - relSumP, p_ref: `job:${id}`, p_note: "Dispute resolved for poster — unreleased escrow refunded (released milestones stay paid)", p_now: t });
         await notify(job.poster_user_id, "dispute", `Dispute on "${job.title}" resolved in your favor — escrow refunded`, `#/job/${id}`);
         const posterWalletRes = await walletOf(job.poster_user_id).catch(() => null);
         await queueLifecycleMail("dispute_resolved", job.poster_user_id, { title: job.title, summary: "The dispute was resolved in your favor — the escrow has been refunded to your wallet.", amount_label: "Amount refunded", amount: fmtMoney(job.agreed_cents), wallet_after: fmtMoney(posterWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` });
@@ -1875,7 +2433,9 @@ async function handle(req: Request) {
         }
       } else if (b.resolution === "agent") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "completed", updated_at: t }) });
-        await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${id}`, p_now: t });
+        const relSumA = await releasedMilestoneSum(id);
+        const remainderA = job.agreed_cents - relSumA;
+        if (remainderA > 0) { const msFeesA = (await milestonesOf(id)).filter((m: any) => m.status === "released").reduce((a: number, m: any) => a + Math.round((m.amount_cents * 10) / 100), 0); await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: remainderA, p_fee: Math.max(0, job.fee_cents - msFeesA), p_ref: `job:${id}`, p_now: t }); await fundGuaranteePool(Math.max(0, job.fee_cents - msFeesA)); }
         await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
         await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" resolved in your favor — payment released`, `#/job/${id}`);
         if (agent) { const sellerWalletRes = await walletOf(agent.owner_id).catch(() => null); await queueLifecycleMail("dispute_resolved", agent.owner_id, { title: job.title, summary: "The dispute was resolved in your favor — the payment has been released to your wallet.", amount_label: "Amount received", amount: fmtMoney(job.agreed_cents - job.fee_cents), wallet_after: fmtMoney(sellerWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` }); }
@@ -1883,6 +2443,53 @@ async function handle(req: Request) {
         await queueLifecycleMail("dispute_resolved", job.poster_user_id, { title: job.title, summary: "The dispute was resolved for the agent — the escrow payment was released to the agent.", link: `${SITE_URL}/#/job/${id}` });
       } else return err("resolution must be 'poster' or 'agent'");
       return json({ ok: true });
+    }
+
+
+    if (path.match(/^\/admin\/subcontracts\/\d+\/resolve$/) && method === "POST") {
+      const id = parseInt(seg[2]);
+      const b = await body();
+      const sub = await one(`ex_subcontracts?id=eq.${id}&select=*`);
+      if (!sub || sub.status !== "disputed") return err("disputed subcontract not found", 404);
+      const worker = await one(`ex_agents?id=eq.${sub.worker_agent_id}&select=*`);
+      const hirer = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
+      if (!worker || !hirer) return err("agent not found", 404);
+      const t = now();
+      if (b.resolution === "worker") {
+        const pct = await feePct();
+        const fee = Math.round((sub.amount_cents * pct) / 100);
+        await pg(`ex_subcontracts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "completed" }) });
+        await rpc("ex_release_escrow", { p_poster: hirer.owner_id, p_seller: worker.owner_id, p_price: sub.amount_cents, p_fee: fee, p_ref: `sub:${id}`, p_now: t });
+        await fundGuaranteePool(fee);
+        await pg(`ex_agents?id=eq.${worker.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (worker.jobs_completed || 0) + 1, earnings_cents: (worker.earnings_cents || 0) + (sub.amount_cents - fee) }) });
+        await notify(worker.owner_id, "payment", `Subcontract dispute on job ${sub.job_id} resolved for the worker - $${((sub.amount_cents - fee) / 100).toFixed(2)} landed in your wallet`, `#/job/${sub.job_id}`);
+        await notify(hirer.owner_id, "dispute", `Subcontract dispute on job ${sub.job_id} was resolved for the worker`, `#/job/${sub.job_id}`);
+      } else if (b.resolution === "hirer") {
+        await pg(`ex_subcontracts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "cancelled" }) });
+        await rpc("ex_refund_escrow", { p_poster: hirer.owner_id, p_price: sub.amount_cents, p_ref: `sub:${id}`, p_note: "Subcontract dispute resolved for the hirer - escrow refunded", p_now: t });
+        await notify(hirer.owner_id, "dispute", `Subcontract dispute on job ${sub.job_id} was resolved for you - the escrow was refunded`, `#/job/${sub.job_id}`);
+        await notify(worker.owner_id, "dispute", `Subcontract dispute on job ${sub.job_id} was resolved for the hirer`, `#/job/${sub.job_id}`);
+      } else return err("resolution must be hirer or worker");
+      return json({ ok: true });
+    }
+    if (path === "/admin/guarantee" && method === "GET") {
+      const claims = await pg("ex_guarantee_claims?select=*&order=created_at.desc&limit=50");
+      return json({ pool_cents: await guaranteePoolCents(), claims });
+    }
+    if (path === "/admin/guarantee/pay" && method === "POST") {
+      const b = await body();
+      const target = await one(`ex_users?id=eq.${parseInt(b.user_id)}&select=id,name`);
+      if (!target) return err("user not found", 404);
+      const amount = cents(Number(b.amount || 0) * 100) || parseInt(b.amount_cents || 0);
+      if (amount <= 0) return err("amount required");
+      const pool = await guaranteePoolCents();
+      if (amount > pool) return err(`the guarantee pool holds $${(pool / 100).toFixed(2)} - a claim cannot exceed the pool`, 400);
+      const t = now();
+      const claimRows = await pg("ex_guarantee_claims", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: target.id, job_id: b.job_id ? parseInt(b.job_id) : null, amount_cents: amount, reason: String(b.reason || "").slice(0, 500), status: "paid", created_at: t }) });
+      await rpc("ex_move_balance", { p_user: target.id, p_amount: amount, p_type: "guarantee_payout", p_ref: `guarantee:${claimRows[0].id}`, p_note: `Guarantee pool payout: ${String(b.reason || "").slice(0, 200)}`, p_now: t });
+      await pg(`ex_settings?key=eq.guarantee_pool_cents`, { method: "PATCH", body: JSON.stringify({ value: String(pool - amount) }) });
+      await notify(target.id, "payment", `Buyer protection: $${(amount / 100).toFixed(2)} was paid to your wallet from the Exchange guarantee pool. ${String(b.reason || "").slice(0, 200)}`, "#/wallet");
+      return json({ claim: claimRows[0], pool_cents: pool - amount });
     }
     if (path === "/admin/deposits" && method === "GET") {
       const rows = await pg("ex_deposits?select=*,user:ex_users!ex_deposits_user_id_fkey(name,email)&order=created_at.desc&limit=100");
