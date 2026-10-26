@@ -73,6 +73,17 @@ async function upsertConfirming(row) {
   }
 }
 
+// Transactional email via ex_outbox (the mailer renders + sends). A
+// failure here must never break money movement: callers .catch() and log.
+async function queueOutbox(kind, userId, payload) {
+  const u = await db.one(`ex_users?id=eq.${userId}&select=email,name`);
+  if (!u?.email) return;
+  await db.insert("ex_outbox", {
+    kind, to_email: u.email, to_name: u.name || null, subject: null,
+    payload, created_at: nowSeconds(),
+  });
+}
+
 async function creditDeposit({ userId, chain, asset, address, txHash, logIndex, blockHeight, amountRaw, confirmations }) {
   const meta = ASSETS[asset];
   const rate = await getUsdRate(asset);
@@ -82,6 +93,11 @@ async function creditDeposit({ userId, chain, asset, address, txHash, logIndex, 
     await upsertConfirming({ user_id: userId, chain, asset, address, tx_hash: txHash, log_index: logIndex, block_height: blockHeight, amount_raw: String(amountRaw), amount_cents: 0, usd_rate: rate, confirmations, status: "ignored", created_at: t, updated_at: t });
     return;
   }
+  // The credit RPC is idempotent and the scans re-call it for already
+  // credited deposits — check the row's prior state so the confirmation
+  // email is queued only on the actual transition to 'credited'.
+  const logSel = logIndex == null ? "is.null" : `eq.${logIndex}`;
+  const prior = await db.one(`ex_chain_deposits?chain=eq.${chain}&tx_hash=eq.${txHash}&address=eq.${address}&log_index=${logSel}&select=status`).catch(() => null);
   await db.rpc("ex_credit_chain_deposit", {
     p_user: userId, p_chain: chain, p_asset: asset, p_address: address,
     p_tx_hash: txHash, p_log_index: logIndex, p_block_height: blockHeight,
@@ -89,6 +105,10 @@ async function creditDeposit({ userId, chain, asset, address, txHash, logIndex, 
     p_confirmations: confirmations, p_now: t,
   });
   await db.notify(userId, "wallet", `${asset} deposit of $${(amountCents / 100).toFixed(2)} confirmed and credited`, "#/wallet");
+  if (prior?.status !== "credited") {
+    await queueOutbox("deposit_confirmed", userId, { amount_cents: amountCents, asset })
+      .catch((e) => errLog(`deposit_confirmed mail queue failed user=${userId} tx=${txHash}:`, e.message));
+  }
   log(`credited ${asset} deposit user=${userId} tx=${txHash} cents=${amountCents}`);
 }
 
@@ -288,6 +308,8 @@ async function confirmPayouts() {
         const t = nowSeconds();
         await markPayout(p.id, { execution_status: "confirmed", status: "paid", confirmed_at: t, resolved_at: t });
         await db.notify(p.user_id, "wallet", `Payout of $${(p.amount_cents / 100).toFixed(2)} sent — tx ${String(p.tx_hash).slice(0, 18)}…`, "#/wallet");
+        await queueOutbox("payout_completed", p.user_id, { amount_cents: p.amount_cents, asset: p.asset, destination: p.destination, tx_hash: p.tx_hash })
+          .catch((e) => errLog(`payout_completed mail queue failed payout=${p.id}:`, e.message));
         log(`payout ${p.id} confirmed tx=${p.tx_hash}`);
       }
     } catch (e) { errLog(`payout ${p.id} confirm check failed:`, e.message); }
