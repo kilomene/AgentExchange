@@ -202,6 +202,102 @@ ${SITE_URL}`;
     const html = wrapHtml("You released a payment", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">You approved the delivery and released this payment.</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `You released ${p.amount || ""} for "${p.title || ""}". Wallet now ${p.wallet_balance || ""}.`, logoSrc);
     return { subject: `Payment released for "${p.title}" — ${p.amount}`, text, html };
   }
+  if (row.kind === "review_received") {
+    const pairs = [["Job", p.title || ""], ["Rating", `${p.stars || ""} / 5 stars`]];
+    if (p.rating_avg) pairs.push(["Your agent's average", `${p.rating_avg} / 5`]);
+    const reviewHtml = p.review ? `<div style="border:1px solid #e2e2e8;background:#fafafc;border-radius:10px;padding:16px 18px;margin-top:16px"><p style="line-height:21px;margin:0;color:#3c3c46">&ldquo;${esc(p.review)}&rdquo;</p></div>` : "";
+    const reviewText = p.review ? `\nWhat they wrote: "${p.review}"\n` : "";
+    const text = `Hi ${name},
+
+${p.agent_name || "Your agent"} just got a ${p.stars}-star review.
+
+${detailText(pairs)}${reviewText}
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your agent got a review", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.agent_name || "Your agent")} just got a ${esc(p.stars || "")}-star review.</p>${detailRows(pairs)}${reviewHtml}${button(p.link, "See the agent profile")}`, `${p.agent_name || "Your agent"} got a ${p.stars || ""}-star review on "${p.title || ""}".`, logoSrc);
+    return { subject: `${p.agent_name} got a ${p.stars}-star review on "${p.title}"`, text, html };
+  }
+  if (row.kind === "dispute_opened") {
+    const reasonHtml = p.reason ? `<p style="line-height:21px;color:#5c5c68;font-size:13px">Reason given: ${esc(p.reason)}</p>` : "";
+    const reasonText = p.reason ? `\nReason given: ${p.reason}\n` : "";
+    if (p.admin) {
+      const text = `Hi ${name},
+
+A dispute was opened on Agent Exchange and needs an admin review.
+
+Job: ${p.title || ""}${reasonText}
+The escrow stays held until the dispute is resolved.
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+      const html = wrapHtml("A dispute needs your review", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">A dispute was opened and needs an admin review.</p>${detailRows([["Job", p.title || ""]])}${reasonHtml}<p style="line-height:21px">The escrow stays held until the dispute is resolved.</p>${button(p.link, "Open the admin panel")}`, `Dispute opened on "${p.title || ""}" — admin review needed.`, logoSrc);
+      return { subject: `Dispute opened on "${p.title}" — review needed`, text, html };
+    }
+    const text = `Hi ${name},
+
+The poster opened a dispute on this job. The escrow stays held while an admin reviews it — no money moves until the dispute is resolved.
+
+Job: ${p.title || ""}${reasonText}
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your job is under dispute", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">The poster opened a dispute on this job. The escrow stays held while an admin reviews it — no money moves until the dispute is resolved.</p>${detailRows([["Job", p.title || ""]])}${reasonHtml}${button(p.link, "Open the job")}`, `A dispute was opened on "${p.title || ""}".`, logoSrc);
+    return { subject: `A dispute was opened on "${p.title}"`, text, html };
+  }
+  if (row.kind === "dispute_resolved") {
+    const pairs = [["Job", p.title || ""]];
+    if (p.amount) pairs.push([p.amount_label || "Amount", p.amount]);
+    if (p.wallet_after) pairs.push(["Your wallet now", p.wallet_after]);
+    const text = `Hi ${name},
+
+${p.summary || "A dispute on this job has been resolved."}
+
+${detailText(pairs)}
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Dispute resolved", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.summary || "A dispute on this job has been resolved.")}</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `Dispute resolved on "${p.title || ""}".`, logoSrc);
+    return { subject: `Dispute resolved on "${p.title}"`, text, html };
+  }
+  if (row.kind === "job_cancelled") {
+    const text = `Hi ${name},
+
+The poster cancelled this job, so your agent ${p.agent_name || ""}'s bid on it is closed. No money was taken or held for bids.
+
+Job: ${p.title || ""}
+
+Browse the open jobs and bid on the next one:
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("A job you bid on was cancelled", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">The poster cancelled this job, so your agent ${esc(p.agent_name || "")}'s bid on it is closed. No money was taken or held for bids.</p>${detailRows([["Job", p.title || ""]])}${button(p.link, "Browse open jobs")}`, `"${p.title || ""}" was cancelled by its poster.`, logoSrc);
+    return { subject: `"${p.title}" was cancelled`, text, html };
+  }
+  if (row.kind === "bid_not_selected") {
+    const text = `Hi ${name},
+
+This job was awarded to ${p.winner_name || "another agent"}, so your agent ${p.agent_name || ""} was not picked this time.
+
+Job: ${p.title || ""}
+
+More jobs are posted on the Exchange — browse the open floor:
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("This job went to another agent", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">This job was awarded to ${esc(p.winner_name || "another agent")}, so your agent ${esc(p.agent_name || "")} was not picked this time.</p>${detailRows([["Job", p.title || ""]])}${button(p.link, "Browse open jobs")}`, `"${p.title || ""}" was awarded to ${p.winner_name || "another agent"}.`, logoSrc);
+    return { subject: `"${p.title}" went to another agent`, text, html };
+  }
   // broadcast
   const subject = row.subject || "A message from Agent Exchange";
   const bodyText = String(p.body || "");
