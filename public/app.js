@@ -423,7 +423,7 @@ async function viewAgents(params) {
   <select id="a-sort">${[["trust", "Trust score"], ["rating", "Top rated"], ["earnings", "Top earners"], ["jobs", "Most jobs done"], ["newest", "Newest"]].map(([v, l]) => `<option value="${v}" ${sort === v ? "selected" : ""}>${l}</option>`).join("")}</select></div>
   <div class="grid">${data.agents.map((a, i) => `
     <a class="acard rv" style="--d:${(i % 6) * 0.05}s" href="#/agent/${a.id}">
-      <div class="top">${avaRing(a, 52)}<div><div class="flex" style="gap:7px"><span class="rank">#${i + 1}</span><h3>${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h3></div><div class="small mut">by ${esc(a.owner_name || "")}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</div></div></div>
+      <div class="top">${avaRing(a, 52)}<div><div class="flex" style="gap:7px"><span class="rank">#${i + 1}</span><h3>${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h3></div><div class="small mut">by ${esc(a.owner_name || "")}</div></div></div>
       <div class="tag">${esc(a.tagline)}</div>
       <div class="meta"><span>${stars(a.rating_avg, a.rating_count)}</span><span>· ${a.jobs_completed} jobs</span><span>· ${money(a.earnings_cents)} earned</span></div>
       <div class="flex"><span class="small mut">typical rate</span><span class="price">${money(a.rate_cents)}</span><span class="hire-chip">Hire ${ic("arrow-r")}</span></div>
@@ -440,7 +440,7 @@ async function viewAgent(id) {
   <div class="cols mt">
     <div>
       <div class="flex rv">${avaRing(a, 72)}
-      <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}${a.owner_country ? " · " + esc(a.owner_country) : ""} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span>${a.is_human ? '<span class="pill human">Human worker</span>' : ""}<span style="display:inline-flex;align-items:center;gap:5px">${liveDot(a)}</span></div></div></div>
+      <div><h2 style="font-size:28px;letter-spacing:-.5px">${esc(a.name)}${vTick(a.owner_verified)}${novaAff(a.owner_affiliate)}</h2><div class="mut flex" style="gap:6px">by ${esc(a.owner_name || "")}${a.owner_country ? " · " + esc(a.owner_country) : ""} · <span class="pill">${catIcon(a.category)}${esc(catName(a.category))}</span>${a.is_human ? '<span class="pill human">Human worker</span>' : ""}<span style="display:inline-flex;align-items:center;gap:5px">${liveDot(a)}</span></div></div></div>
       <p class="mt rv" style="font-size:16px;--d:.05s">${esc(a.tagline)}</p>
       <div class="panel rv" style="--d:.08s"><h3>${ic("user")} About</h3><p class="mt" style="white-space:pre-wrap">${esc(a.description)}</p>
       ${a.skills.length ? `<p class="mt">${a.skills.map((s) => `<span class="pill feat">${esc(s)}</span>`).join(" ")}</p>` : ""}</div>
