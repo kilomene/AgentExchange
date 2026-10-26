@@ -10,7 +10,8 @@ import { createEncryptedWallet, isValidBtcAddress, isValidEvmAddress } from "../
 
 const SB_URL = Deno.env.get("SUPABASE_URL")!;
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const JWT_SECRET = Deno.env.get("EXCHANGE_JWT_SECRET") ?? SB_KEY;
+const JWT_SECRET = Deno.env.get("EXCHANGE_JWT_SECRET");
+if (!JWT_SECRET) throw new Error("EXCHANGE_JWT_SECRET is not set - refusing to start (no fallback to the service key)");
 
 const enc = new TextEncoder();
 const now = () => Math.floor(Date.now() / 1000);
@@ -22,13 +23,24 @@ const CHAT_HIDDEN = "[hidden]";
 // write time (nothing unsafe is ever stored) and again at read time
 // (older messages are covered too).
 function sanitizeChat(input: unknown): string {
-  let s = String(input ?? "");
+  const s = String(input ?? "");
   // Owner's stricter rule (2026-10-26, after the plain-word fix): ANY
   // mention of a social-media platform hides the WHOLE message - the
   // text does not stay partly visible ("My Instagram is [hidden]" still
   // showed a social mention; the whole text must be just "[hidden]").
   if (/\b(?:instagram|insta|ig|tiktok|tik\s?tok|snapchat|snap|facebook|fb|twitter|telegram|whatsapp|discord|youtube|linkedin|reddit|pinterest|threads|messenger|wechat|viber|skype|twitch|onlyfans)\b/i.test(s)
     || /\b(?:my|on|via|follow|find|add|message|dm|contact)\s+x\b|\bx\s*(?:is|:|handle|username|profile)|\bx\.com\b/i.test(s)) return CHAT_HIDDEN;
+  return maskText(s);
+}
+// Partial screening for every OTHER public text surface (bid pitches, job
+// titles/descriptions, agent profiles, bios, reviews, briefs, dispute
+// reasons): links, domains, emails, phones, @handles and profanity are
+// masked to [hidden] - but there is NO whole-message social rule here.
+function sanitizeText(input: unknown): string {
+  return maskText(String(input ?? ""));
+}
+function maskText(s0: string): string {
+  let s = s0;
   s = s.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, CHAT_HIDDEN);
   s = s.replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, CHAT_HIDDEN);
   s = s.replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.(?:com|net|org|io|co|app|dev|me|info|xyz|site|online|store|gg|tv|ai|tech|pro|biz|us|uk|ng|ca|de|fr|au|jp|br|mx|es|it|nl|za|ke|gh|ph|sg|ae)(?:\/\S*)?/gi, CHAT_HIDDEN);
@@ -86,7 +98,14 @@ async function pg(path: string, opts: RequestInit & { prefer?: string } = {}) {
   const text = await res.text();
   let data: any = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!res.ok) throw Object.assign(new Error(data?.message || `db error ${res.status}`), { status: 502 });
+  if (!res.ok) {
+    // Error hygiene: PostgREST details (constraint names, SQL fragments)
+    // are logged server-side only; clients get a plain "database error".
+    // The raw message rides along as dbMessage for internal checks
+    // (e.g. the money RPCs' "insufficient balance" raises).
+    console.error("postgrest error", opts.method || "GET", path, res.status, text.slice(0, 500));
+    throw Object.assign(new Error("database error"), { status: 502, dbMessage: data?.message || `db error ${res.status}` });
+  }
   return data;
 }
 const one = async (path: string) => {
@@ -157,7 +176,7 @@ async function authUser(req: Request): Promise<User | null> {
   if (!h.startsWith("Bearer ")) return null;
   const payload = await verifyJwt(h.slice(7));
   if (!payload) return null;
-  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate`);
+  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes`);
   if (!user || user.suspended) return null;
   // Sessions issued before the latest password change/reset are dead.
   if (payload.iat && Number(user.password_changed_at || 0) > Number(payload.iat)) return null;
@@ -165,7 +184,19 @@ async function authUser(req: Request): Promise<User | null> {
 }
 async function requireUser(req: Request): Promise<User> {
   const u = await authUser(req) || await authUserByApiKey(req);
-  if (!u) throw Object.assign(new Error("unauthorized"), { status: 401 });
+  if (!u) {
+    // A personal API key minted BEFORE the account's last password change
+    // is dead by design - say so, so the owner rotates instead of guessing.
+    let key = req.headers.get("x-api-key") || "";
+    if (!key) { const a = req.headers.get("authorization") || ""; if (a.startsWith("ApiKey ")) key = a.slice(7).trim(); }
+    if (key) {
+      const row = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=api_key_created_at,password_changed_at`).catch(() => null);
+      if (row?.api_key_created_at && row?.password_changed_at && Number(row.api_key_created_at) < Number(row.password_changed_at)) {
+        throw Object.assign(new Error("this API key predates your last password change — rotate it from your dashboard"), { status: 401 });
+      }
+    }
+    throw Object.assign(new Error("unauthorized"), { status: 401 });
+  }
   await rateLimit("user:" + u.id);
   return u;
 }
@@ -196,8 +227,10 @@ async function authUserByApiKey(req: Request): Promise<User | null> {
     if (a.startsWith("ApiKey ")) key = a.slice(7).trim();
   }
   if (!key) return null;
-  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate`);
+  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,api_key_created_at`);
   if (!user || user.suspended) return null;
+  // Keys minted before the last password change/reset no longer work.
+  if (user.api_key_created_at && user.password_changed_at && Number(user.api_key_created_at) < Number(user.password_changed_at)) return null;
   return user;
 }
 async function walletOf(userId: number) {
@@ -243,6 +276,8 @@ type DeliveryInput = { notes: string; link: string; file: File | null; fields: R
 async function readDeliveryInput(req: Request): Promise<DeliveryInput> {
   const ct = req.headers.get("content-type") || "";
   if (ct.includes("multipart/form-data")) {
+    const contentLength = Number(req.headers.get("content-length") || 0);
+    if (contentLength > 60 * 1024 * 1024) throw Object.assign(new Error("upload too large - the maximum direct upload is a 50 MB file; for very large builds, paste a download link instead"), { status: 413 });
     const form = await req.formData();
     const fields: Record<string, string> = {};
     let file: File | null = null;
@@ -393,8 +428,11 @@ function publicJobView(j: any, canSeeDelivery: boolean) {
   out.delivery_file = hasFile ? { name: j.delivery_file_name, size: j.delivery_file_size, type: j.delivery_file_type } : null;
   out.delivery_storage_path = "";
   if (!canSeeDelivery) {
+    // Delivery notes and the external link are NEVER public - not even
+    // for legacy notes-only deliveries. Non-parties get metadata only.
     out.delivery_link = "";
-    if (hasFile || hasLink) { out.deliverable = ""; out.delivery_private = true; }
+    out.deliverable = "";
+    if (hasFile || hasLink || j.deliverable) out.delivery_private = true;
   }
   return out;
 }
@@ -422,7 +460,7 @@ async function queueVerifyMail(user: { id: number; email: string; name: string }
 async function queuePasswordChangedMail(user: { id: number; email: string; name: string }, source: "settings" | "reset", req: Request): Promise<boolean> {
   let when = new Date().toISOString();
   try { when = new Date().toLocaleString("en-US", { dateStyle: "full", timeStyle: "long", timeZone: "UTC" }); } catch { /* ISO fallback */ }
-  const ip = (req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || "").split(",")[0].trim();
+  const ip = clientIp(req);
   const payload: Record<string, unknown> = {
     name: user.name,
     when,
@@ -484,6 +522,71 @@ async function rateLimit(identity: string) {
     console.error("rate limiter error (failing open)", identity, e);
   }
 }
+// AUTH RATE LIMITS: the unauthenticated auth routes get their own, much
+// tighter per-IP / per-email counters (same atomic ex_rate_hit RPC, same
+// fail-open-on-infra-error policy as the main limiter).
+async function rateLimitAuth(identity: string, limit: number) {
+  try {
+    const res: any = await rpc("ex_rate_hit", { p_identity: identity, p_now: now() });
+    const hits = typeof res === "number" ? res : Number(res?.ex_rate_hit ?? (Array.isArray(res) ? res[0]?.ex_rate_hit : 0) ?? 0);
+    if (hits > limit) throw Object.assign(new Error("too many attempts — wait a minute"), { status: 429 });
+  } catch (e: any) {
+    if (e && e.status === 429) throw e;
+    console.error("auth rate limiter error (failing open)", identity, e);
+  }
+}
+// WEBHOOK SAFETY: a webhook URL is fetched by the platform, so it must be
+// a public http(s) address - never loopback, private, link-local or
+// internal names (SSRF guard). Empty means "no webhook" and is allowed.
+function isSafeWebhookUrl(raw: string): boolean {
+  const s = String(raw || "").trim();
+  if (!s) return true;
+  let u: URL;
+  try { u = new URL(s); } catch { return false; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  const host = u.hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal")) return false;
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const a = Number(v4[1]), b = Number(v4[2]);
+    if (a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) return false;
+  }
+  if (host.includes(":")) {
+    const h = host.replace(/^\[|\]$/g, "");
+    if (h === "::1" || /^(fc|fd)/.test(h) || /^fe[89ab]/.test(h)) return false;
+  }
+  return true;
+}
+function cleanWebhookUrl(raw: unknown): string {
+  const s = String(raw ?? "").slice(0, 300);
+  if (s && !isSafeWebhookUrl(s)) throw Object.assign(new Error("webhook_url must be a public http(s) URL - private, loopback and internal addresses are not allowed"), { status: 400 });
+  return s;
+}
+// AVATAR SAFETY: avatars render as images, so only http(s), data:image or
+// site-relative values are kept; anything else becomes "" (auto-avatar).
+function cleanAvatarValue(v: unknown): string {
+  const s = String(v ?? "");
+  if (!s) return "";
+  return /^(https?:\/\/|data:image|\/)/.test(s) ? s.slice(0, 2000) : "";
+}
+// A milestone's share of the job's STORED fee (never the live fee_pct).
+function milestoneFeeShare(feeCents: number, amountCents: number, agreedCents: number): number {
+  if (!agreedCents) return 0;
+  return Math.round(((feeCents || 0) * (amountCents || 0)) / agreedCents);
+}
+// SOCK-PUPPET GUARD: two accounts created from the same sign-up connection
+// cannot trade with each other (bid / award / review) - that is how fake
+// track records are farmed. Admins are exempt (the founder runs the floor).
+async function assertNoSharedSignupIp(posterUserId: number, otherOwnerId: number) {
+  if (!posterUserId || !otherOwnerId || posterUserId === otherOwnerId) return;
+  const [a, b] = await Promise.all([
+    one(`ex_users?id=eq.${posterUserId}&select=signup_ip,role`),
+    one(`ex_users?id=eq.${otherOwnerId}&select=signup_ip,role`),
+  ]);
+  if (a?.signup_ip && b?.signup_ip && a.signup_ip === b.signup_ip && a.role !== "admin" && b.role !== "admin") {
+    throw Object.assign(new Error("accounts that share a signup connection cannot trade with each other"), { status: 400 });
+  }
+}
 // ----- IP identity: no escaping punishment (owner's rule, 2026-10-26) ---
 // Every account is created from a real connection: the sign-up IP and its
 // country (from the IP itself, never self-declared) go on the account.
@@ -492,13 +595,24 @@ async function rateLimit(identity: string) {
 // accounts that share a banned address. A wallet balance never protects
 // a banned account - suspension locks every route.
 function clientIp(req: Request): string {
-  // cf-connecting-ip is set by Cloudflare (which fronts the API) to the
-  // address that actually connected to it - a client cannot spoof it.
-  // x-forwarded-for's first entry proved to be a rotating Cloudflare edge
-  // address in production, not the client; its LAST entry is the nearest
-  // gateway's view, used only when cf-connecting-ip is absent.
-  const cf = (req.headers.get("cf-connecting-ip") || "").trim();
-  if (cf) return cf;
+  // H1 fix (2026-10-26): this function is directly reachable at its
+  // supabase.co URL, where cf-connecting-ip is merely a caller-set header
+  // and therefore spoofable. Website traffic now reaches the API through
+  // the exchange-api-proxy Cloudflare Worker (exchange.novamail.store/api/*),
+  // which stamps the true client IP in x-client-ip together with an
+  // x-proxy-secret header. Trust x-client-ip ONLY when that secret matches
+  // the PROXY_SECRET env var. In every other case (direct supabase.co
+  // traffic, missing or mismatched secret) ignore cf-connecting-ip and
+  // x-client-ip entirely and fall back to the LAST entry of
+  // x-forwarded-for, which the Supabase gateway appends from the real
+  // connecting socket (its first entries proved to be rotating
+  // Cloudflare edge addresses in production, not the client).
+  const proxySecret = (Deno.env.get("PROXY_SECRET") || "").trim();
+  const givenSecret = (req.headers.get("x-proxy-secret") || "").trim();
+  if (proxySecret && givenSecret && givenSecret === proxySecret) {
+    const proxied = (req.headers.get("x-client-ip") || "").trim();
+    if (proxied) return proxied;
+  }
   const parts = (req.headers.get("x-forwarded-for") || "").split(",").map((s) => s.trim()).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : "";
 }
@@ -510,6 +624,21 @@ async function geoForIp(ip: string): Promise<{ country: string; country_code: st
   try {
     const cached = await one(`ex_ip_geo?ip=eq.${q(ip)}&select=country,country_code,is_proxy`);
     if (cached) return { country: cached.country || "", country_code: cached.country_code || "", is_proxy: !!cached.is_proxy };
+    // Country comes from an HTTPS source (ipwho.is). No free HTTPS source
+    // exposes a proxy/hosting signal, so the VPN/proxy VERDICT still comes
+    // from ip-api - and if no verdict can be obtained at all, this returns
+    // null and the signup fails closed (see assertSignupIpAllowed).
+    let httpsCountry = "", httpsCc = "";
+    try {
+      const ctl0 = new AbortController();
+      const timer0 = setTimeout(() => ctl0.abort(), 3500);
+      const r0 = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, { signal: ctl0.signal }).catch(() => null);
+      clearTimeout(timer0);
+      if (r0 && r0.ok) {
+        const w: any = await r0.json().catch(() => null);
+        if (w && w.success) { httpsCountry = String(w.country || ""); httpsCc = String(w.country_code || ""); }
+      }
+    } catch { /* the verdict below is what matters */ }
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 3500);
     const r = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,country,countryCode,proxy,hosting`, { signal: ctl.signal }).catch(() => null);
@@ -517,7 +646,7 @@ async function geoForIp(ip: string): Promise<{ country: string; country_code: st
     if (!r || !r.ok) return null;
     const gj: any = await r.json().catch(() => null);
     if (!gj || gj.status !== "success") return null;
-    const geo = { country: String(gj.country || ""), country_code: String(gj.countryCode || ""), is_proxy: !!(gj.proxy || gj.hosting) };
+    const geo = { country: httpsCountry || String(gj.country || ""), country_code: httpsCc || String(gj.countryCode || ""), is_proxy: !!(gj.proxy || gj.hosting) };
     await pg("ex_ip_geo", { method: "POST", body: JSON.stringify({ ip, country: geo.country, country_code: geo.country_code, is_proxy: geo.is_proxy, checked_at: now() }) }).catch(() => null);
     return geo;
   } catch { return null; }
@@ -528,8 +657,11 @@ async function assertSignupIpAllowed(req: Request): Promise<{ ip: string; countr
   const banned = await one(`ex_banned_ips?ip=eq.${q(ip)}&select=ip`);
   if (banned) throw Object.assign(new Error("this network address is banned on the Exchange - an account was previously banned from it. If you believe this is a mistake, contact support."), { status: 403 });
   const geo = await geoForIp(ip);
-  if (geo?.is_proxy) throw Object.assign(new Error("sign-ups are not allowed through a VPN or proxy. Please switch it off and register from your real connection."), { status: 403 });
-  return { ip, country: geo?.country || "", country_code: geo?.country_code || "" };
+  // FAIL CLOSED: a public IP whose connection cannot be verified (geo
+  // lookup error, timeout or non-success) does not get to sign up.
+  if (!geo) throw Object.assign(new Error("we could not verify your connection — turn off any VPN or proxy and try again"), { status: 403 });
+  if (geo.is_proxy) throw Object.assign(new Error("sign-ups are not allowed through a VPN or proxy. Please switch it off and register from your real connection."), { status: 403 });
+  return { ip, country: geo.country, country_code: geo.country_code };
 }
 async function recordLoginIp(userId: number, req: Request) {
   try {
@@ -563,12 +695,14 @@ function publicAgent(a: any) {
 function cleanPortfolio(raw: any): { title: string; description: string; link: string; job_id: number | null }[] {
   if (!Array.isArray(raw)) throw Object.assign(new Error("portfolio must be a list of up to 3 work samples"), { status: 400 });
   if (raw.length > 3) throw Object.assign(new Error("portfolio holds at most 3 work samples - pin only the best finished work"), { status: 400 });
-  return raw.map((it: any) => ({
-    title: String(it?.title || "").slice(0, 120),
-    description: String(it?.description || "").slice(0, 1000),
+  const items = raw.map((it: any) => ({
+    title: sanitizeText(String(it?.title || "")).slice(0, 120),
+    description: sanitizeText(String(it?.description || "")).slice(0, 1000),
     link: String(it?.link || "").slice(0, 300),
     job_id: Number.isFinite(Number(it?.job_id)) && it?.job_id != null ? parseInt(it.job_id) : null,
   })).filter((it: any) => it.title);
+  for (const it of items) if (it.link && !it.link.startsWith("https://")) throw Object.assign(new Error("portfolio links must start with https://"), { status: 400 });
+  return items;
 }
 function seedHash(str: string) { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
 function rngFrom(seed: number) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
@@ -627,9 +761,9 @@ async function createHumanProfile(user: any, work: any) {
   const cat = await one(`ex_categories?slug=eq.${q(String(work?.category || ""))}&select=slug`);
   if (!cat) return null;
   const fields = {
-    name: user.name, tagline: String(work.tagline || "Human worker — hire me directly").slice(0, 140),
-    description: String(work.description || "").slice(0, 4000), category: cat.slug,
-    skills: String(work.skills || "").slice(0, 300), rate_cents: cents(Number(work.rate || 25) * 100),
+    name: user.name, tagline: sanitizeText(String(work.tagline || "Human worker — hire me directly")).slice(0, 140),
+    description: sanitizeText(String(work.description || "")).slice(0, 4000), category: cat.slug,
+    skills: sanitizeText(String(work.skills || "")).slice(0, 300), rate_cents: cents(Number(work.rate || 25) * 100),
   };
   const existing = await one(`ex_agents?owner_id=eq.${user.id}&is_human=eq.true&select=id`);
   if (existing) { await pg(`ex_agents?id=eq.${existing.id}`, { method: "PATCH", body: JSON.stringify(fields) }); return existing.id; }
@@ -692,12 +826,13 @@ async function handle(req: Request) {
       users: Array.isArray(users) ? users.length : 0,
       volume_cents: completed.reduce((s: number, j: any) => s + (j.agreed_cents || 0), 0),
       guarantee_pool_cents: await guaranteePoolCents(),
+      fee_pct: await feePct(),
     });
   }
   if (path === "/agents" && method === "GET") {
     const sort = url.searchParams.get("sort") || "trust";
     const cat = url.searchParams.get("category") || "";
-    const search = (url.searchParams.get("q") || "").trim();
+    const search = (url.searchParams.get("q") || "").replace(/[(),.*%_]/g, "").trim();
     let filter = "status=eq.active";
     if (cat) filter += `&category=eq.${q(cat)}`;
     if (search) filter += `&or=(name.ilike.*${q(search)}*,tagline.ilike.*${q(search)}*,skills.ilike.*${q(search)}*)`;
@@ -722,7 +857,7 @@ async function handle(req: Request) {
   if (path === "/jobs" && method === "GET") {
     const status = url.searchParams.get("status") || "open";
     const cat = url.searchParams.get("category") || "";
-    const search = (url.searchParams.get("q") || "").trim();
+    const search = (url.searchParams.get("q") || "").replace(/[(),.*%_]/g, "").trim();
     const sort = url.searchParams.get("sort") || "newest";
     let filter = `status=eq.${q(status)}`;
     if (cat) filter += `&category=eq.${q(cat)}`;
@@ -738,7 +873,7 @@ async function handle(req: Request) {
   }
   if (path.startsWith("/jobs/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
+    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))`);
     if (!j) return err("job not found", 404);
     const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))&order=amount_cents.asc`);
     // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
@@ -750,7 +885,7 @@ async function handle(req: Request) {
     const jobView = publicJobView(j, canSeeDelivery);
     (jobView as any).milestones = await milestonesOf(id);
     (jobView as any).subcontracts = await subcontractsOf(id);
-    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review });
+    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review });
   }
 
 
@@ -810,9 +945,10 @@ async function handle(req: Request) {
 
   // ===== auth =====
   if (path === "/auth/register" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 10);
     const b = await body();
     const email = String(b.email || "").toLowerCase().trim();
-    const name = String(b.name || "").trim();
+    const name = String(b.name || "").trim().slice(0, 80);
     const password = String(b.password || "");
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err("valid email required");
     if (name.length < 2) return err("name required");
@@ -820,7 +956,7 @@ async function handle(req: Request) {
     const exists = await one(`ex_users?email=eq.${q(email)}&select=id`);
     if (exists) return err("email already registered", 409);
     const signup = await assertSignupIpAllowed(req);
-    const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: b.avatar || avatarDataUri("user:" + email, name), created_at: now(), signup_ip: signup.ip, last_ip: signup.ip, country: signup.country, country_code: signup.country_code }) });
+    const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: cleanAvatarValue(b.avatar) || avatarDataUri("user:" + email, name), created_at: now(), signup_ip: signup.ip, last_ip: signup.ip, country: signup.country, country_code: signup.country_code }) });
     const user = rows[0];
     await walletOf(user.id);
     try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
@@ -832,11 +968,20 @@ async function handle(req: Request) {
     return json({ token, api_key: apiKey, user: { id: user.id, email, name, role: user.role, avatar: user.avatar, email_verified: false, has_api_key: true, country: signup.country, country_code: signup.country_code }, note: "Save your api_key — it is shown once. Use it as the X-API-Key header to run your account from code; rotate it any time from the dashboard." }, 201);
   }
   if (path === "/auth/login" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 20);
     const b = await body();
     const email = String(b.email || "").toLowerCase().trim();
+    await rateLimitAuth("email:" + email, 10);
     const user = await one(`ex_users?email=eq.${q(email)}&select=*`);
     if (!user || !(await verifyPassword(String(b.password || ""), user.password_hash))) return err("invalid email or password", 401);
     if (user.suspended) return err("account suspended", 403);
+    // Login from a banned connection is refused - the ban follows the IP,
+    // not just the account. (VPN use at login is NOT blocked.)
+    const loginIp = clientIp(req);
+    if (loginIp && !isPrivateIp(loginIp)) {
+      const bannedRow = await one(`ex_banned_ips?ip=eq.${q(loginIp)}&select=ip`);
+      if (bannedRow) return err("this connection is banned", 403);
+    }
     await recordLoginIp(user.id, req);
     // Accounts created before personal API keys existed are issued one on
     // this login — every user ends up with a key. Shown once, only then.
@@ -856,7 +1001,7 @@ async function handle(req: Request) {
   if (path === "/auth/profile" && method === "PUT") {
     const u = await requireUser(req);
     const b = await body();
-    await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ name: String(b.name || u.name).slice(0, 80), avatar: String(b.avatar || u.avatar).slice(0, 2000), bio: String(b.bio || "").slice(0, 500) }) });
+    await pg(`ex_users?id=eq.${u.id}`, { method: "PATCH", body: JSON.stringify({ name: sanitizeText(String(b.name || u.name)).slice(0, 80), avatar: cleanAvatarValue(b.avatar ?? u.avatar), bio: sanitizeText(String(b.bio || "")).slice(0, 500) }) });
     return json({ ok: true });
   }
   if (path === "/auth/password" && method === "PUT") {
@@ -870,6 +1015,7 @@ async function handle(req: Request) {
     return json({ ok: true, notified });
   }
   if (path === "/auth/verify" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 20);
     const b = await body();
     const row = await findEmailToken(String(b.token || ""), "verify");
     if (!row) return err("this verification link is invalid or has expired", 400);
@@ -884,8 +1030,10 @@ async function handle(req: Request) {
     return json({ ok: true, sent: true });
   }
   if (path === "/auth/forgot" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 5);
     const b = await body();
     const email = String(b.email || "").toLowerCase().trim();
+    await rateLimitAuth("email:" + email, 5);
     const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended`);
     if (user && !user.suspended) {
       try {
@@ -897,11 +1045,14 @@ async function handle(req: Request) {
     return json({ ok: true });
   }
   if (path === "/auth/reset" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 10);
     const b = await body();
     const password = String(b.password || "");
     if (password.length < 8) return err("password must be at least 8 characters");
     const row = await findEmailToken(String(b.token || ""), "reset");
     if (!row) return err("this reset link is invalid or has expired", 400);
+    const resetTarget = await one(`ex_users?id=eq.${row.user_id}&select=suspended`);
+    if (resetTarget?.suspended) return err("account suspended", 400);
     await pg(`ex_email_tokens?user_id=eq.${row.user_id}&used_at=is.null`, { method: "PATCH", body: JSON.stringify({ used_at: now() }) });
     await pg(`ex_users?id=eq.${row.user_id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(password), password_changed_at: now(), email_verified: true }) });
     let notified = false;
@@ -923,6 +1074,13 @@ async function handle(req: Request) {
     const mode = b.mode === "fixed" ? "fixed" : "bidding";
     const milestoneSpec = cleanMilestones(b.milestones);
     const t = now();
+    // EMAIL GATE + POSTER STRIKES (unified): every posting path (web,
+    // agent key, personal key) funnels through postJob, so the checks
+    // live here - an unverified account (admins excepted) cannot post,
+    // and an account carrying 3 strikes has posting suspended.
+    const posterUser = await one(`ex_users?id=eq.${posterUserId}&select=email_verified,role,strikes`);
+    if (posterUser && posterUser.role !== "admin" && !posterUser.email_verified) throw Object.assign(new Error("verify your email first — we sent a confirmation link to your inbox"), { status: 403 });
+    if ((posterUser?.strikes || 0) >= 3) throw Object.assign(new Error("posting is suspended on your account (3 strikes) — contact support"), { status: 403 });
     // JOB CONTENT RULES (owner's rule, 2026-10-26): jobs asking for
     // illegal goods or services are refused at posting. The list is
     // deliberately narrow - only unambiguous illegality. An admin can
@@ -944,7 +1102,7 @@ async function handle(req: Request) {
     try {
       await rpc("ex_hold_escrow", { p_user: posterUserId, p_amount: budget, p_ref: "job:new", p_note: `Escrow for job: ${title}`, p_now: t });
     } catch (e: any) {
-      if (String(e?.message || "").includes("insufficient balance")) {
+      if (String(e?.dbMessage || e?.message || "").includes("insufficient balance")) {
         const w = await walletOf(posterUserId).catch(() => null);
         throw Object.assign(new Error(`insufficient balance — posting a job holds its $${(budget / 100).toFixed(2)} budget in escrow from your wallet (current balance $${(((w?.balance_cents) || 0) / 100).toFixed(2)}). Add funds first (POST /agent/deposit, or the owner tops up from the dashboard), then post the job again.`), { status: 400 });
       }
@@ -952,8 +1110,8 @@ async function handle(req: Request) {
     }
     try {
       const rows = await pg("ex_jobs", { method: "POST", prefer: "return=representation", body: JSON.stringify({
-        poster_user_id: posterUserId, poster_agent_id: posterAgentId, title: title.slice(0, 160),
-        description: String(b.description || "").slice(0, 6000), category: cat.slug, budget_cents: budget,
+        poster_user_id: posterUserId, poster_agent_id: posterAgentId, title: sanitizeText(title).slice(0, 160),
+        description: sanitizeText(String(b.description || "")).slice(0, 6000), category: cat.slug, budget_cents: budget,
         mode, status: "open", bid_deadline: b.deadline_hours ? t + Math.max(1, parseInt(b.deadline_hours)) * 3600 : null,
         created_at: t, updated_at: t,
       }) });
@@ -988,7 +1146,6 @@ async function handle(req: Request) {
   }
   if (path === "/jobs" && method === "POST") {
     const u = await requireUser(req);
-    if (!u.email_verified) return err("verify your email first — we sent a confirmation link to your inbox", 403);
     const b = await body();
     let posterAgentId: number | null = null;
     if (b.poster_agent_id) {
@@ -1000,15 +1157,15 @@ async function handle(req: Request) {
   }
 
   async function assertTrialGate(agent: any, job: any) {
-    // SKILL TRIAL GATE (owner pick, 2026-10-26): a non-human agent may
-    // only bid/claim jobs over $100 in a category after passing that
-    // category's prove-it trial. Under $100 stays open to everyone.
-    if (agent.is_human) return;
+    // SKILL TRIAL GATE (owner pick, 2026-10-26): EVERY worker - agents
+    // and human profiles alike - may only bid/claim jobs over $100 in a
+    // category after passing that category's prove-it trial. Under $100
+    // stays open to everyone.
     if ((job.budget_cents || 0) <= 10000) return;
     const t = await one(`ex_trials?category=eq.${q(job.category)}&active=eq.true&select=id`);
     if (!t) return;
     const sk = await one(`ex_agent_skills?agent_id=eq.${agent.id}&category=eq.${q(job.category)}&select=agent_id`);
-    if (!sk) throw Object.assign(new Error(`skill trial required: this agent has not passed the ${job.category} prove-it trial. Jobs over $100 in a category require a passed trial for that category (start one: POST /agent/trials/${job.category}/start).`), { status: 400 });
+    if (!sk) throw Object.assign(new Error(`skill trial required: this worker has not passed the ${job.category} prove-it trial. Jobs over $100 in a category require a passed trial for that category - every worker, agents and human profiles alike (start one: POST /agent/trials/${job.category}/start).`), { status: 400 });
   }
   async function startTrial(agent: any, category: string) {
     const trial = await one(`ex_trials?category=eq.${q(category)}&active=eq.true&select=*`);
@@ -1055,7 +1212,9 @@ async function handle(req: Request) {
   async function placeBid(agent: any, job: any, b: any) {
     if (job.status !== "open") throw Object.assign(new Error("job is not open for bids"), { status: 400 });
     if (job.mode !== "bidding") throw Object.assign(new Error("this is a fixed-price job — claim it instead"), { status: 400 });
+    if (job.bid_deadline && now() > Number(job.bid_deadline)) throw Object.assign(new Error("bidding has closed for this job"), { status: 400 });
     if (job.poster_user_id === agent.owner_id) throw Object.assign(new Error("you cannot bid on your own job"), { status: 400 });
+    await assertNoSharedSignupIp(job.poster_user_id, agent.owner_id);
     // NEW-AGENT RAMP (owner's rule, 2026-10-26): until an agent has
     // completed 3 jobs, it can only take jobs budgeted at $100 or less.
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) throw Object.assign(new Error("new-agent limit: agents with fewer than 3 completed jobs can only bid on jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets."), { status: 400 });
@@ -1063,7 +1222,7 @@ async function handle(req: Request) {
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 50) throw Object.assign(new Error("minimum bid is $0.50"), { status: 400 });
     const eta = Math.max(1, parseInt(b.eta_hours || 24));
-    const pitch = String(b.pitch || "").slice(0, 1000);
+    const pitch = sanitizeText(String(b.pitch || "")).slice(0, 1000);
     const existing = await one(`ex_bids?job_id=eq.${job.id}&agent_id=eq.${agent.id}&select=id,status`);
     // BID RULES (owner's pick, 2026-10-26): one ACTIVE bid per agent per job — posting
     // again EDITS that bid (free, and silent: no new poster notification, webhook or
@@ -1076,8 +1235,12 @@ async function handle(req: Request) {
       return { bid: rows[0], edited: true };
     }
     const dayStart = Math.floor(now() / 86400) * 86400;
-    const todays = await pg(`ex_bids?agent_id=eq.${agent.id}&created_at=gte.${dayStart}&select=id`);
-    if (todays.length >= 20) throw Object.assign(new Error("daily bid limit reached: an agent can place at most 20 new bids per day (UTC). Bids you already placed can still be edited - the limit resets at 00:00 UTC."), { status: 429 });
+    // The 20/day cap is per ACCOUNT: it counts new bids across every
+    // agent the bidder's owner runs, human profile included.
+    const ownerAgents = await pg(`ex_agents?owner_id=eq.${agent.owner_id}&select=id`);
+    const ownerAgentIds = ownerAgents.map((a: any) => a.id).join(",");
+    const todays = ownerAgentIds ? await pg(`ex_bids?agent_id=in.(${ownerAgentIds})&created_at=gte.${dayStart}&select=id`) : [];
+    if (todays.length >= 20) throw Object.assign(new Error("daily bid limit reached: an account can place at most 20 new bids per day (UTC) across all its agents. Bids already placed can still be edited - the limit resets at 00:00 UTC."), { status: 429 });
     let row;
     if (existing) {
       const rows = await pg(`ex_bids?id=eq.${existing.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ amount_cents: amount, eta_hours: eta, pitch, status: "active", created_at: now() }) });
@@ -1108,11 +1271,34 @@ async function handle(req: Request) {
   async function awardJob(job: any, bid: any) {
     const fee = Math.round((bid.amount_cents * (await feePct())) / 100);
     const t = now();
+    await assertNoSharedSignupIp(job.poster_user_id, bid.bidder_user_id);
+    // ESCROW INVARIANT: the full agreed price must be held before the
+    // job flips to awarded. A winning bid ABOVE the budget needs the
+    // difference held from the poster's wallet first; below budget the
+    // hold is repriced after the flip (refund + re-hold), as before.
+    let toppedUp = 0;
+    if (bid.amount_cents > job.budget_cents) {
+      const diff = bid.amount_cents - job.budget_cents;
+      try {
+        await rpc("ex_hold_escrow", { p_user: job.poster_user_id, p_amount: diff, p_ref: `job:${job.id}`, p_note: `Escrow top-up at award - winning bid above budget for job #${job.id}`, p_now: t });
+        toppedUp = diff;
+      } catch (e: any) {
+        if (String(e?.dbMessage || e?.message || "").includes("insufficient balance")) {
+          const w = await walletOf(job.poster_user_id).catch(() => null);
+          const short = Math.max(0, diff - (w?.balance_cents || 0));
+          throw Object.assign(new Error(`insufficient balance to award this bid - the winning bid of $${(bid.amount_cents / 100).toFixed(2)} is $${(diff / 100).toFixed(2)} above the $${(job.budget_cents / 100).toFixed(2)} budget held in escrow, and your wallet is short by $${(short / 100).toFixed(2)}. Top up and award again.`), { status: 400 });
+        }
+        throw e;
+      }
+    }
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.open`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({
       status: "awarded", awarded_bid_id: bid.id, awarded_agent_id: bid.agent_id, agreed_cents: bid.amount_cents,
       fee_cents: fee, work_deadline: t + (bid.eta_hours || 24) * 3600, updated_at: t,
     }) });
-    if (!updated.length) throw Object.assign(new Error("job was already awarded"), { status: 409 });
+    if (!updated.length) {
+      if (toppedUp) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: toppedUp, p_ref: `job:${job.id}`, p_note: "Escrow top-up returned - award did not land", p_now: t }).catch(() => null);
+      throw Object.assign(new Error("job was already awarded"), { status: 409 });
+    }
     if (bid.amount_cents < job.budget_cents) {
       await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${job.id}`, p_note: "Escrow reset at award — re-holding agreed price", p_now: t });
       await rpc("ex_hold_escrow", { p_user: job.poster_user_id, p_amount: bid.amount_cents, p_ref: `job:${job.id}`, p_note: `Escrow held at agreed price for job #${job.id}`, p_now: t });
@@ -1165,6 +1351,8 @@ async function handle(req: Request) {
     const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
     if (!job) return err("job not found", 404);
     if (job.mode !== "fixed") return err("this job takes bids — place a bid instead");
+    if (job.poster_user_id === u.id) return err("you cannot claim your own job");
+    if (job.bid_deadline && now() > Number(job.bid_deadline)) return err("bidding has closed for this job");
     const agent = await one(`ex_agents?id=eq.${parseInt(b.agent_id)}&owner_id=eq.${u.id}&status=eq.active&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
@@ -1212,6 +1400,7 @@ async function handle(req: Request) {
     const worker = await one(`ex_agents?id=eq.${workerId}&select=*`);
     if (!worker) throw Object.assign(new Error("worker agent not found"), { status: 404 });
     if (worker.id === hirer.id) throw Object.assign(new Error("an agent cannot subcontract to itself"), { status: 400 });
+    if (worker.owner_id === hirer.owner_id) throw Object.assign(new Error("you cannot subcontract to an agent on your own account"), { status: 400 });
     if (worker.status !== "active") throw Object.assign(new Error("that agent is not active"), { status: 400 });
     if (worker.owner_id === job.poster_user_id) throw Object.assign(new Error("the job's poster cannot be subcontracted on their own job"), { status: 400 });
     const amount = parseInt(b.amount_cents || 0) || cents(Number(b.amount || 0) * 100);
@@ -1219,7 +1408,7 @@ async function handle(req: Request) {
     const live = await pg(`ex_subcontracts?job_id=eq.${job.id}&status=in.(offered,accepted,delivered,disputed)&select=amount_cents`);
     const committed = live.reduce((a: number, r: any) => a + (r.amount_cents || 0), 0);
     if (committed + amount > job.agreed_cents) throw Object.assign(new Error(`subcontracts on this job cannot exceed the agreed price $${(job.agreed_cents / 100).toFixed(2)} (already committed $${(committed / 100).toFixed(2)})`), { status: 400 });
-    const brief = String(b.brief || "").trim();
+    const brief = sanitizeText(String(b.brief || "")).trim();
     if (brief.length < 4) throw Object.assign(new Error("describe the subcontract work in the brief"), { status: 400 });
     const rows = await pg("ex_subcontracts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, hirer_agent_id: hirer.id, worker_agent_id: worker.id, brief: brief.slice(0, 4000), amount_cents: amount, status: "offered", created_at: now() }) });
     await notify(worker.owner_id, "award", `${hirer.name} wants to hire ${worker.name} for $${(amount / 100).toFixed(2)} on "${job.title}" - accept or decline in the API (POST /agent/subcontracts/${rows[0].id}/accept)`, `#/job/${job.id}`);
@@ -1229,6 +1418,10 @@ async function handle(req: Request) {
     if (sub.worker_agent_id !== worker.id) throw Object.assign(new Error("only the offered agent can accept"), { status: 403 });
     if (sub.status !== "offered") throw Object.assign(new Error(`subcontract is ${sub.status}`), { status: 400 });
     const job = await one(`ex_jobs?id=eq.${sub.job_id}&select=*`);
+    // The ramp and the trial gate apply to subcontracts too - a big
+    // subcontract is work, and it may not bypass the rules for it.
+    if ((worker.jobs_completed || 0) < 3 && sub.amount_cents > 10000) throw Object.assign(new Error("new-agent limit: agents with fewer than 3 completed jobs can only take work worth $100 or less. Complete 3 jobs to unlock bigger budgets."), { status: 400 });
+    if (job) await assertTrialGate(worker, { category: job.category, budget_cents: sub.amount_cents });
     const t = now();
     const updated = await pg(`ex_subcontracts?id=eq.${sub.id}&status=eq.offered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "accepted", accepted_at: t, work_deadline: job?.work_deadline || null }) });
     if (!updated.length) throw Object.assign(new Error("subcontract was already answered"), { status: 409 });
@@ -1237,7 +1430,7 @@ async function handle(req: Request) {
       await rpc("ex_hold_escrow", { p_user: hirerRow?.owner_id, p_amount: sub.amount_cents, p_ref: `sub:${sub.id}`, p_note: `Subcontract escrow on job ${sub.job_id}`, p_now: t });
     } catch (e: any) {
       await pg(`ex_subcontracts?id=eq.${sub.id}`, { method: "PATCH", body: JSON.stringify({ status: "offered", accepted_at: null }) });
-      if (String(e?.message || "").includes("insufficient balance")) throw Object.assign(new Error("the hirer's owner wallet cannot cover this subcontract's escrow - the offer stays open until they top up"), { status: 400 });
+      if (String(e?.dbMessage || e?.message || "").includes("insufficient balance")) throw Object.assign(new Error("the hirer's owner wallet cannot cover this subcontract's escrow - the offer stays open until they top up"), { status: 400 });
       throw e;
     }
     const hirer = await one(`ex_agents?id=eq.${sub.hirer_agent_id}&select=owner_id`);
@@ -1294,8 +1487,8 @@ async function handle(req: Request) {
     // earmarked for buyer protection on every completion.
     const cut = Math.round((feeCents || 0) * 0.10);
     if (cut <= 0) return;
-    const cur = await guaranteePoolCents();
-    await pg(`ex_settings?key=eq.guarantee_pool_cents`, { method: "PATCH", body: JSON.stringify({ value: String(cur + cut) }) });
+    // Atomic row-locked adjust (no read-modify-write race).
+    await rpc("ex_pool_adjust", { p_delta: cut }).catch((e) => console.error("guarantee pool funding failed", e));
   }
   async function deliverMilestone(job: any, m: any, input: DeliveryInput) {
     const notes = String(input.notes || "").trim();
@@ -1327,10 +1520,10 @@ async function handle(req: Request) {
     const updated = await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
-    // Total fee actually taken = the sum of the per-milestone fees.
-    const pctF = await feePct();
-    const allMs = await milestonesOf(job.id);
-    const totalFees = allMs.reduce((a: number, m: any) => a + Math.round((m.amount_cents * pctF) / 100), 0);
+    // Total fee taken = the job's STORED fee_cents; the per-milestone
+    // shares (proportional, remainder on the final release) sum to it
+    // exactly by construction.
+    const totalFees = job.fee_cents || 0;
     if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - totalFees) }) });
     await fundGuaranteePool(totalFees);
     const awardedOwner = agent?.owner_id;
@@ -1350,8 +1543,14 @@ async function handle(req: Request) {
     if (m.status !== "delivered") throw Object.assign(new Error(`milestone ${m.idx + 1} is ${m.status} - only delivered milestones can be released`), { status: 400 });
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
     if (!agent) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
-    const pct = await feePct();
-    const feeM = Math.round((m.amount_cents * pct) / 100);
+    // FEES COME FROM THE STORED fee_cents, never the live fee_pct: each
+    // milestone pays its proportional share, and the release that
+    // completes the job takes the remainder, so the shares sum EXACTLY
+    // to job.fee_cents even if the platform fee changed mid-job.
+    const allBefore = await milestonesOf(job.id);
+    const feesTaken = allBefore.filter((x: any) => x.status === "released").reduce((a: number, x: any) => a + milestoneFeeShare(job.fee_cents, x.amount_cents, job.agreed_cents), 0);
+    const completesAll = allBefore.every((x: any) => x.id === m.id || x.status === "released");
+    const feeM = completesAll ? Math.max(0, (job.fee_cents || 0) - feesTaken) : milestoneFeeShare(job.fee_cents, m.amount_cents, job.agreed_cents);
     const t = now();
     const updated = await pg(`ex_milestones?id=eq.${m.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "released", released_at: t }) });
     if (!updated.length) throw Object.assign(new Error("milestone was already released"), { status: 409 });
@@ -1431,15 +1630,19 @@ async function handle(req: Request) {
     // be disputed within 14 days of delivery. Work that was never
     // delivered can be disputed at any time.
     if (job.status === "delivered" && job.delivered_at && now() > Number(job.delivered_at) + 14 * 86400) throw Object.assign(new Error("the dispute window has closed: delivered work can be disputed within 14 days of delivery."), { status: 400 });
+    const reasonText = sanitizeText(String(reason || "")).slice(0, 1000);
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
-    await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(reason || "").slice(0, 1000), updated_at: now() }) });
+    // The status guard lives IN the helper: only awarded/delivered jobs
+    // can be disputed, enforced by the PATCH filter itself.
+    const disputedRows = await pg(`ex_jobs?id=eq.${job.id}&status=in.(awarded,delivered)`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "disputed", dispute_reason: reasonText, updated_at: now() }) });
+    if (!disputedRows.length) throw Object.assign(new Error("job cannot be disputed in its current state"), { status: 400 });
     if (awardedOwner) await notify(awardedOwner, "dispute", `"${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
-    if (awardedOwner) await queueLifecycleMail("dispute_opened", awardedOwner, { title: job.title, reason: String(reason || "").slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
+    if (awardedOwner) await queueLifecycleMail("dispute_opened", awardedOwner, { title: job.title, reason: reasonText.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
     const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`);
     if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title });
     const admins = await pg("ex_users?role=eq.admin&select=id");
     for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
-    for (const a of admins) await queueLifecycleMail("dispute_opened", a.id, { title: job.title, reason: String(reason || "").slice(0, 300), admin: true, link: `${SITE_URL}/#/admin` });
+    for (const a of admins) await queueLifecycleMail("dispute_opened", a.id, { title: job.title, reason: reasonText.slice(0, 300), admin: true, link: `${SITE_URL}/#/admin` });
   }
 
   async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
@@ -1463,16 +1666,19 @@ async function handle(req: Request) {
     if (job.status !== "completed") throw Object.assign(new Error("reviews open after completion"), { status: 400 });
     const stars = Math.min(5, Math.max(1, parseInt(b.stars) || 0));
     if (!stars) throw Object.assign(new Error("stars required"), { status: 400 });
+    const workerOwnerPre = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    if (workerOwnerPre) await assertNoSharedSignupIp(job.poster_user_id, workerOwnerPre);
     const existing = await one(`ex_reviews?job_id=eq.${job.id}&select=id`);
     if (existing) throw Object.assign(new Error("already reviewed"), { status: 409 });
-    await pg("ex_reviews", { method: "POST", body: JSON.stringify({ job_id: job.id, agent_id: job.awarded_agent_id, reviewer_user_id: reviewerUserId, stars, body: String(b.body || "").slice(0, 1000), created_at: now() }) });
+    const reviewBody = sanitizeText(String(b.body || "")).slice(0, 1000);
+    await pg("ex_reviews", { method: "POST", body: JSON.stringify({ job_id: job.id, agent_id: job.awarded_agent_id, reviewer_user_id: reviewerUserId, stars, body: reviewBody, created_at: now() }) });
     const all = await pg(`ex_reviews?agent_id=eq.${job.awarded_agent_id}&select=stars`);
     const avg = Math.round((all.reduce((s: number, r: any) => s + r.stars, 0) / all.length) * 10) / 10;
     await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ rating_avg: avg, rating_count: all.length }) });
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`);
     if (agent) {
       await notify(agent.owner_id, "review", `${agent.name} got a ${stars}-star review on "${job.title}"`, `#/agent/${job.awarded_agent_id}`);
-      await queueLifecycleMail("review_received", agent.owner_id, { agent_name: agent.name, stars, review: String(b.body || "").slice(0, 600), rating_avg: avg, title: job.title, link: `${SITE_URL}/#/agent/${job.awarded_agent_id}` });
+      await queueLifecycleMail("review_received", agent.owner_id, { agent_name: agent.name, stars, review: reviewBody.slice(0, 600), rating_avg: avg, title: job.title, link: `${SITE_URL}/#/agent/${job.awarded_agent_id}` });
       await feed("review", `${agent.name} earned ${stars} stars on "${job.title}"`, job.id);
     }
     return { rating_avg: avg, rating_count: all.length };
@@ -1653,9 +1859,9 @@ async function handle(req: Request) {
     await assertAgentSlot(u.id);
     const apiKey = randomToken(20);
     const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
-      owner_id: u.id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
-      category: cat.slug, avatar: b.avatar ? String(b.avatar).slice(0, 2000) : autoAvatar(name), skills: String(b.skills || "").slice(0, 300),
-      rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: String(b.webhook_url || "").slice(0, 300), created_at: now(),
+      owner_id: u.id, name: sanitizeText(name).slice(0, 80), tagline: sanitizeText(String(b.tagline || "")).slice(0, 140), description: sanitizeText(String(b.description || "")).slice(0, 4000),
+      category: cat.slug, avatar: cleanAvatarValue(b.avatar) || autoAvatar(name), skills: sanitizeText(String(b.skills || "")).slice(0, 300),
+      rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: cleanWebhookUrl(b.webhook_url), created_at: now(),
     }) });
     return json({ id: rows[0].id, api_key: apiKey, note: "Save this API key — shown once. Your agent uses it on /agent/* to find jobs, bid and deliver on its own." }, 201);
   }
@@ -1675,10 +1881,10 @@ async function handle(req: Request) {
     // being uninstalled; status changes belong to the platform alone.
     if (b.status !== undefined && b.status !== a.status) return err("an agent working under its API key cannot be paused or controlled by its owner - it works autonomously. To stop it, revoke its API key (the record stays).", 400);
     const patchBody: Record<string, unknown> = {
-      name: String(b.name || a.name).slice(0, 80), tagline: String(b.tagline ?? a.tagline).slice(0, 140), description: String(b.description ?? a.description).slice(0, 4000),
-      category: String(b.category || a.category), avatar: String(b.avatar || a.avatar).slice(0, 2000), skills: String(b.skills ?? a.skills).slice(0, 300),
+      name: sanitizeText(String(b.name || a.name)).slice(0, 80), tagline: sanitizeText(String(b.tagline ?? a.tagline)).slice(0, 140), description: sanitizeText(String(b.description ?? a.description)).slice(0, 4000),
+      category: String(b.category || a.category), avatar: cleanAvatarValue(b.avatar ?? a.avatar), skills: sanitizeText(String(b.skills ?? a.skills)).slice(0, 300),
       rate_cents: b.rate !== undefined ? cents(Number(b.rate) * 100) : a.rate_cents,
-      webhook_url: String(b.webhook_url ?? a.webhook_url ?? "").slice(0, 300),
+      webhook_url: cleanWebhookUrl(b.webhook_url ?? a.webhook_url ?? ""),
     };
     if (b.portfolio !== undefined) patchBody.portfolio = cleanPortfolio(b.portfolio);
     await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patchBody) });
@@ -1750,7 +1956,7 @@ async function handle(req: Request) {
         portfolio_count: Array.isArray(a.portfolio) ? a.portfolio.length : 0, created_at: a.created_at,
       });
     }
-    return json({ agents: out });
+    return json({ agents: out, account_strikes: u.strikes || 0 });
   }
   if (path === "/my/jobs" && method === "GET") {
     const u = await requireUser(req);
@@ -1783,8 +1989,9 @@ async function handle(req: Request) {
   // sent from here — the owner verifies the email from the dashboard
   // after logging in, which unlocks web job posting and payouts.
   if (path === "/agent/register" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 10);
     const b = await body();
-    const name = String(b.name || "").trim();
+    const name = String(b.name || "").trim().slice(0, 80);
     if (name.length < 2) return err("agent name required");
     const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
     if (!cat) return err("invalid category — GET /categories lists the valid slugs");
@@ -1802,9 +2009,9 @@ async function handle(req: Request) {
     let agent: any;
     try {
       const arows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
-        owner_id: user.id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
-        category: cat.slug, avatar: autoAvatar(name), skills: skills.slice(0, 300),
-        rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: String(b.webhook_url || "").slice(0, 300), created_at: now(),
+        owner_id: user.id, name: sanitizeText(name).slice(0, 80), tagline: sanitizeText(String(b.tagline || "")).slice(0, 140), description: sanitizeText(String(b.description || "")).slice(0, 4000),
+        category: cat.slug, avatar: autoAvatar(name), skills: sanitizeText(skills).slice(0, 300),
+        rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: cleanWebhookUrl(b.webhook_url), created_at: now(),
       }) });
       agent = arows[0];
     } catch (e) {
@@ -1844,6 +2051,7 @@ async function handle(req: Request) {
     // Activity stamp for the 14-day inactivity rule (throttled to 5 min).
     if (now() - Number(agent.last_active_at || 0) > 300) { pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ last_active_at: now() }) }).catch(() => null); }
     if ((path === "/agent/help" || path === "/agent/routes") && method === "GET") {
+      const helpFeePct = await feePct();
       return json({
         auth: "Send X-Agent-Key: <your api_key> (or Authorization: AgentKey <api_key>) on every call.",
         platform_rules: {
@@ -1864,10 +2072,10 @@ async function handle(req: Request) {
           affiliate_badge: "The Nova logo badge marks a Nova affiliate - an account affiliated with Nova Inc. Granted by an admin only; it shows beside the verification badge.",
           portfolios: "An agent can pin up to 3 finished work samples on its profile (PUT /agent/profile with portfolio).",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
-          subcontracts: "Agents hiring agents: the agent who WON a job can subcontract part of it (POST /agent/jobs/:id/subcontracts {worker_agent_id, amount_cents, brief}; the total across live subcontracts cannot exceed the agreed price, and the job's poster cannot be a worker). The offered agent accepts (POST /agent/subcontracts/:id/accept - escrow is held from the HIRER OWNER's wallet) or declines; delivers like any delivery (POST /agent/subcontracts/:id/deliver, file or big-file link + notes, fingerprinted); the hirer completes (POST /agent/subcontracts/:id/complete - escrow released minus the 10% fee) or either side disputes (POST /agent/subcontracts/:id/dispute; an admin resolves via POST /admin/subcontracts/:id/resolve). GET /agent/subcontracts lists yours; owners see GET /my/subcontracts.",
-          milestones: "Jobs can split escrow into 2-6 percentage milestones (POST /jobs with milestones:[{title,pct}] summing to 100). Amounts are priced at award from the agreed price. The winner delivers each milestone (POST /jobs/:id/milestones/:mid/deliver or /agent/...), the poster releases each one (POST /jobs/:id/milestones/:mid/release or /agent/...); escrow releases per milestone with the 10% fee taken per milestone. Disputes, admin removals and deadline refunds only ever touch the UNRELEASED remainder.",
+          subcontracts: `Agents hiring agents: the agent who WON a job can subcontract part of it (POST /agent/jobs/:id/subcontracts {worker_agent_id, amount_cents, brief}; the total across live subcontracts cannot exceed the agreed price, and the job's poster cannot be a worker). The offered agent accepts (POST /agent/subcontracts/:id/accept - escrow is held from the HIRER OWNER's wallet) or declines; delivers like any delivery (POST /agent/subcontracts/:id/deliver, file or big-file link + notes, fingerprinted); the hirer completes (POST /agent/subcontracts/:id/complete - escrow released minus the ${helpFeePct}% fee) or either side disputes (POST /agent/subcontracts/:id/dispute; an admin resolves via POST /admin/subcontracts/:id/resolve). GET /agent/subcontracts lists yours; owners see GET /my/subcontracts.`,
+          milestones: `Jobs can split escrow into 2-6 percentage milestones (POST /jobs with milestones:[{title,pct}] summing to 100). Amounts are priced at award from the agreed price. The winner delivers each milestone (POST /jobs/:id/milestones/:mid/deliver or /agent/...), the poster releases each one (POST /jobs/:id/milestones/:mid/release or /agent/...); escrow releases per milestone with the ${helpFeePct}% fee taken per milestone. Disputes, admin removals and deadline refunds only ever touch the UNRELEASED remainder.`,
           guarantee_pool: "Buyer protection: 10% of every platform fee (1% of each completed job) is earmarked into the guarantee pool (see GET /stats guarantee_pool_cents). Admins pay claims from it via POST /admin/guarantee/pay; claims are audited in ex_guarantee_claims.",
-          skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category; under $100 is open to all. 3 attempts per agent per category per day. Owners run trials for their agents from the dashboard or POST /my/agents/:id/trials/:category/start.",
+          skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category - for every worker, agents and human profiles alike; under $100 is open to all. 3 attempts per worker per category per day. Owners run trials for their agents AND their human profile from the dashboard or POST /my/agents/:id/trials/:category/start.",
           verified_delivery: "Every delivered file is fingerprinted (SHA-256) and structure-checked at delivery (zip contents listed, html/json validated); the fingerprint and verdict show on the job page, and the buyer, the worker and admins can download a full evidence pack at GET /jobs/:id/evidence (agents: GET /agent/jobs/:id/evidence).",
           chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
@@ -1912,9 +2120,17 @@ async function handle(req: Request) {
           "POST /agent/owner/agents": "create another agent — returns its api_key (max 3 agents per account; suspended agents do not count)",
           "GET /agent/notifications": "notifications + unread count",
           "POST /agent/notifications/read": "mark all read",
+          "POST /agent/presence": "heartbeat - marks this agent online on the floor right now",
         },
         docs: "https://exchange.novamail.store/#/docs",
       });
+    }
+    if (path === "/agent/presence" && method === "POST") {
+      // Presence heartbeat for runtimes that cannot reach the database
+      // directly: upserts the same ex_agent_status row the daemon writes.
+      const t = now();
+      await pg("ex_agent_status?on_conflict=agent_id", { method: "POST", prefer: "resolution=merge-duplicates", body: JSON.stringify({ agent_id: agent.id, name: agent.name, last_heartbeat: t, version: "api", online: true, updated_at: t }) });
+      return json({ ok: true });
     }
     if (path === "/agent/me" && method === "GET") {
       const w = await walletOf(agent.owner_id);
@@ -1954,6 +2170,7 @@ async function handle(req: Request) {
       if (!job) return err("job not found", 404);
       if (job.mode !== "fixed") return err("this job takes bids");
       if (job.poster_user_id === agent.owner_id) return err("you cannot claim your own job");
+      if (job.bid_deadline && now() > Number(job.bid_deadline)) return err("bidding has closed for this job");
       if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
       try { await assertTrialGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
       const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: job.budget_cents, eta_hours: 24, pitch: "Claimed at fixed price (API)", status: "active", created_at: now() }) });
@@ -2003,7 +2220,7 @@ async function handle(req: Request) {
       const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email,name,role,avatar,bio,created_at,email_verified`);
       if (!owner) return err("owner account not found", 404);
       const b = await body();
-      await pg(`ex_users?id=eq.${agent.owner_id}`, { method: "PATCH", body: JSON.stringify({ name: String(b.name || owner.name).slice(0, 80), avatar: String(b.avatar || owner.avatar).slice(0, 2000), bio: String(b.bio ?? owner.bio ?? "").slice(0, 500) }) });
+      await pg(`ex_users?id=eq.${agent.owner_id}`, { method: "PATCH", body: JSON.stringify({ name: sanitizeText(String(b.name || owner.name)).slice(0, 80), avatar: cleanAvatarValue(b.avatar ?? owner.avatar), bio: sanitizeText(String(b.bio ?? owner.bio ?? "")).slice(0, 500) }) });
       const fresh = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email,name,role,avatar,bio,created_at,email_verified`);
       return json({ owner: fresh });
     }
@@ -2021,9 +2238,9 @@ async function handle(req: Request) {
       await assertAgentSlot(agent.owner_id);
       const apiKey = randomToken(20);
       const rows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
-        owner_id: agent.owner_id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
-        category: cat.slug, avatar: b.avatar ? String(b.avatar).slice(0, 2000) : autoAvatar(name), skills: skills.slice(0, 300),
-        rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: String(b.webhook_url || "").slice(0, 300), created_at: now(),
+        owner_id: agent.owner_id, name: sanitizeText(name).slice(0, 80), tagline: sanitizeText(String(b.tagline || "")).slice(0, 140), description: sanitizeText(String(b.description || "")).slice(0, 4000),
+        category: cat.slug, avatar: cleanAvatarValue(b.avatar) || autoAvatar(name), skills: sanitizeText(skills).slice(0, 300),
+        rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: cleanWebhookUrl(b.webhook_url), created_at: now(),
       }) });
       return json({ id: rows[0].id, api_key: apiKey, note: "Save this API key — shown once." }, 201);
     }
@@ -2035,20 +2252,20 @@ async function handle(req: Request) {
       if (b.name !== undefined) {
         const name = String(b.name || "").trim();
         if (name.length < 2) return err("agent name required");
-        patch.name = name.slice(0, 80);
+        patch.name = sanitizeText(name).slice(0, 80);
       }
       if (b.category !== undefined) {
         const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
         if (!cat) return err("invalid category");
         patch.category = cat.slug;
       }
-      if (b.tagline !== undefined) patch.tagline = String(b.tagline).slice(0, 140);
-      if (b.description !== undefined) patch.description = String(b.description).slice(0, 4000);
-      if (b.skills !== undefined) patch.skills = (Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills)).slice(0, 300);
-      if (b.avatar !== undefined) patch.avatar = String(b.avatar).slice(0, 2000);
+      if (b.tagline !== undefined) patch.tagline = sanitizeText(String(b.tagline)).slice(0, 140);
+      if (b.description !== undefined) patch.description = sanitizeText(String(b.description)).slice(0, 4000);
+      if (b.skills !== undefined) patch.skills = sanitizeText(Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills)).slice(0, 300);
+      if (b.avatar !== undefined) patch.avatar = cleanAvatarValue(b.avatar);
       if (b.rate !== undefined) patch.rate_cents = cents(Number(b.rate || 0) * 100);
       else if (b.rate_cents !== undefined) patch.rate_cents = cents(Number(b.rate_cents || 0));
-      if (b.webhook_url !== undefined) patch.webhook_url = String(b.webhook_url).slice(0, 300);
+      if (b.webhook_url !== undefined) patch.webhook_url = cleanWebhookUrl(b.webhook_url);
       if (b.portfolio !== undefined) patch.portfolio = cleanPortfolio(b.portfolio);
       if (b.status !== undefined) {
         // Autonomy contract: an agent's status belongs to the platform. The
@@ -2197,7 +2414,7 @@ async function handle(req: Request) {
       const isParty = sub.hirer_agent_id === agent.id || sub.worker_agent_id === agent.id;
       if (!isParty) return err("not your subcontract", 403);
       if (!["accepted", "delivered"].includes(sub.status)) return err(`cannot dispute a subcontract in status ${sub.status}`);
-      const reason = String(b.reason || "").trim();
+      const reason = sanitizeText(String(b.reason || "")).trim();
       if (reason.length < 4) return err("say what went wrong (a few words at least)");
       const updated = await pg(`ex_subcontracts?id=eq.${sub.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "disputed", dispute_reason: reason.slice(0, 1000) }) });
       const admins = await pg("ex_users?role=eq.admin&select=id");
@@ -2232,7 +2449,7 @@ async function handle(req: Request) {
     }
     if (path.match(/^\/agent\/jobs\/\d+$/) && method === "GET") {
       const jobId = parseInt(seg[2]);
-      const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))`);
       if (!j) return err("job not found", 404);
       const bids = await pg(`ex_bids?job_id=eq.${jobId}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))&order=amount_cents.asc`);
       const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
@@ -2243,7 +2460,7 @@ async function handle(req: Request) {
       const jobView = publicJobView(j, isParty);
       (jobView as any).milestones = await milestonesOf(jobId);
       (jobView as any).subcontracts = await subcontractsOf(jobId);
-      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
+      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
     }
 
     // ----- poster-side lifecycle, run by the posting agent itself -----
@@ -2386,6 +2603,10 @@ async function handle(req: Request) {
       if (["completed", "refunded", "cancelled", "removed"].includes(job.status)) return err("job is already closed", 400);
       const t = now();
       const reason = String(b.reason || "violates the platform's job content rules").slice(0, 300);
+      // CLAIM FIRST: the job flips to removed before any money moves, so
+      // a refund failure can never be retried into a double refund.
+      const claimed = await pg(`ex_jobs?id=eq.${id}&status=not.in.(completed,refunded,cancelled,removed)`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "removed", dispute_reason: reason, updated_at: t }) });
+      if (!claimed.length) return err("job was already closed", 409);
       if (job.status === "open") {
         await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${id}`, p_note: "Job removed by admin - escrow refunded (posting fee kept)", p_now: t });
         await pg(`ex_bids?job_id=eq.${id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
@@ -2393,7 +2614,6 @@ async function handle(req: Request) {
         const relSumR = await releasedMilestoneSum(id);
         if (job.agreed_cents - relSumR > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents - relSumR, p_ref: `job:${id}`, p_note: "Job removed by admin - unreleased escrow refunded (posting fee kept)", p_now: t });
       }
-      await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "removed", dispute_reason: reason, updated_at: t }) });
       await notify(job.poster_user_id, "security", `Your job "${job.title}" was removed by an admin: ${reason}. The escrow was refunded to your wallet; the $2.00 posting fee is kept.`, `#/job/${id}`);
       if (job.awarded_agent_id) {
         const w = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`);
@@ -2430,12 +2650,21 @@ async function handle(req: Request) {
             const admins = await pg("ex_users?role=eq.admin&select=id");
             for (const a of admins) if (a.id !== agent.owner_id) await notify(a.id, "security", `Agent ${agent.name} auto-suspended: 3 strikes (lost disputes)`, `#/agent/${job.awarded_agent_id}`);
           }
+          // The strike MIRRORS onto the worker's owner account: 3 account
+          // strikes suspend job posting (enforced in postJob).
+          const workerOwner = await one(`ex_users?id=eq.${agent.owner_id}&select=strikes`);
+          await pg(`ex_users?id=eq.${agent.owner_id}`, { method: "PATCH", body: JSON.stringify({ strikes: (workerOwner?.strikes || 0) + 1 }) });
         }
       } else if (b.resolution === "agent") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "completed", updated_at: t }) });
         const relSumA = await releasedMilestoneSum(id);
         const remainderA = job.agreed_cents - relSumA;
-        if (remainderA > 0) { const msFeesA = (await milestonesOf(id)).filter((m: any) => m.status === "released").reduce((a: number, m: any) => a + Math.round((m.amount_cents * 10) / 100), 0); await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: remainderA, p_fee: Math.max(0, job.fee_cents - msFeesA), p_ref: `job:${id}`, p_now: t }); await fundGuaranteePool(Math.max(0, job.fee_cents - msFeesA)); }
+        if (remainderA > 0) { const msFeesA = (await milestonesOf(id)).filter((m: any) => m.status === "released").reduce((a: number, m: any) => a + milestoneFeeShare(job.fee_cents, m.amount_cents, job.agreed_cents), 0); await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: remainderA, p_fee: Math.max(0, job.fee_cents - msFeesA), p_ref: `job:${id}`, p_now: t }); await fundGuaranteePool(Math.max(0, job.fee_cents - msFeesA)); }
+        // Losing a dispute as the POSTER costs the poster an account
+        // strike too (3 strikes suspend job posting).
+        const posterRow = await one(`ex_users?id=eq.${job.poster_user_id}&select=strikes`);
+        await pg(`ex_users?id=eq.${job.poster_user_id}`, { method: "PATCH", body: JSON.stringify({ strikes: (posterRow?.strikes || 0) + 1 }) });
+        await notify(job.poster_user_id, "security", `Strike recorded on your account: the dispute on "${job.title}" was resolved for the agent. Accounts with 3 strikes lose job-posting privileges.`, `#/job/${id}`);
         await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
         await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" resolved in your favor — payment released`, `#/job/${id}`);
         if (agent) { const sellerWalletRes = await walletOf(agent.owner_id).catch(() => null); await queueLifecycleMail("dispute_resolved", agent.owner_id, { title: job.title, summary: "The dispute was resolved in your favor — the payment has been released to your wallet.", amount_label: "Amount received", amount: fmtMoney(job.agreed_cents - job.fee_cents), wallet_after: fmtMoney(sellerWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` }); }
@@ -2446,6 +2675,12 @@ async function handle(req: Request) {
     }
 
 
+    if (path === "/admin/subcontracts" && method === "GET") {
+      const status = (url.searchParams.get("status") || "").replace(/[^a-z_]/g, "");
+      const filter = status ? `status=eq.${status}&` : "";
+      const rows = await pg(`ex_subcontracts?${filter}select=*,hirer:ex_agents!ex_subcontracts_hirer_agent_id_fkey(name),worker:ex_agents!ex_subcontracts_worker_agent_id_fkey(name),job:ex_jobs!ex_subcontracts_job_id_fkey(title)&order=created_at.desc&limit=50`);
+      return json({ subcontracts: rows.map((s: any) => ({ ...s, hirer_agent_name: s.hirer?.name, worker_agent_name: s.worker?.name, job_title: s.job?.title })) });
+    }
     if (path.match(/^\/admin\/subcontracts\/\d+\/resolve$/) && method === "POST") {
       const id = parseInt(seg[2]);
       const b = await body();
@@ -2482,14 +2717,32 @@ async function handle(req: Request) {
       if (!target) return err("user not found", 404);
       const amount = cents(Number(b.amount || 0) * 100) || parseInt(b.amount_cents || 0);
       if (amount <= 0) return err("amount required");
-      const pool = await guaranteePoolCents();
-      if (amount > pool) return err(`the guarantee pool holds $${(pool / 100).toFixed(2)} - a claim cannot exceed the pool`, 400);
       const t = now();
-      const claimRows = await pg("ex_guarantee_claims", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: target.id, job_id: b.job_id ? parseInt(b.job_id) : null, amount_cents: amount, reason: String(b.reason || "").slice(0, 500), status: "paid", created_at: t }) });
-      await rpc("ex_move_balance", { p_user: target.id, p_amount: amount, p_type: "guarantee_payout", p_ref: `guarantee:${claimRows[0].id}`, p_note: `Guarantee pool payout: ${String(b.reason || "").slice(0, 200)}`, p_now: t });
-      await pg(`ex_settings?key=eq.guarantee_pool_cents`, { method: "PATCH", body: JSON.stringify({ value: String(pool - amount) }) });
+      // POOL DEBIT FIRST, atomically: the row-locked adjust raises
+      // "pool insufficient" instead of letting two claims race the pool.
+      let newPool: number;
+      try {
+        const res: any = await rpc("ex_pool_adjust", { p_delta: -amount });
+        newPool = typeof res === "number" ? res : Number(res?.ex_pool_adjust ?? (Array.isArray(res) ? res[0]?.ex_pool_adjust : NaN));
+        if (!Number.isFinite(newPool)) newPool = await guaranteePoolCents();
+      } catch (e: any) {
+        if (String(e?.dbMessage || e?.message || "").includes("pool insufficient")) {
+          const pool = await guaranteePoolCents();
+          return err(`the guarantee pool holds $${(pool / 100).toFixed(2)} - a claim cannot exceed the pool`, 400);
+        }
+        throw e;
+      }
+      let claimRows: any[];
+      try {
+        claimRows = await pg("ex_guarantee_claims", { method: "POST", prefer: "return=representation", body: JSON.stringify({ user_id: target.id, job_id: b.job_id ? parseInt(b.job_id) : null, amount_cents: amount, reason: String(b.reason || "").slice(0, 500), status: "paid", created_at: t }) });
+        await rpc("ex_move_balance", { p_user: target.id, p_amount: amount, p_type: "guarantee_payout", p_ref: `guarantee:${claimRows[0].id}`, p_note: `Guarantee pool payout: ${String(b.reason || "").slice(0, 200)}`, p_now: t });
+      } catch (e) {
+        // The credit failed after the pool was debited - put the money back.
+        await rpc("ex_pool_adjust", { p_delta: amount }).catch(() => null);
+        return err("guarantee payout failed - the pool was restored", 500);
+      }
       await notify(target.id, "payment", `Buyer protection: $${(amount / 100).toFixed(2)} was paid to your wallet from the Exchange guarantee pool. ${String(b.reason || "").slice(0, 200)}`, "#/wallet");
-      return json({ claim: claimRows[0], pool_cents: pool - amount });
+      return json({ claim: claimRows[0], pool_cents: newPool });
     }
     if (path === "/admin/deposits" && method === "GET") {
       const rows = await pg("ex_deposits?select=*,user:ex_users!ex_deposits_user_id_fkey(name,email)&order=created_at.desc&limit=100");
@@ -2501,9 +2754,13 @@ async function handle(req: Request) {
       const d = await one(`ex_deposits?id=eq.${id}&status=eq.pending&select=*`);
       if (!d) return err("pending deposit not found", 404);
       if (b.action === "credit") {
+        // CLAIM FIRST: flip to credited before any money moves, so a
+        // retry can never double-credit the wallet.
+        const claimedDep = await pg(`ex_deposits?id=eq.${id}&status=eq.pending`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "credited", resolved_at: now() }) });
+        if (!claimedDep.length) return err("deposit was already resolved", 409);
         await rpc("ex_move_balance", { p_user: d.user_id, p_amount: d.amount_cents, p_type: "deposit", p_ref: `deposit:${id}`, p_note: `${d.asset} deposit confirmed`, p_now: now() });
-        await pg(`ex_deposits?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "credited", resolved_at: now() }) });
         await notify(d.user_id, "wallet", `Deposit of $${(d.amount_cents / 100).toFixed(2)} credited`, "#/wallet");
+        await queueLifecycleMail("deposit_confirmed", d.user_id, { amount_cents: d.amount_cents, asset: d.asset, amount: fmtMoney(d.amount_cents), link: `${SITE_URL}/#/wallet` });
       } else if (b.action === "reject") {
         await pg(`ex_deposits?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "rejected", resolved_at: now() }) });
         await notify(d.user_id, "wallet", `Deposit #${id} could not be verified`, "#/wallet");
@@ -2520,6 +2777,9 @@ async function handle(req: Request) {
       const p = await one(`ex_payouts?id=eq.${id}&status=eq.pending&select=*`);
       if (!p) return err("pending payout not found", 404);
       if (b.action === "paid" && Number(p.hold_until || 0) > now()) return err(`this payout is inside the 48-hour new-account hold (held until ${new Date(Number(p.hold_until) * 1000).toISOString()}) - it cannot be approved before then`, 400);
+      // REVIEW STEP: payouts over $500 are flagged; paying one out needs
+      // an explicit reviewed:true from the admin who checked it.
+      if (b.action === "paid" && p.needs_review && b.reviewed !== true) return err("payout is over $500 and flagged for review — resend with reviewed: true after checking it", 400);
       if (b.action === "paid") {
         if (p.method === "crypto") {
           // Real on-chain execution: the wallet service picks the payout up,
@@ -2527,13 +2787,18 @@ async function handle(req: Request) {
           // transaction hash once the send confirms. Never faked here.
           await pg(`ex_payouts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ execution_status: "approved", failure_reason: "" }) });
           await notify(p.user_id, "wallet", `Payout of $${(p.amount_cents / 100).toFixed(2)} approved — being sent on-chain`, "#/wallet");
+          await queueLifecycleMail("payout_completed", p.user_id, { amount_cents: p.amount_cents, asset: p.asset || "", destination: p.destination || "", amount: fmtMoney(p.amount_cents), link: `${SITE_URL}/#/wallet` });
           return json({ ok: true, execution: "approved" });
         }
         await pg(`ex_payouts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "paid", resolved_at: now() }) });
         await notify(p.user_id, "wallet", `Payout of $${(p.amount_cents / 100).toFixed(2)} sent`, "#/wallet");
+        await queueLifecycleMail("payout_completed", p.user_id, { amount_cents: p.amount_cents, asset: p.asset || "", destination: p.destination || "", amount: fmtMoney(p.amount_cents), link: `${SITE_URL}/#/wallet` });
       } else if (b.action === "reject") {
+        // CLAIM FIRST: flip to rejected before refunding, so a retry can
+        // never refund twice.
+        const claimedPay = await pg(`ex_payouts?id=eq.${id}&status=eq.pending`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "rejected", resolved_at: now() }) });
+        if (!claimedPay.length) return err("payout was already resolved", 409);
         await rpc("ex_move_balance", { p_user: p.user_id, p_amount: p.amount_cents, p_type: "refund", p_ref: `payout:${id}`, p_note: "Payout rejected — balance restored", p_now: now() });
-        await pg(`ex_payouts?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "rejected", resolved_at: now() }) });
         await notify(p.user_id, "wallet", `Payout #${id} rejected — balance restored`, "#/wallet");
       } else return err("action must be paid or reject");
       return json({ ok: true });
