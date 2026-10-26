@@ -18,7 +18,7 @@ if (proxyUrl) {
 
 import { loadConfig, SupabaseAdmin } from "./supabase.mjs";
 import { sendMail, buildMessage } from "./smtp.mjs";
-import { renderMail, FROM_NAME_EXPORT } from "./templates.mjs";
+import { renderMail, FROM_NAME_EXPORT, TEMPLATE_KINDS } from "./templates.mjs";
 import { reservedDomainOf } from "./reserved.mjs";
 import { embed as embedWatermark } from "./watermark.mjs";
 
@@ -65,6 +65,94 @@ const now = () => Math.floor(Date.now() / 1000);
 let sentTotal = 0;
 let failedTotal = 0;
 
+// ---------------------------------------------------------------------------
+// SENDER-PROTECTION GUARDS (owner order 2026-10-26, after the Zoho
+// 550 5.4.6 "Unusual sending activity" throttle incident): the company
+// mailbox is production infrastructure, not a test blaster.
+//  1. PAUSE file ($STATE_DIR/PAUSE): when present, the mailer idles —
+//     no sends, no attempt burns. The wake-hook supervisor honors it too.
+//  2. THROTTLE DEFERRAL: a Zoho 5.4.6 / "try after sometime" refusal is a
+//     provider cooldown, NOT a message failure. It never increments the
+//     row's attempts and never marks a row failed; instead the mailer
+//     parks ALL sending for THROTTLE_COOLDOWN_SECS and retries after.
+//  3. HOURLY CAP: at most MAIL_HOURLY_CAP successful sends per rolling
+//     hour (default 30). Excess rows simply stay queued. Raise via env
+//     only when sending moves to a real transactional service.
+// ---------------------------------------------------------------------------
+const PAUSE_FILE = `${STATE_DIR}/PAUSE`;
+const SENDLOG_FILE = `${STATE_DIR}/sendlog.json`;
+const POOL_FILE = `${STATE_DIR}/pool.json`;
+const THROTTLE_COOLDOWN_SECS = 1800; // 30m park for a 5.4.6 activity throttle
+const BLOCK_COOLDOWN_SECS = 21600; // 6h park for sender-block / AUTH refusals
+const HOURLY_CAP = parseInt(process.env.MAIL_HOURLY_CAP || "30", 10); // global, all senders
+const PER_SENDER_CAP = parseInt(process.env.MAIL_PER_SENDER_HOURLY_CAP || "15", 10);
+
+import { existsSync } from "node:fs";
+// ---------------------------------------------------------------------------
+// SENDER POOL state (owner order 2026-10-26: never depend on ONE address).
+// pool.json: { parked: {key: until_epoch}, sends: {from: [epoch, ...]} }
+// Park keys: a From address ("notify@…") for per-address throttles, or
+// "auth:<user>" for AUTH/sender-block refusals (every alias of that Zoho
+// user is dead until the account unblocks, so the whole group parks).
+// A provider refusal NEVER burns a row's attempts and NEVER fails a row —
+// the sender parks, the row fails over to the next healthy sender, and
+// only defers (stays queued) when every sender is parked or capped.
+// ---------------------------------------------------------------------------
+function loadPool() {
+  try {
+    const p = JSON.parse(readFileSync(POOL_FILE, "utf8"));
+    return { parked: p.parked || {}, sends: p.sends || {} };
+  } catch { return { parked: {}, sends: {} }; }
+}
+function savePool(p) {
+  try { writeFileSync(POOL_FILE, JSON.stringify(p)); } catch { /* best-effort */ }
+}
+function senderParkedUntil(p, sender) {
+  return Math.max(p.parked[sender.from] || 0, p.parked[`auth:${sender.authUser}`] || 0);
+}
+function parkSender(p, sender, secs, scope) {
+  const key = scope === "auth" ? `auth:${sender.authUser}` : sender.from;
+  p.parked[key] = now() + secs;
+  savePool(p);
+  return p.parked[key];
+}
+function senderRecentCount(p, from) {
+  const cutoff = now() - 3600;
+  return (p.sends[from] || []).filter((t) => t > cutoff).length;
+}
+function isBlockError(e) {
+  const s = String((e && e.message) || e || "");
+  return /5\.1\.8|sender address blocked|SMTP AUTH failed/i.test(s);
+}
+function isThrottleError(e) {
+  const s = String((e && e.message) || e || "");
+  return /5\.4\.6|unusual sending activity|try after/i.test(s);
+}
+function isProviderError(e) { return isBlockError(e) || isThrottleError(e); }
+function recentSendCount() {
+  try {
+    const arr = JSON.parse(readFileSync(SENDLOG_FILE, "utf8"));
+    const cutoff = now() - 3600;
+    return arr.filter((t) => t > cutoff).length;
+  } catch { return 0; }
+}
+function recordSend(from) {
+  try {
+    const arr = JSON.parse(readFileSync(SENDLOG_FILE, "utf8"));
+    const cutoff = now() - 3600;
+    const kept = arr.filter((t) => t > cutoff);
+    kept.push(now());
+    writeFileSync(SENDLOG_FILE, JSON.stringify(kept));
+  } catch {
+    try { writeFileSync(SENDLOG_FILE, JSON.stringify([now()])); } catch { /* best-effort */ }
+  }
+  const p = loadPool();
+  const cutoff = now() - 3600;
+  p.sends[from] = (p.sends[from] || []).filter((t) => t > cutoff);
+  p.sends[from].push(now());
+  savePool(p);
+}
+
 function heartbeat(phase) {
   try {
     writeFileSync(`${STATE_DIR}/heartbeat.json`, JSON.stringify({ ts: now(), pid: process.pid, phase, sent_total: sentTotal, failed_total: failedTotal }));
@@ -72,8 +160,31 @@ function heartbeat(phase) {
 }
 
 async function cycle() {
+  // Sender-protection guards first: an owner pause means NO sends and NO
+  // attempt burns this cycle. (Throttle/block parking is per-sender now —
+  // handled inside the row loop via the pool state.)
+  if (existsSync(PAUSE_FILE)) { heartbeat("paused"); return; }
+  let sendBudget = HOURLY_CAP - recentSendCount();
+  if (sendBudget <= 0) { heartbeat("capped"); return; }
   const rows = await db.list("ex_outbox?status=eq.queued&order=id.asc&limit=10&select=*");
+  const unknownLogged = new Set();
   for (const row of rows || []) {
+    // NO-TEMPLATE GUARD: a kind with no template in templates.mjs (e.g. a
+    // future backend kind shipped before its template) is left exactly as
+    // it is — queued, unsent, no attempt burned — and logged once per
+    // cycle per kind. Only 'broadcast' falls through to the generic
+    // template, and only because it is an explicit member of the set.
+    if (!TEMPLATE_KINDS.has(row.kind)) {
+      if (!unknownLogged.has(row.kind)) {
+        unknownLogged.add(row.kind);
+        console.log(`[mailerd] no template for kind ${row.kind} — left queued (row id=${row.id})`);
+      }
+      continue;
+    }
+    if (sendBudget <= 0) {
+      console.log("[mailerd] hourly cap reached — remaining rows stay queued (no attempts burned)");
+      break;
+    }
     // EMAIL DISCIPLINE GUARD (owner order 2026-10-23, hard rule): reserved /
     // undeliverable recipient domain (RFC 2606) — refuse BEFORE any SMTP
     // attempt; no attempt counted, never retried (the row leaves 'queued'
@@ -95,40 +206,76 @@ async function cycle() {
     }
     const attempts = (row.attempts || 0) + 1;
     await db.patch(`ex_outbox?id=eq.${row.id}`, { attempts });
-    try {
-      const rowLogo = logoImageFor(row.id);
-      const isReview = row.kind === "review_received" && starFilledBase && starEmptyBase;
-      const { subject, text, html } = renderMail(row, {
-        logoSrc: rowLogo ? "cid:novalogo" : undefined,
-        ...(isReview ? { starFilledSrc: "cid:starfilled", starEmptySrc: "cid:starempty" } : {}),
-      });
-      const inlineImages = [];
-      if (rowLogo) inlineImages.push(rowLogo);
-      if (isReview) {
-        inlineImages.push({ cid: "starfilled", contentType: "image/png", base64: starFilledBase.toString("base64") });
-        inlineImages.push({ cid: "starempty", contentType: "image/png", base64: starEmptyBase.toString("base64") });
-      }
+    // Render once; the same message body is offered to each pool sender.
+    const rowLogo = logoImageFor(row.id);
+    const isReview = row.kind === "review_received" && starFilledBase && starEmptyBase;
+    const { subject, text, html } = renderMail(row, {
+      logoSrc: rowLogo ? "cid:novalogo" : undefined,
+      ...(isReview ? { starFilledSrc: "cid:starfilled", starEmptySrc: "cid:starempty" } : {}),
+    });
+    const inlineImages = [];
+    if (rowLogo) inlineImages.push(rowLogo);
+    if (isReview) {
+      inlineImages.push({ cid: "starfilled", contentType: "image/png", base64: starFilledBase.toString("base64") });
+      inlineImages.push({ cid: "starempty", contentType: "image/png", base64: starEmptyBase.toString("base64") });
+    }
+    // SENDER POOL FAILOVER: try healthy senders (least-used first) until
+    // one accepts. A provider refusal parks that sender (30m throttle /
+    // 6h AUTH-block, whole auth group for AUTH) and the SAME row moves to
+    // the next sender — one blocked address never stops platform mail.
+    const pool = loadPool();
+    const ordered = [...config.senders].sort((a, b) => senderRecentCount(pool, a.from) - senderRecentCount(pool, b.from));
+    let delivered = false;
+    let providerDeferred = false;
+    let messageFailed = false;
+    for (const sender of ordered) {
+      if (senderParkedUntil(pool, sender) > now()) continue;
+      if (senderRecentCount(pool, sender.from) >= PER_SENDER_CAP) continue;
       const message = buildMessage({
-        from: config.smtpUser, fromName: FROM_NAME_EXPORT,
+        from: sender.from, fromName: FROM_NAME_EXPORT,
         to: row.to_email, toName: row.to_name || "",
         subject, text, html,
         inlineImages,
       });
-      await sendMail({ user: config.smtpUser, pass: config.smtpPass, message });
-      await db.patch(`ex_outbox?id=eq.${row.id}`, { status: "sent", sent_at: now(), last_error: null });
-      sentTotal++;
-      console.log(`[mailerd] sent id=${row.id} kind=${row.kind} to=${row.to_email}`);
-    } catch (e) {
-      failedTotal++;
-      const patch = { last_error: String(e.message || e).slice(0, 400) };
-      if (attempts >= 3) patch.status = "failed";
-      await db.patch(`ex_outbox?id=eq.${row.id}`, patch).catch(() => {});
-      console.error(`[mailerd] send failed id=${row.id} attempt=${attempts}: ${patch.last_error}`);
+      try {
+        await sendMail({ user: sender.authUser, pass: sender.pass, message, mailFrom: sender.from });
+        await db.patch(`ex_outbox?id=eq.${row.id}`, { status: "sent", sent_at: now(), last_error: null });
+        sentTotal++;
+        sendBudget--;
+        recordSend(sender.from);
+        console.log(`[mailerd] sent id=${row.id} kind=${row.kind} to=${row.to_email} via=${sender.from}`);
+        delivered = true;
+        break;
+      } catch (e) {
+        if (isProviderError(e)) {
+          const blocked = isBlockError(e);
+          const until = parkSender(pool, sender, blocked ? BLOCK_COOLDOWN_SECS : THROTTLE_COOLDOWN_SECS, blocked ? "auth" : "from");
+          console.error(`[mailerd] Zoho ${blocked ? "SENDER BLOCK/AUTH" : "throttle 5.4.6"} via=${sender.from} on id=${row.id} — sender parked until ${until}, failing over`);
+          providerDeferred = true;
+          continue;
+        }
+        // A genuine message-level failure (bad recipient, rejected content):
+        // counts against the row exactly as before, no failover.
+        failedTotal++;
+        const patch = { last_error: String(e.message || e).slice(0, 400) };
+        if (attempts >= 3) patch.status = "failed";
+        await db.patch(`ex_outbox?id=eq.${row.id}`, patch).catch(() => {});
+        console.error(`[mailerd] send failed id=${row.id} attempt=${attempts} via=${sender.from}: ${patch.last_error}`);
+        messageFailed = true;
+        break;
+      }
+    }
+    if (!delivered && !messageFailed) {
+      // Every sender was parked/capped, or all refused at the provider:
+      // the row is DEFERRED, not failed — undo the attempt increment.
+      await db.patch(`ex_outbox?id=eq.${row.id}`, { attempts: row.attempts || 0, last_error: `deferred at ${now()} — all senders parked/capped (provider), attempt not counted` }).catch(() => {});
+      console.log(`[mailerd] deferred id=${row.id} — no healthy sender available (providerDeferred=${providerDeferred}); row stays queued, attempt NOT counted`);
+      break; // remaining rows would hit the same wall this cycle
     }
   }
 }
 
-console.log(`[mailerd] starting; smtp user ${config.smtpUser}; state ${STATE_DIR}`);
+console.log(`[mailerd] starting; smtp user ${config.smtpUser}; state ${STATE_DIR}; sender pool: ${config.senders.map((s) => s.from).join(", ")} (global cap ${HOURLY_CAP}/h, per-sender cap ${PER_SENDER_CAP}/h)`);
 heartbeat("boot");
 for (;;) {
   const started = Date.now();
