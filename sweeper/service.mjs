@@ -303,9 +303,83 @@ async function deliveredAutoRelease() {
   }
 }
 
+// CONTRACT JOBS (2026-10-26): two time-based duties.
+//  a) WINDOW OPENING: when an awarded contract job's call window opens
+//     within the next 60 minutes, the winning agent's owner is notified
+//     in-app and the agent's webhook gets contract_attempt_window_opening
+//     - exactly once per job (the window_notified flag is the claim).
+//  b) WINDOW REFUND: an awarded contract job whose call window ended
+//     more than 24h ago with NO delivery is auto-cancelled and its full
+//     held escrow refunds to the poster (contract jobs have no
+//     milestones, so the held amount is the agreed price). The status
+//     flip is the claim; a failed refund reverts it for the next cycle.
+//     Both sides are notified in-app and emailed (job_cancelled kind).
+//     Delivered contract jobs are NOT touched here - the delivered
+//     auto-release above settles them by their pay rule instead.
+async function contractWindowOpening() {
+  const t = nowSec();
+  const rows = await get(`ex_contract_jobs?window_notified=eq.false&window_start=gt.${t}&window_start=lt.${t + 3600}&select=*&limit=50`).catch(() => []);
+  for (const cj of rows || []) {
+    try {
+      const job = (await get(`ex_jobs?id=eq.${cj.job_id}&select=id,title,status,awarded_agent_id,poster_user_id`))[0];
+      if (!job || job.status !== "awarded" || !job.awarded_agent_id) continue;
+      const claimed = await patch(`ex_contract_jobs?job_id=eq.${cj.job_id}&window_notified=eq.false`, { window_notified: true }, "return=representation");
+      if (!claimed || !claimed.length) continue;
+      const agent = (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id,webhook_url`))[0];
+      if (agent) {
+        await notify(agent.owner_id, "award", `Call window opening soon: "${job.title}" - the call window opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz}). Open an attempt inside the window before dialling.`, `#/job/${job.id}`);
+        if (agent.webhook_url) {
+          try {
+            await fetch(agent.webhook_url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "contract_attempt_window_opening", job_id: job.id, title: job.title, window_start: cj.window_start, window_end: cj.window_end, window_tz: cj.window_tz }), signal: AbortSignal.timeout(5000) });
+          } catch { /* best effort, like the backend's fireWebhook */ }
+        }
+      }
+      console.log(`contract: window-opening notice sent for job ${job.id}`);
+    } catch (e) {
+      console.error(`contractWindowOpening: job ${cj.job_id} failed:`, e.message);
+    }
+  }
+}
+
+async function contractWindowRefunds() {
+  const t = nowSec();
+  const rows = await get(`ex_contract_jobs?window_end=lt.${t - 24 * 3600}&select=job_id&limit=50`).catch(() => []);
+  for (const cj of rows || []) {
+    try {
+      const job = (await get(`ex_jobs?id=eq.${cj.job_id}&status=eq.awarded&select=*`))[0];
+      if (!job) continue;
+      const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { status: "cancelled", updated_at: t }, "return=representation");
+      if (!claimed || !claimed.length) continue;
+      try {
+        if (Number(job.agreed_cents || 0) > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents, p_ref: `job:${job.id}`, p_note: "Contract call window passed with no delivery - escrow refunded in full", p_now: t });
+      } catch (e) {
+        await patch(`ex_jobs?id=eq.${job.id}`, { status: "awarded", updated_at: t }).catch(() => {});
+        console.error(`contract refund FAILED for job ${job.id} (status reverted, will retry):`, e.message);
+        continue;
+      }
+      await notify(job.poster_user_id, "payment", `"${job.title}" was cancelled automatically - the call window closed over a day ago with no delivery, and your escrow (${money(job.agreed_cents)}) was refunded in full`, `#/job/${job.id}`);
+      const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
+      if (poster) await queueMail("job_cancelled", poster, { name: poster.name || "", title: job.title, link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("contract poster mail failed", e.message));
+      if (job.awarded_agent_id) {
+        const agent = (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`))[0];
+        if (agent) {
+          await notify(agent.owner_id, "delivery", `"${job.title}" was cancelled automatically - the call window closed with no delivery, and the escrow was refunded to the poster`, `#/job/${job.id}`);
+          const owner = (await get(`ex_users?id=eq.${agent.owner_id}&select=id,email,name`))[0];
+          if (owner) await queueMail("job_cancelled", owner, { name: owner.name || "", title: job.title, link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("contract worker mail failed", e.message));
+        }
+      }
+      console.log(`contract: job ${job.id} auto-cancelled (window passed, no delivery), ${money(job.agreed_cents)} refunded to poster ${job.poster_user_id}`);
+    } catch (e) {
+      console.error(`contractWindowRefunds: job ${cj.job_id} failed:`, e.message);
+    }
+  }
+}
+
 async function cycle() {
   try { await deadlineRefunds(); } catch (e) { console.error("deadlineRefunds:", e.message); }
   try { await deliveredAutoRelease(); } catch (e) { console.error("deliveredAutoRelease:", e.message); }
+  try { await contractWindowOpening(); } catch (e) { console.error("contractWindowOpening:", e.message); }
+  try { await contractWindowRefunds(); } catch (e) { console.error("contractWindowRefunds:", e.message); }
   try { await deadListings(); } catch (e) { console.error("deadListings:", e.message); }
   try { await altScan(); } catch (e) { console.error("altScan:", e.message); }
   try { await del(`ex_rate_counters?window_start=lt.${nowSec() - 86400}`); } catch { /* housekeeping only */ }
