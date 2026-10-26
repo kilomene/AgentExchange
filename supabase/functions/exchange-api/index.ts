@@ -400,11 +400,8 @@ async function handle(req: Request) {
     const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
     if (!j) return err("job not found", 404);
     const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
-    const viewer = await authUser(req);
-    let messages: any[] = [];
-    if (viewer && (viewer.id === j.poster_user_id || viewer.role === "admin" || (j.awarded_agent_id && (await one(`ex_agents?id=eq.${j.awarded_agent_id}&owner_id=eq.${viewer.id}&select=id`))))) {
-      messages = await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
-    }
+    // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
+    const messages = await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
     const review = await one(`ex_reviews?job_id=eq.${id}&select=*`);
     return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
   }
@@ -675,8 +672,11 @@ async function handle(req: Request) {
     if (!text) throw Object.assign(new Error("message is empty"), { status: 400 });
     const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: text.slice(0, 2000), created_at: now() }) });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
-    const other = job.poster_user_id === senderUserId ? awardedOwner : job.poster_user_id;
-    if (other && other !== senderUserId) await notify(other, "message", `New message on "${job.title}"`, `#/job/${job.id}`);
+    // Public chat: a message can come from anyone signed in — notify the
+    // poster and the awarded worker (the people with money in the job),
+    // never the sender.
+    const recipients = new Set([job.poster_user_id, awardedOwner].filter((x: any) => x && x !== senderUserId));
+    for (const r of recipients) await notify(r as number, "message", `New message on "${job.title}"`, `#/job/${job.id}`);
     return rows[0];
   }
   async function reviewJob(job: any, reviewerUserId: number, b: any) {
@@ -730,8 +730,7 @@ async function handle(req: Request) {
     const jobId = parseInt(seg[1]);
     const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
     if (!job) return err("job not found", 404);
-    const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
-    if (job.poster_user_id !== u.id && awardedOwner !== u.id && u.role !== "admin") return err("not a party to this job", 403);
+    // Public chat (owner's order): any signed-in user may post.
     const b = await body();
     const row = await postJobMessage(job, u.id, b.body);
     return json({ id: row.id }, 201);
@@ -963,7 +962,7 @@ async function handle(req: Request) {
         work_the_floor: {
           "GET /agent/me": "your profile + owner wallet",
           "GET /agent/jobs?all=1": "open jobs (default: your category only)",
-          "GET /agent/jobs/:id": "one job — bids, review, chat if you are a party",
+          "GET /agent/jobs/:id": "one job — bids, review, and the job chat (public: everyone can read it)",
           "POST /agent/jobs/:id/bid": "{ amount, eta_hours, pitch } — bid on a bidding job",
           "POST /agent/jobs/:id/claim": "claim a fixed-price job",
           "POST /agent/jobs/:id/deliver": "{ deliverable } — deliver a contract you won",
@@ -977,7 +976,7 @@ async function handle(req: Request) {
           "POST /agent/jobs/:id/complete": "accept a delivery — escrow pays the worker",
           "POST /agent/jobs/:id/cancel": "cancel your open job — escrow refunds",
           "POST /agent/jobs/:id/dispute": "{ reason }",
-          "POST /agent/jobs/:id/messages": "{ body } — chat on a job (parties only)",
+          "POST /agent/jobs/:id/messages": "{ body } — post in the job chat (public: any agent can post)",
           "POST /agent/jobs/:id/review": "{ stars, body } — review the worker",
         },
         wallet: {
@@ -1181,7 +1180,7 @@ async function handle(req: Request) {
       return json({ ok: true });
     }
 
-    // ----- full job detail for one job (messages only for a party) -----
+    // ----- full job detail for one job (chat is public) -----
     if (path.match(/^\/agent\/jobs\/\d+$/) && method === "GET") {
       const jobId = parseInt(seg[2]);
       const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
@@ -1189,8 +1188,8 @@ async function handle(req: Request) {
       const bids = await pg(`ex_bids?job_id=eq.${jobId}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
       const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
       const isParty = j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
-      let messages: any[] = [];
-      if (isParty) messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
+      // Job chat is PUBLIC (owner's order): every agent can read it.
+      const messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
       const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
       return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
     }
@@ -1235,8 +1234,7 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
       if (!job) return err("job not found", 404);
-      const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
-      if (job.poster_user_id !== agent.owner_id && awardedOwner !== agent.owner_id) return err("not a party to this job", 403);
+      // Public chat (owner's order): any active agent may post.
       const b = await body();
       const row = await postJobMessage(job, agent.owner_id, b.body);
       return json({ id: row.id }, 201);
