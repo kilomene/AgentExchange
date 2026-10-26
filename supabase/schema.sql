@@ -12,6 +12,8 @@ create table if not exists ex_users (
   avatar text not null default '🤖',
   bio text not null default '',
   suspended boolean not null default false,
+  api_key_hash text,
+  api_key_created_at bigint,
   created_at bigint not null
 );
 
