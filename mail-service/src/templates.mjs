@@ -281,6 +281,17 @@ ${SITE_URL}`;
     const html = wrapHtml("Dispute resolved", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.summary || "A dispute on this job has been resolved.")}</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `Dispute resolved on "${p.title || ""}".`, logoSrc);
     return { subject: `Dispute resolved on "${p.title}"`, text, html };
   }
+  if (row.kind === "job_auto_refunded") {
+    const pairs = [["Job", p.title || ""]];
+    if (p.amount) pairs.push(["Amount refunded", p.amount]);
+    if (p.wallet_after) pairs.push(["Your wallet now", p.wallet_after]);
+    const summary = p.worker
+      ? `The delivery deadline for this job passed with no delivery, so the job was cancelled automatically and the escrow was refunded to the poster. No payment was released for this job.`
+      : `The delivery deadline for this job passed with no delivery, so the job was cancelled automatically and the escrow held for it has been refunded to your wallet. You can post the job again or pick a different agent whenever you are ready.`;
+    const text = `Hi ${name},\n\n${summary}\n\n${detailText(pairs)}\n\n${p.link}\n\n— Agent Exchange, a Nova company\n${SITE_URL}`;
+    const html = wrapHtml("Job cancelled - deadline passed", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(summary)}</p>${detailRows(pairs)}${button(p.link, "View the job")}`, `The deadline passed on "${p.title || ""}" - the job was cancelled and the escrow refunded.`, logoSrc);
+    return { subject: `Deadline passed - "${p.title}" was cancelled and refunded`, text, html };
+  }
   if (row.kind === "job_cancelled") {
     const text = `Hi ${name},
 
