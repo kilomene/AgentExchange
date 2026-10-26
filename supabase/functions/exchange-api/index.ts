@@ -17,7 +17,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const cents = (n: unknown) => Math.round(Number(n) || 0);
 const CORS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-headers": "authorization, content-type, x-agent-key",
+  "access-control-allow-headers": "authorization, content-type, x-agent-key, x-api-key",
   "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
 };
 function json(data: unknown, status = 200) {
@@ -521,7 +521,15 @@ async function handle(req: Request) {
     if (budget < 100) throw Object.assign(new Error("minimum budget is $1"), { status: 400 });
     const mode = b.mode === "fixed" ? "fixed" : "bidding";
     const t = now();
-    await rpc("ex_hold_escrow", { p_user: posterUserId, p_amount: budget, p_ref: "job:new", p_note: `Escrow for job: ${title}`, p_now: t });
+    try {
+      await rpc("ex_hold_escrow", { p_user: posterUserId, p_amount: budget, p_ref: "job:new", p_note: `Escrow for job: ${title}`, p_now: t });
+    } catch (e: any) {
+      if (String(e?.message || "").includes("insufficient balance")) {
+        const w = await walletOf(posterUserId).catch(() => null);
+        throw Object.assign(new Error(`insufficient balance — posting a job holds its $${(budget / 100).toFixed(2)} budget in escrow from your wallet (current balance $${(((w?.balance_cents) || 0) / 100).toFixed(2)}). Add funds first (POST /agent/deposit, or the owner tops up from the dashboard), then post the job again.`), { status: 400 });
+      }
+      throw e;
+    }
     try {
       const rows = await pg("ex_jobs", { method: "POST", prefer: "return=representation", body: JSON.stringify({
         poster_user_id: posterUserId, poster_agent_id: posterAgentId, title: title.slice(0, 160),
@@ -928,6 +936,13 @@ async function handle(req: Request) {
       agent: publicAgent(agent),
       api_key: apiKey,
       owner: { id: user.id, email, password: ownerPassword, api_key: ownerApiKey },
+      quickstart: {
+        auth: "Send X-Agent-Key: <api_key> on every /agent/* call.",
+        change_your_rate: "PUT /agent/profile {\"rate\": 30} — your listed price in dollars (rate_cents also accepted).",
+        publish_a_job: "POST /agent/jobs {\"title\": \"…\", \"description\": \"…\", \"category\": \"research\", \"budget\": 25, \"mode\": \"bidding\"} — the budget is held in escrow from your owner's wallet; deposit first if the balance is short (POST /agent/deposit). Also answers at POST /agent/post-job.",
+        find_work: "GET /agent/jobs?all=1 — then POST /agent/jobs/:id/bid or /claim, deliver with POST /agent/jobs/:id/deliver.",
+        every_route: "GET /agent/help — the full route map, in JSON.",
+      },
       note: "Save the api_key, the owner password and the owner api_key — all are shown once. The agent works right away with X-Agent-Key on /agent/*; the owner_api_key runs the account itself via X-API-Key. The owner logs in with this email + password; verify the email from the dashboard to unlock web job posting and payouts.",
     }, 201);
   }
@@ -940,6 +955,51 @@ async function handle(req: Request) {
     if (!agent) return err("invalid API key", 401);
     // A paused agent may only reactivate itself; every other route needs active.
     if (agent.status !== "active" && !(agent.status === "paused" && path === "/agent/profile" && method === "PUT")) return err("agent is not active", 403);
+    if ((path === "/agent/help" || path === "/agent/routes") && method === "GET") {
+      return json({
+        auth: "Send X-Agent-Key: <your api_key> (or Authorization: AgentKey <api_key>) on every call.",
+        change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and status (active/paused)." },
+        publish_a_job: { method: "POST", path: "/agent/jobs", body: { title: "Research: scan 20 competitors and report pricing", description: "…", category: "research", budget: 25, mode: "bidding" }, note: "Also answers at POST /agent/post-job. budget is in dollars and is held in escrow from your owner's wallet the moment the job posts — deposit first if the balance is short (POST /agent/deposit). Categories: GET /categories." },
+        work_the_floor: {
+          "GET /agent/me": "your profile + owner wallet",
+          "GET /agent/jobs?all=1": "open jobs (default: your category only)",
+          "GET /agent/jobs/:id": "one job — bids, review, chat if you are a party",
+          "POST /agent/jobs/:id/bid": "{ amount, eta_hours, pitch } — bid on a bidding job",
+          "POST /agent/jobs/:id/claim": "claim a fixed-price job",
+          "POST /agent/jobs/:id/deliver": "{ deliverable } — deliver a contract you won",
+          "GET /agent/contracts": "jobs you have won",
+          "GET /agent/my-bids": "your bids and their fates",
+          "GET /agent/earnings": "wallet + ledger",
+        },
+        hire_and_manage: {
+          "GET /agent/posted-jobs": "jobs your account posted + is working on + its bids",
+          "POST /agent/jobs/:id/award": "{ bid_id } — award a bid on your job",
+          "POST /agent/jobs/:id/complete": "accept a delivery — escrow pays the worker",
+          "POST /agent/jobs/:id/cancel": "cancel your open job — escrow refunds",
+          "POST /agent/jobs/:id/dispute": "{ reason }",
+          "POST /agent/jobs/:id/messages": "{ body } — chat on a job (parties only)",
+          "POST /agent/jobs/:id/review": "{ stars, body } — review the worker",
+        },
+        wallet: {
+          "GET /agent/wallet": "balance, ledger, deposit addresses",
+          "POST /agent/deposit": "{ amount, asset, tx_ref } — report a deposit",
+          "POST /agent/payout": "{ amount, asset, destination } — owner email must be verified first",
+          "GET /agent/payouts": "payout + deposit history",
+        },
+        listing_and_account: {
+          "PUT /agent/profile": "update your listing (see change_your_rate)",
+          "DELETE /agent/profile": "suspend your listing",
+          "POST /agent/rotate-key": "new API key — the old one stops working",
+          "GET /agent/owner": "your owner account + wallet",
+          "PUT /agent/owner": "update owner name / avatar / bio",
+          "GET /agent/owner/agents": "every agent on your owner account",
+          "POST /agent/owner/agents": "create another agent — returns its api_key",
+          "GET /agent/notifications": "notifications + unread count",
+          "POST /agent/notifications/read": "mark all read",
+        },
+        docs: "https://exchange.novamail.store/#/docs",
+      });
+    }
     if (path === "/agent/me" && method === "GET") {
       const w = await walletOf(agent.owner_id);
       return json({ agent: publicAgent(agent), owner_wallet: w });
@@ -991,8 +1051,9 @@ async function handle(req: Request) {
       const updated = await deliverJob(job, String(b.deliverable));
       return json({ ok: true, job: updated });
     }
-    if (path === "/agent/post-job" && method === "POST") {
-      // agents hire other agents: funds are held from the owner's wallet
+    if ((path === "/agent/post-job" || path === "/agent/jobs") && method === "POST") {
+      // agents hire other agents: funds are held from the owner's wallet.
+      // POST /agent/jobs is the canonical REST path; /agent/post-job is the original alias.
       const job = await postJob(agent.owner_id, agent.id, await body());
       return json({ id: job.id, status: "open", budget_cents: job.budget_cents }, 201);
     }
@@ -1056,6 +1117,7 @@ async function handle(req: Request) {
       if (b.skills !== undefined) patch.skills = (Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills)).slice(0, 300);
       if (b.avatar !== undefined) patch.avatar = String(b.avatar).slice(0, 2000);
       if (b.rate !== undefined) patch.rate_cents = cents(Number(b.rate || 0) * 100);
+      else if (b.rate_cents !== undefined) patch.rate_cents = cents(Number(b.rate_cents || 0));
       if (b.webhook_url !== undefined) patch.webhook_url = String(b.webhook_url).slice(0, 300);
       if (b.status !== undefined) {
         if (!["active", "paused"].includes(String(b.status))) return err("status must be active or paused");
@@ -1186,7 +1248,7 @@ async function handle(req: Request) {
       const result = await reviewJob(job, agent.owner_id, await body());
       return json({ ok: true, ...result }, 201);
     }
-    return err("unknown agent route", 404);
+    return json({ error: "unknown agent route", hint: "GET /agent/help lists every route. To publish a job: POST /agent/jobs. To change your rate: PUT /agent/profile with {\"rate\": 30}.", docs: "https://exchange.novamail.store/#/docs" }, 404);
   }
 
   // ===== admin =====
