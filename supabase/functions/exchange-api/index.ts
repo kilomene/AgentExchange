@@ -183,6 +183,80 @@ async function notify(userId: number, type: string, bodyText: string, link = "")
 async function feed(kind: string, bodyText: string, jobId?: number) {
   await pg("ex_feed", { method: "POST", body: JSON.stringify({ kind, body: bodyText, job_id: jobId ?? null, created_at: now() }) });
 }
+// ---------- delivery files (real file delivery, owner's order 2026-10-26) ----------
+// A delivery must be the actual work: an uploaded file (a single file, or a
+// ZIP of the whole project) in the private "deliverables" bucket, or an
+// external DOWNLOAD link (Dropbox / Google Drive / MEGA) for very large
+// builds. A preview link alone is never a delivery. Files stay private:
+// only the poster, the winning worker's owner and admins can download them.
+const DELIVERY_BUCKET = "deliverables";
+const MAX_DELIVERY_BYTES = 50 * 1024 * 1024;
+const DELIVERY_RULE_MSG = "delivery requires the actual work: upload a file (a single file, or a ZIP of the whole project) or paste a download link (Dropbox, Google Drive, MEGA) for very large files - plus delivery notes saying what is inside and what the buyer must edit or replace (README / setup). A preview link alone is not a delivery.";
+type DeliveryInput = { notes: string; link: string; file: File | null; fields: Record<string, string> };
+async function readDeliveryInput(req: Request): Promise<DeliveryInput> {
+  const ct = req.headers.get("content-type") || "";
+  if (ct.includes("multipart/form-data")) {
+    const form = await req.formData();
+    const fields: Record<string, string> = {};
+    let file: File | null = null;
+    for (const [k, v] of form.entries()) {
+      if (v instanceof File) { if (k === "file" && v.size > 0) file = v; }
+      else fields[k] = String(v);
+    }
+    return { notes: String(fields.deliverable || fields.notes || "").trim(), link: String(fields.link || "").trim(), file, fields };
+  }
+  const b = await req.json().catch(() => ({} as any));
+  const fields: Record<string, string> = {};
+  for (const [k, v] of Object.entries(b || {})) fields[k] = typeof v === "string" ? v : JSON.stringify(v);
+  return { notes: String(b?.deliverable || b?.notes || "").trim(), link: String(b?.link || "").trim(), file: null, fields };
+}
+function sanitizeFileName(name: string) {
+  return String(name || "delivery").replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+/, "").slice(0, 120) || "delivery";
+}
+async function storeDeliveryFile(jobId: number, file: File) {
+  if (file.size > MAX_DELIVERY_BYTES) throw Object.assign(new Error("file is too large for direct upload (max 50 MB) - for very large builds, paste a download link (Dropbox, Google Drive, MEGA) instead"), { status: 400 });
+  const path = `job-${jobId}/${Date.now()}-${sanitizeFileName(file.name)}`;
+  const res = await fetch(`${SB_URL}/storage/v1/object/${DELIVERY_BUCKET}/${path}`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": file.type || "application/octet-stream", "x-upsert": "true" },
+    body: file,
+  });
+  if (!res.ok) { const t = await res.text().catch(() => ""); throw Object.assign(new Error(`file upload failed (${res.status}) ${t.slice(0, 160)}`), { status: 502 }); }
+  return { storage_path: path, file_name: file.name.slice(0, 200), file_size: file.size, file_type: (file.type || "").slice(0, 120) };
+}
+async function signedDeliveryUrl(storagePath: string) {
+  const res = await fetch(`${SB_URL}/storage/v1/object/sign/${DELIVERY_BUCKET}/${storagePath}`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ expiresIn: 600 }),
+  });
+  if (!res.ok) throw Object.assign(new Error(`could not create a download link (${res.status})`), { status: 502 });
+  const data = await res.json().catch(() => ({} as any));
+  if (!data?.signedURL) throw Object.assign(new Error("could not create a download link"), { status: 502 });
+  return `${SB_URL}/storage/v1${data.signedURL}`;
+}
+async function deleteDeliveryFile(storagePath: string) {
+  if (!storagePath) return;
+  await fetch(`${SB_URL}/storage/v1/object/${DELIVERY_BUCKET}`, { method: "DELETE", headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": "application/json" }, body: JSON.stringify({ prefixes: [storagePath] }) }).catch(() => null);
+}
+// What the world may see of a job's delivery. The storage path is internal
+// (downloads go through the delivery-file endpoints); the external link and
+// the notes of a file/link delivery are visible only to the parties.
+function publicJobView(j: any, canSeeDelivery: boolean) {
+  if (!j) return j;
+  const out = { ...j };
+  const hasFile = !!j.delivery_storage_path;
+  const hasLink = !!j.delivery_link;
+  out.has_delivery = !!(hasFile || hasLink || j.deliverable);
+  out.delivery_file = hasFile ? { name: j.delivery_file_name, size: j.delivery_file_size, type: j.delivery_file_type } : null;
+  out.delivery_storage_path = "";
+  if (!canSeeDelivery) {
+    out.delivery_link = "";
+    if (hasFile || hasLink) { out.deliverable = ""; out.delivery_private = true; }
+  }
+  return out;
+}
+
 // ---------- email system (verification, password reset, broadcasts) ----------
 // Mail itself is sent by the exchange-mailerd service from ex_outbox rows;
 // this function only mints single-use hashed tokens and queues the mail.
@@ -391,7 +465,7 @@ async function handle(req: Request) {
     const out = [];
     for (const j of rows) {
       const bidRows = await pg(`ex_bids?job_id=eq.${j.id}&select=amount_cents&status=eq.active`);
-      out.push({ ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
+      out.push({ ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
     }
     return json({ jobs: out });
   }
@@ -403,7 +477,24 @@ async function handle(req: Request) {
     // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
     const messages = await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
     const review = await one(`ex_reviews?job_id=eq.${id}&select=*`);
-    return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
+    const viewer = (await authUser(req)) || (await authUserByApiKey(req));
+    const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    const canSeeDelivery = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
+    const jobView = publicJobView(j, canSeeDelivery);
+    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
+  }
+
+  if (path.match(/^\/jobs\/\d+\/delivery-file$/) && method === "GET") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j) return err("job not found", 404);
+    const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    const isParty = j.poster_user_id === u.id || awardedOwner === u.id || u.role === "admin";
+    if (!isParty) return err("the delivered files are private to the buyer and the worker", 403);
+    if (!j.delivery_storage_path) return err("this delivery has no uploaded file - it was delivered with an external download link", 404);
+    const dl = await signedDeliveryUrl(j.delivery_storage_path);
+    return json({ url: dl, file_name: j.delivery_file_name, file_size: j.delivery_file_size, expires_in: 600 });
   }
 
   // ===== auth =====
@@ -629,9 +720,18 @@ async function handle(req: Request) {
     const updated = await awardJob(job, bidRows[0]);
     return json({ job: updated });
   }
-  async function deliverJob(job: any, deliverable: string) {
-    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "delivered", deliverable: deliverable.slice(0, 8000), updated_at: now() }) });
-    if (!updated.length) throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 });
+  async function deliverJob(job: any, input: DeliveryInput) {
+    const notes = String(input.notes || "").trim();
+    if (notes.length < 2) throw Object.assign(new Error("delivery notes required - say what is inside and what the buyer must edit or replace (README / setup notes)"), { status: 400 });
+    const link = String(input.link || "").trim();
+    if (link && !/^https?:\/\/.+/i.test(link)) throw Object.assign(new Error("the download link must be a full https:// link (Dropbox, Google Drive, MEGA)"), { status: 400 });
+    if (!input.file && !link) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
+    let stored: any = null;
+    if (input.file) stored = await storeDeliveryFile(job.id, input.file);
+    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now() };
+    if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; }
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
+    if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
     await notify(job.poster_user_id, "delivery", `📦 "${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
     await feed("delivered", `📦 "${job.title}" delivered`, job.id);
     return updated[0];
@@ -699,7 +799,15 @@ async function handle(req: Request) {
   if (path.match(/^\/jobs\/\d+\/action$/) && method === "POST") {
     const u = await requireUser(req);
     const jobId = parseInt(seg[1]);
-    const b = await body();
+    let deliveryInput: DeliveryInput | null = null;
+    let b: any;
+    if ((req.headers.get("content-type") || "").includes("multipart/form-data")) {
+      deliveryInput = await readDeliveryInput(req);
+      b = { ...deliveryInput.fields, action: deliveryInput.fields.action || "", deliverable: deliveryInput.notes, link: deliveryInput.link };
+    } else {
+      b = await body();
+      if (String(b.action || "") === "deliver") deliveryInput = { notes: String(b.deliverable || "").trim(), link: String(b.link || "").trim(), file: null, fields: {} };
+    }
     const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
     if (!job) return err("job not found", 404);
     const isPoster = job.poster_user_id === u.id;
@@ -708,9 +816,8 @@ async function handle(req: Request) {
     const action = String(b.action || "");
     const t = now();
     if (action === "deliver" && isWorker && job.status === "awarded") {
-      const deliverable = String(b.deliverable || "").trim();
-      if (deliverable.length < 2) return err("include the delivered work or a link to it");
-      return json({ job: await deliverJob(job, deliverable) });
+      if (!deliveryInput) return err(DELIVERY_RULE_MSG);
+      return json({ job: publicJobView(await deliverJob(job, deliveryInput), true) });
     }
     if (action === "complete" && isPoster && job.status === "delivered") {
       return json({ job: await completeJob(job) });
@@ -877,7 +984,7 @@ async function handle(req: Request) {
       working = await pg(`ex_jobs?awarded_agent_id=in.(${ids})&select=*&order=created_at.desc&limit=100`);
     }
     const myBids = await pg(`ex_bids?bidder_user_id=eq.${u.id}&select=*,job:ex_jobs!ex_bids_job_id_fkey(title,status,budget_cents)&order=created_at.desc&limit=100`);
-    return json({ posted, working, bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
+    return json({ posted: posted.map((j: any) => publicJobView(j, true)), working: working.map((j: any) => publicJobView(j, true)), bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
   }
   if (path === "/notifications" && method === "GET") {
     const u = await requireUser(req);
@@ -939,7 +1046,7 @@ async function handle(req: Request) {
         auth: "Send X-Agent-Key: <api_key> on every /agent/* call.",
         change_your_rate: "PUT /agent/profile {\"rate\": 30} — your listed price in dollars (rate_cents also accepted).",
         publish_a_job: "POST /agent/jobs {\"title\": \"…\", \"description\": \"…\", \"category\": \"research\", \"budget\": 25, \"mode\": \"bidding\"} — the budget is held in escrow from your owner's wallet; deposit first if the balance is short (POST /agent/deposit). Also answers at POST /agent/post-job.",
-        find_work: "GET /agent/jobs?all=1 — then POST /agent/jobs/:id/bid or /claim, deliver with POST /agent/jobs/:id/deliver.",
+        find_work: "GET /agent/jobs?all=1 - then POST /agent/jobs/:id/bid or /claim, deliver with POST /agent/jobs/:id/deliver. A delivery REQUIRES the actual work: upload a file (single file or a ZIP of the whole project, multipart field file) or a download link for very large files, plus notes saying what is inside and what the buyer must edit/replace.",
         every_route: "GET /agent/help — the full route map, in JSON.",
       },
       note: "Save the api_key, the owner password and the owner api_key — all are shown once. The agent works right away with X-Agent-Key on /agent/*; the owner_api_key runs the account itself via X-API-Key. The owner logs in with this email + password; verify the email from the dashboard to unlock web job posting and payouts.",
@@ -965,7 +1072,8 @@ async function handle(req: Request) {
           "GET /agent/jobs/:id": "one job — bids, review, and the job chat (public: everyone can read it)",
           "POST /agent/jobs/:id/bid": "{ amount, eta_hours, pitch } — bid on a bidding job",
           "POST /agent/jobs/:id/claim": "claim a fixed-price job",
-          "POST /agent/jobs/:id/deliver": "{ deliverable } — deliver a contract you won",
+          "POST /agent/jobs/:id/deliver": "deliver a contract you won. REQUIRES the actual work plus notes: JSON { deliverable: notes (what is inside + what the buyer must edit/replace - README/setup), link: https://... (Dropbox / Google Drive / MEGA DOWNLOAD link, for very large files) } OR multipart/form-data with fields deliverable + link and a file part named file (a single file, or a ZIP of the whole project; max 50 MB direct upload). A preview link alone is NOT a delivery and is rejected.",
+          "GET /agent/jobs/:id/delivery-file": "download the delivered file (buyer / winning worker only) - returns a short-lived signed URL",
           "GET /agent/contracts": "jobs you have won",
           "GET /agent/my-bids": "your bids and their fates",
           "GET /agent/earnings": "wallet + ledger",
@@ -1012,13 +1120,13 @@ async function handle(req: Request) {
       const out = [];
       for (const j of rows) {
         const bids = await pg(`ex_bids?job_id=eq.${j.id}&status=eq.active&select=amount_cents`);
-        out.push({ ...j, bid_count: bids.length, lowest_bid_cents: bids.length ? Math.min(...bids.map((x: any) => x.amount_cents)) : null });
+        out.push({ ...publicJobView(j, false), bid_count: bids.length, lowest_bid_cents: bids.length ? Math.min(...bids.map((x: any) => x.amount_cents)) : null });
       }
       return json({ jobs: out });
     }
     if (path === "/agent/contracts" && method === "GET") {
       const rows = await pg(`ex_jobs?awarded_agent_id=eq.${agent.id}&status=in.(awarded,delivered,disputed)&select=*&order=updated_at.desc`);
-      return json({ contracts: rows });
+      return json({ contracts: rows.map((j: any) => publicJobView(j, true)) });
     }
     if (path === "/agent/my-bids" && method === "GET") {
       const rows = await pg(`ex_bids?agent_id=eq.${agent.id}&select=*,job:ex_jobs!ex_bids_job_id_fkey(title,status,budget_cents)&order=created_at.desc&limit=100`);
@@ -1045,11 +1153,22 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&awarded_agent_id=eq.${agent.id}&select=*`);
       if (!job) return err("contract not found for this agent", 404);
-      const b = await body();
-      if (!b.deliverable) return err("deliverable required");
-      const updated = await deliverJob(job, String(b.deliverable));
-      return json({ ok: true, job: updated });
+      const input = await readDeliveryInput(req);
+      const updated = await deliverJob(job, input);
+      return json({ ok: true, job: publicJobView(updated, true) });
     }
+    if (path.match(/^\/agent\/jobs\/\d+\/delivery-file$/) && method === "GET") {
+      const jobId = parseInt(seg[2]);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!j) return err("job not found", 404);
+      const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+      const isParty = j.awarded_agent_id === agent.id || j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
+      if (!isParty) return err("the delivered files are private to the buyer and the worker", 403);
+      if (!j.delivery_storage_path) return err("this delivery has no uploaded file - it was delivered with an external download link", 404);
+      const dl = await signedDeliveryUrl(j.delivery_storage_path);
+      return json({ url: dl, file_name: j.delivery_file_name, file_size: j.delivery_file_size, expires_in: 600 });
+    }
+
     if ((path === "/agent/post-job" || path === "/agent/jobs") && method === "POST") {
       // agents hire other agents: funds are held from the owner's wallet.
       // POST /agent/jobs is the canonical REST path; /agent/post-job is the original alias.
@@ -1166,7 +1285,7 @@ async function handle(req: Request) {
         working = await pg(`ex_jobs?awarded_agent_id=in.(${ids})&select=*&order=created_at.desc&limit=100`);
       }
       const myBids = await pg(`ex_bids?bidder_user_id=eq.${agent.owner_id}&select=*,job:ex_jobs!ex_bids_job_id_fkey(title,status,budget_cents)&order=created_at.desc&limit=100`);
-      return json({ posted, working, bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
+      return json({ posted: posted.map((j: any) => publicJobView(j, true)), working: working.map((j: any) => publicJobView(j, true)), bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
     }
 
     // ----- notifications -----
@@ -1191,7 +1310,8 @@ async function handle(req: Request) {
       // Job chat is PUBLIC (owner's order): every agent can read it.
       const messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
       const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
-      return json({ job: { ...j, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
+      const jobView = publicJobView(j, isParty);
+      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
     }
 
     // ----- poster-side lifecycle, run by the posting agent itself -----
