@@ -348,6 +348,14 @@ function deliveryChecks(bytes: Uint8Array, name: string, mime: string) {
     const png = bytes[0] === 0x89 && bytes[1] === 0x50; const jpg = bytes[0] === 0xff && bytes[1] === 0xd8; const gif = head4.startsWith("GIF8");
     const webp = bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
     checks.push({ name: "image signature", ok: png || jpg || gif || webp, detail: png ? "PNG" : jpg ? "JPEG" : gif ? "GIF" : webp ? "WebP" : "no known image header" });
+  } else if (/\.(mp3|wav|ogg|webm|m4a|opus|flac)$/.test(lower) || mime.startsWith("audio/")) {
+    // AUDIO branch (contract-agent call proof): the recording must carry
+    // a real audio container signature, and be big enough to hold an
+    // actual conversation. Duration itself cannot be decoded here, so
+    // size is the reported proxy - the check REPORTS, it never blocks.
+    const ak = audioKind(bytes, name, mime);
+    checks.push({ name: "audio signature", ok: ak.ok, detail: ak.ok ? `${ak.format} audio container` : "no known audio container header (wav/mp3/ogg/webm/m4a/flac)" });
+    checks.push({ name: "audio size sane", ok: bytes.length >= 2000, detail: bytes.length >= 2000 ? `${bytes.length} bytes - plausibly a real recording` : `${bytes.length} bytes - too small to hold a real call recording` });
   }
   const verdict = checks.every((c) => c.ok) ? "passed" : "flagged";
   return { verdict, checked_at: now(), checks };
@@ -386,13 +394,13 @@ function cleanMilestones(raw: any): { title: string; pct: number }[] | null {
   if (out.reduce((a, m) => a + m.pct, 0) !== 100) throw Object.assign(new Error("milestone percentages must add up to exactly 100"), { status: 400 });
   return out;
 }
-async function storeDeliveryFile(jobId: number, file: File) {
+async function storeDeliveryFile(jobId: number, file: File, folder?: string) {
   if (file.size > MAX_DELIVERY_BYTES) throw Object.assign(new Error("file is too large for direct upload (max 50 MB) - for very large builds, paste a download link (Dropbox, Google Drive, MEGA) instead"), { status: 400 });
   const buf = await file.arrayBuffer();
   const bytes = new Uint8Array(buf);
   const sha = await sha256hexBytes(buf);
   const check = deliveryChecks(bytes, file.name || "delivery", file.type || "");
-  const path = `job-${jobId}/${Date.now()}-${sanitizeFileName(file.name)}`;
+  const path = folder ? `${folder}/${Date.now()}-${sanitizeFileName(file.name)}` : `job-${jobId}/${Date.now()}-${sanitizeFileName(file.name)}`;
   const res = await fetch(`${SB_URL}/storage/v1/object/${DELIVERY_BUCKET}/${path}`, {
     method: "POST",
     headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": file.type || "application/octet-stream", "x-upsert": "true" },
@@ -435,6 +443,271 @@ function publicJobView(j: any, canSeeDelivery: boolean) {
     if (hasFile || hasLink || j.deliverable) out.delivery_private = true;
   }
   return out;
+}
+
+// ---------- CONTRACT AGENTS (owner's idea, 2026-10-26) ----------
+// A contract job is worked through a tool in the agent's own environment
+// - v1: its own phone number. The agent places real calls itself; the
+// platform NEVER places, routes or proxies calls, and has no telephony
+// of its own. The "Call Test" below is therefore a PLATFORM-ISSUED
+// CHALLENGE (a rotating phrase + two set questions) that the agent
+// answers by submitting a proof pack (recording + transcript +
+// answers), auto-graded server-side - exactly the trials pattern. It is
+// honestly labelled a challenge everywhere; no platform phone line is
+// claimed to exist. Payment for a contract job follows the job's pay
+// rule: each attempt ends in one outcome code, and completing the job
+// pays pay_rule[final_outcome] percent of the agreed price (fee taken
+// on the amount actually paid), refunding the rest to the poster.
+const CONTRACT_OUTCOMES = ["answered_completed", "answered_partial", "voicemail_left", "no_answer", "busy", "wrong_number", "refused_recording"];
+const CONTRACT_TERMINAL_OUTCOMES = ["answered_completed", "answered_partial", "voicemail_left"];
+const CONTRACT_PASS_SCORE = 70;
+const CONTRACT_CAPABILITY_TTL = 90 * 86400;
+const CONTRACT_DEFAULT_PAY_RULE: Record<string, number> = { answered_completed: 100, answered_partial: 50, voicemail_left: 50, no_answer: 0, busy: 0, wrong_number: 0, refused_recording: 0 };
+// Narrow, unambiguous contract prohibitions, ON TOP of the general job
+// content screen: no credential fishing, no impersonation, no emergency
+// calls, no debt-collection threats, no harvesting someone's private data.
+const CONTRACT_BANNED_PHRASES = ["account password", "their password", "your password", "the password", "password for", "pin number", "their pin", "one-time code", "one time code", "otp code", "verification code", "social security number", "bank account number", "credit card number", "impersonate", "impersonation", "pretend to be", "pose as", "emergency services", "call 911", "dial 911", "debt collection", "collect the debt", "threaten them", "legal threat"];
+function audioKind(bytes: Uint8Array, name: string, mime: string): { ok: boolean; format: string } {
+  const b = bytes;
+  const ascii = (off: number, len: number) => { let s = ""; for (let i = off; i < Math.min(b.length, off + len); i++) s += String.fromCharCode(b[i]); return s; };
+  if (b.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WAVE") return { ok: true, format: "WAV" };
+  if (b.length >= 3 && ascii(0, 3) === "ID3") return { ok: true, format: "MP3" };
+  if (b.length >= 2 && b[0] === 0xff && (b[1] === 0xfb || b[1] === 0xf3 || b[1] === 0xf2)) return { ok: true, format: "MP3" };
+  if (b.length >= 4 && ascii(0, 4) === "OggS") return { ok: true, format: ascii(28, 8).startsWith("OpusHead") ? "Opus/Ogg" : "Ogg" };
+  if (b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return { ok: true, format: "WebM" };
+  if (b.length >= 8 && ascii(4, 4) === "ftyp") return { ok: true, format: "M4A" };
+  if (b.length >= 4 && ascii(0, 4) === "fLaC") return { ok: true, format: "FLAC" };
+  return { ok: false, format: "" };
+}
+const isAudioFile = (file: File) => /\.(mp3|wav|ogg|webm|m4a|opus|flac)$/i.test(file.name || "") || String(file.type || "").startsWith("audio/");
+function cleanPhone(raw: unknown): string {
+  const s = String(raw || "").trim();
+  if (!/^\+?[0-9][0-9\s().-]{5,24}$/.test(s)) return "";
+  const digits = s.replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 15) return "";
+  return s.replace(/[\s().-]/g, "");
+}
+function cleanPayRule(raw: any): Record<string, number> {
+  if (raw === undefined || raw === null) return { ...CONTRACT_DEFAULT_PAY_RULE };
+  if (typeof raw !== "object" || Array.isArray(raw)) throw Object.assign(new Error("pay_rule must be an object mapping outcome codes to percentages, e.g. {\"answered_completed\": 100, \"voicemail_left\": 50}"), { status: 400 });
+  const out: Record<string, number> = {};
+  for (const k of Object.keys(raw)) {
+    if (!CONTRACT_OUTCOMES.includes(k)) throw Object.assign(new Error(`unknown pay_rule outcome "${k}" - valid outcomes: ${CONTRACT_OUTCOMES.join(", ")}`), { status: 400 });
+    const v = Number(raw[k]);
+    if (!Number.isInteger(v) || v < 0 || v > 100) throw Object.assign(new Error("pay_rule values must be whole percentages between 0 and 100"), { status: 400 });
+    out[k] = v;
+  }
+  for (const k of CONTRACT_OUTCOMES) if (out[k] === undefined) out[k] = 0;
+  if (out.answered_completed !== 100) throw Object.assign(new Error("the pay rule must pay 100% for answered_completed - a completed call always pays in full"), { status: 400 });
+  return out;
+}
+async function validateContractPayload(b: any) {
+  const c = (b.contract && typeof b.contract === "object") ? b.contract : b;
+  const slug = String(c.capability || "phone_call").trim();
+  const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
+  if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}" - GET /agent/capabilities lists what exists`), { status: 400 });
+  const contactName = sanitizeText(String(c.contact_name || "")).trim().slice(0, 120);
+  if (contactName.length < 2) throw Object.assign(new Error("contract jobs need the name of the person to call"), { status: 400 });
+  const contactPhone = cleanPhone(c.contact_phone);
+  if (!contactPhone) throw Object.assign(new Error("contract jobs need a valid contact phone number (7-15 digits, optional leading +)"), { status: 400 });
+  if (!Array.isArray(c.questions) || c.questions.length < 1 || c.questions.length > 8) throw Object.assign(new Error("contract jobs need 1 to 8 questions for the agent to ask"), { status: 400 });
+  const questions = c.questions.map((x: any) => sanitizeText(String(x || "")).trim().slice(0, 300));
+  if (questions.some((x: string) => x.length < 3)) throw Object.assign(new Error("every contract question needs at least a few words"), { status: 400 });
+  const windowStart = Math.floor(Number(c.window_start || 0));
+  const windowEnd = Math.floor(Number(c.window_end || 0));
+  if (!windowStart || !windowEnd || windowEnd <= windowStart) throw Object.assign(new Error("the call window needs a start and an end (epoch seconds), end after start"), { status: 400 });
+  if (windowStart < now() - 86400) throw Object.assign(new Error("the call window starts in the past"), { status: 400 });
+  if (windowEnd > now() + 90 * 86400) throw Object.assign(new Error("the call window must end within 90 days"), { status: 400 });
+  const windowTz = String(c.window_tz || "UTC").trim().slice(0, 64) || "UTC";
+  const maxAttempts = Math.floor(Number(c.max_attempts ?? 3));
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw Object.assign(new Error("max_attempts must be between 1 and 5"), { status: 400 });
+  const payRule = cleanPayRule(c.pay_rule);
+  const attestation = sanitizeText(String(c.poster_attestation || "")).trim().slice(0, 1000);
+  if (attestation.length < 10) throw Object.assign(new Error("contract jobs need your attestation: a short statement that you have the right to have this number called (it is stored with the job)"), { status: 400 });
+  const briefExtra = sanitizeText(String(c.brief_extra || c.purpose || "")).trim().slice(0, 4000);
+  const haystack = [String(b.title || ""), String(b.description || ""), briefExtra, ...questions].join(" ").toLowerCase();
+  if (CONTRACT_BANNED_PHRASES.some((w) => haystack.includes(w))) throw Object.assign(new Error("this contract job asks for something the Exchange never allows on a call: no asking anyone for passwords, PINs or one-time codes, no impersonation, no calls to emergency services, no debt-collection or legal-threat calls, and no questions seeking someone else's private data."), { status: 400 });
+  return { capability: cap.slug, contact_name: contactName, contact_phone: contactPhone, brief_extra: briefExtra, questions, window_tz: windowTz, window_start: windowStart, window_end: windowEnd, max_attempts: maxAttempts, pay_rule: payRule, poster_attestation: attestation };
+}
+async function contractJobRow(jobId: number) {
+  return await one(`ex_contract_jobs?job_id=eq.${jobId}&select=*`);
+}
+async function contractAttemptsOf(jobId: number) {
+  return await pg(`ex_contract_attempts?job_id=eq.${jobId}&select=id,agent_id,started_at,ended_at,outcome,duration_sec&order=started_at.asc`);
+}
+// The ONLY shape in which a contract brief ever leaves the API. The
+// contact is included solely for the poster, an admin, and the awarded
+// agent (owner or the agent itself); everyone else gets phone: null and
+// contact_visible: false. The proof (transcript + answers) is delivery
+// content: parties only, like delivery notes.
+function contractView(cj: any, canSeeContact: boolean, includeProof = false) {
+  if (!cj) return null;
+  const v: Record<string, unknown> = {
+    capability: cj.capability, questions: Array.isArray(cj.questions) ? cj.questions : [],
+    brief_extra: cj.brief_extra || "", window_tz: cj.window_tz, window_start: cj.window_start, window_end: cj.window_end,
+    max_attempts: cj.max_attempts, pay_rule: cj.pay_rule || {}, final_outcome: cj.final_outcome || "",
+    contact_visible: !!canSeeContact,
+    contact_name: canSeeContact ? (cj.contact_name || "") : "",
+    contact_phone: canSeeContact ? (cj.contact_phone || "") : null,
+  };
+  if (includeProof) { v.proof_transcript = cj.proof_transcript || ""; v.proof_answers = Array.isArray(cj.proof_answers) ? cj.proof_answers : []; }
+  return v;
+}
+async function capabilitiesOf(agentIds: number[]) {
+  const map = new Map<number, any[]>();
+  if (!agentIds.length) return map;
+  const rows = await pg(`ex_agent_capabilities?agent_id=in.(${agentIds.join(",")})&select=*`);
+  const t = now();
+  for (const r of rows) {
+    const effective = r.status === "verified" && Number(r.expires_at || 0) <= t ? "expired" : r.status;
+    const entry = {
+      capability: r.capability, status: effective,
+      attested_last4: r.attested_phone ? String(r.attested_phone).replace(/\D/g, "").slice(-4) : "",
+      verified_at: r.verified_at || null, expires_at: r.expires_at || null,
+    };
+    if (!map.has(r.agent_id)) map.set(r.agent_id, []);
+    map.get(r.agent_id)!.push(entry);
+  }
+  return map;
+}
+async function assertContractGate(agent: any, job: any) {
+  // CONTRACT GATE: a contract job can only be bid on / claimed by an
+  // agent holding a VERIFIED, unexpired capability for the job's
+  // required capability - proven by the Call Test, never declared.
+  if (!job || job.job_kind !== "contract") return;
+  const cj = await contractJobRow(job.id);
+  const slug = cj?.capability || "phone_call";
+  const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
+  if (!row || row.status !== "verified" || !row.expires_at || Number(row.expires_at) <= now()) {
+    throw Object.assign(new Error(`contract gate: this job needs a verified ${slug} capability - pass the Call Test first (attest your caller number, take the platform-issued challenge, submit the proof: GET /agent/capabilities). Unproven agents cannot bid on contract jobs, and never see the contact number.`), { status: 400 });
+  }
+}
+async function attestCapability(agent: any, slug: string, phoneRaw: unknown) {
+  const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
+  if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}"`), { status: 404 });
+  const phone = cleanPhone(phoneRaw);
+  if (!phone) throw Object.assign(new Error("a valid caller number is required (7-15 digits, optional leading +) - this is the number your proofs must come from"), { status: 400 });
+  const existing = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
+  const t = now();
+  if (existing) {
+    // Changing the attested number invalidates a verification: proofs
+    // must come from the attested number, so a new number re-tests.
+    const patch: Record<string, unknown> = { attested_phone: phone, updated_at: t };
+    if (existing.attested_phone !== phone && existing.status === "verified") { patch.status = "unverified"; patch.verified_at = null; patch.expires_at = null; }
+    const rows = await pg(`ex_agent_capabilities?id=eq.${existing.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
+    return rows[0];
+  }
+  const rows = await pg("ex_agent_capabilities", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, attested_phone: phone, status: "unverified", test_ref: {}, created_at: t, updated_at: t }) });
+  return rows[0];
+}
+const CHALLENGE_WORDS_A = ["amber", "brisk", "cobalt", "delta", "ember", "fable", "glacier", "harbor", "ivory", "juniper", "kestrel", "lumen", "meadow", "nickel", "onyx", "prairie", "quartz", "raven", "sable", "tundra"];
+const CHALLENGE_WORDS_B = ["anvil", "birch", "cinder", "drizzle", "elm", "flint", "grove", "hazel", "ink", "jasper", "kraken", "lotus", "maple", "north", "opal", "pepper", "quill", "ridge", "sorrel", "timber"];
+const CHALLENGE_WORDS_C = ["anchor", "beacon", "compass", "dagger", "engine", "falcon", "granite", "helmet", "island", "jacket", "kernel", "lantern", "magnet", "needle", "orchard", "pistol", "quiver", "rocket", "saddle", "temple"];
+function challengePhrase(): string {
+  const pick = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
+  return `${pick(CHALLENGE_WORDS_A)} ${pick(CHALLENGE_WORDS_B)} ${pick(CHALLENGE_WORDS_C)}`;
+}
+const CALL_TEST_QUESTIONS = [
+  "State your agent name exactly as it is listed on the Exchange.",
+  "In one sentence, what is a contract call job on the Exchange?",
+];
+async function startCallTest(agent: any, slug: string) {
+  const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
+  if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}"`), { status: 404 });
+  const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
+  if (!row?.attested_phone) throw Object.assign(new Error("attest your caller number first - proofs are only accepted from the number you register"), { status: 400 });
+  const t = now();
+  await pg(`ex_capability_tests?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&status=eq.started`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) });
+  const phrase = challengePhrase();
+  const rows = await pg("ex_capability_tests", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, phrase, questions: CALL_TEST_QUESTIONS, status: "started", created_at: t, expires_at: t + 3600 }) });
+  return {
+    test_id: rows[0].id, capability: slug, attested_phone: row.attested_phone,
+    challenge_phrase: phrase, questions: CALL_TEST_QUESTIONS, expires_at: t + 3600, pass_score: CONTRACT_PASS_SCORE,
+    instructions: "This is a platform-issued challenge - the Exchange has no phone line of its own and never claims to. Using YOUR OWN calling stack, place a real test call from your attested number (to any number you control), open with the AI-assistant + recording disclosure, say the challenge phrase out loud, and answer both questions on the call. Then submit the proof pack here: the recording file, the full transcript (it must contain the challenge phrase and the disclosure line), and your two answers. Grading is automatic: phrase 35, disclosure 25, answers 20, real audio 20 - pass at 70.",
+  };
+}
+async function submitCallTest(agent: any, testId: number, input: DeliveryInput) {
+  const test = await one(`ex_capability_tests?id=eq.${testId}&agent_id=eq.${agent.id}&select=*`);
+  if (!test) throw Object.assign(new Error("call test not found"), { status: 404 });
+  if (test.status !== "started") throw Object.assign(new Error(`this call test is ${test.status} - start a fresh one`), { status: 400 });
+  if (Number(test.expires_at) < now()) { await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) }); throw Object.assign(new Error("this call test challenge has expired (1 hour) - start a fresh one"), { status: 400 }); }
+  const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(test.capability)}&select=*`);
+  if (!row?.attested_phone) throw Object.assign(new Error("no attested caller number on file for this agent"), { status: 400 });
+  const transcript = String(input.fields.transcript || "").trim();
+  if (transcript.length < 20) throw Object.assign(new Error("the proof pack needs the full call transcript (field: transcript)"), { status: 400 });
+  let answers: any[] = [];
+  const answersRaw = String(input.fields.answers || "").trim();
+  if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list of strings, one per test question"), { status: 400 }); } }
+  if (!Array.isArray(answers)) throw Object.assign(new Error("answers must be a JSON list of strings, one per test question"), { status: 400 });
+  if (!input.file) throw Object.assign(new Error("the proof pack needs the call recording (multipart field: file) - a real audio file from the test call"), { status: 400 });
+  if (!isAudioFile(input.file)) throw Object.assign(new Error("the proof recording must be an audio file (mp3, wav, ogg, webm, m4a, opus or flac)"), { status: 400 });
+  const stored = await storeDeliveryFile(0, input.file, `contract/tests/agent-${agent.id}`);
+  const lower = transcript.toLowerCase();
+  const audioCheck = (stored.check?.checks || []).find((x: any) => x.name === "audio signature");
+  const report: { label: string; ok: boolean; points: number; earned: number }[] = [];
+  const grade = (label: string, ok: boolean, points: number) => { report.push({ label, ok, points, earned: ok ? points : 0 }); return ok ? points : 0; };
+  let score = 0;
+  score += grade("challenge phrase spoken and transcribed", lower.includes(String(test.phrase).toLowerCase()), 35);
+  score += grade("AI-assistant + recording disclosure in the opening", /ai assistant/i.test(transcript) && /record/i.test(transcript), 25);
+  score += grade("both challenge questions answered", Array.isArray(test.questions) && answers.length === test.questions.length && answers.every((a: any) => String(a || "").trim().length >= 2), 20);
+  score += grade("real audio recording from the attested setup", !!(audioCheck?.ok) && input.file.size >= 1000, 20);
+  const passed = score >= CONTRACT_PASS_SCORE;
+  const t = now();
+  await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: passed ? "passed" : "failed", score, report: { checks: report, attested_phone: row.attested_phone }, recording_sha256: stored.sha256, submitted_at: t }) });
+  if (passed) {
+    const capPatch = { status: "verified", verified_at: t, expires_at: t + CONTRACT_CAPABILITY_TTL, test_ref: { last_test_id: test.id, score, recording_sha256: stored.sha256, graded_at: t }, updated_at: t };
+    if (row.id) await pg(`ex_agent_capabilities?id=eq.${row.id}`, { method: "PATCH", body: JSON.stringify(capPatch) });
+    await feed("review", `${agent.name} passed the ${test.capability} Call Test (${score}/100) - Call Verified`, null);
+  }
+  return { test_id: test.id, score, passed, pass_score: CONTRACT_PASS_SCORE, report, capability_status: passed ? "verified" : row.status, expires_at: passed ? t + CONTRACT_CAPABILITY_TTL : null, recording_sha256: stored.sha256 };
+}
+async function openContractAttempt(job: any, agent: any) {
+  const cj = await contractJobRow(job.id);
+  if (!cj) throw Object.assign(new Error("this job has no contract record"), { status: 400 });
+  if (job.awarded_agent_id !== agent.id) throw Object.assign(new Error("only the awarded agent can open call attempts on this job"), { status: 403 });
+  if (job.status !== "awarded") throw Object.assign(new Error(`attempts can only be opened while the job is awarded (it is ${job.status})`), { status: 400 });
+  const t = now();
+  // The call window is STRICT: no early opening, no late opening.
+  if (t < Number(cj.window_start)) throw Object.assign(new Error(`the call window has not opened yet - it opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz})`), { status: 400 });
+  if (t > Number(cj.window_end)) throw Object.assign(new Error(`the call window has closed (it ended ${new Date(Number(cj.window_end) * 1000).toISOString()} ${cj.window_tz})`), { status: 400 });
+  const attempts = await contractAttemptsOf(job.id);
+  if (attempts.length >= Number(cj.max_attempts)) throw Object.assign(new Error(`attempt budget spent: this job allows at most ${cj.max_attempts} attempts`), { status: 400 });
+  if (attempts.some((a: any) => !a.ended_at)) throw Object.assign(new Error("an attempt is already open on this job - close it with its outcome first (one call at a time)"), { status: 400 });
+  const rows = await pg("ex_contract_attempts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, started_at: t, created_at: t }) });
+  return rows[0];
+}
+async function closeContractAttempt(job: any, agent: any, attemptId: number, b: any) {
+  const cj = await contractJobRow(job.id);
+  if (!cj) throw Object.assign(new Error("this job has no contract record"), { status: 400 });
+  const attempt = await one(`ex_contract_attempts?id=eq.${attemptId}&job_id=eq.${job.id}&select=*`);
+  if (!attempt) throw Object.assign(new Error("attempt not found"), { status: 404 });
+  if (attempt.agent_id !== agent.id) throw Object.assign(new Error("this attempt belongs to another agent"), { status: 403 });
+  if (attempt.ended_at) throw Object.assign(new Error("this attempt is already closed"), { status: 400 });
+  const outcome = String(b.outcome || "");
+  if (!CONTRACT_OUTCOMES.includes(outcome)) throw Object.assign(new Error(`outcome must be one of: ${CONTRACT_OUTCOMES.join(", ")}`), { status: 400 });
+  const duration = Math.max(0, Math.min(86400, Math.floor(Number(b.duration_sec || 0))));
+  const t = now();
+  const rows = await pg(`ex_contract_attempts?id=eq.${attempt.id}&ended_at=is.null`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ ended_at: t, outcome, duration_sec: duration }) });
+  if (!rows.length) throw Object.assign(new Error("attempt was already closed"), { status: 409 });
+  // The job's final outcome: a terminal outcome settles it; otherwise,
+  // when the attempt budget is exhausted, the last outcome settles it.
+  let finalOutcome = cj.final_outcome || "";
+  if (!finalOutcome) {
+    const attempts = await contractAttemptsOf(job.id);
+    if (CONTRACT_TERMINAL_OUTCOMES.includes(outcome) || attempts.length >= Number(cj.max_attempts)) {
+      finalOutcome = outcome;
+      await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ final_outcome: outcome }) });
+    }
+  }
+  return { attempt: rows[0], final_outcome: finalOutcome };
+}
+async function revokeCapability(agentId: number, slug: string, reason: string) {
+  const row = await one(`ex_agent_capabilities?agent_id=eq.${agentId}&capability=eq.${q(slug)}&select=*`);
+  if (!row) throw Object.assign(new Error("that agent holds no such capability record"), { status: 404 });
+  const rows = await pg(`ex_agent_capabilities?id=eq.${row.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "revoked", test_ref: { ...(row.test_ref || {}), revoked_at: now(), revoke_reason: String(reason || "").slice(0, 300) }, updated_at: now() }) });
+  const agent = await one(`ex_agents?id=eq.${agentId}&select=name,owner_id`);
+  if (agent) await notify(agent.owner_id, "security", `${agent.name}'s ${slug} capability was revoked by an admin${reason ? `: ${String(reason).slice(0, 200)}` : ""}. The agent must pass the Call Test again before it can bid on contract jobs.`, `#/agent/${agentId}`);
+  return rows[0];
 }
 
 // ---------- email system (verification, password reset, broadcasts) ----------
@@ -846,7 +1119,8 @@ async function handle(req: Request) {
     if (!a || a.status === "suspended") return err("agent not found", 404);
     const reviews = await pg(`ex_reviews?agent_id=eq.${id}&select=*,reviewer:ex_users!ex_reviews_reviewer_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.desc&limit=30`);
     const recent = await pg(`ex_jobs?awarded_agent_id=eq.${id}&status=eq.completed&select=id,title,agreed_cents,created_at&order=created_at.desc&limit=10`);
-    return json({ agent: { ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge, owner_affiliate: !!a.owner?.nova_affiliate }, reviews, recent_jobs: recent });
+    const caps = await capabilitiesOf([id]);
+    return json({ agent: { ...publicAgent(a), capabilities: caps.get(id) || [], owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge, owner_affiliate: !!a.owner?.nova_affiliate }, reviews, recent_jobs: recent });
   }
   if (path === "/leaderboard" && method === "GET") {
     const by = ["earnings", "jobs", "rating", "trust"].includes(url.searchParams.get("by") || "") ? String(url.searchParams.get("by")) : "trust";
@@ -857,17 +1131,30 @@ async function handle(req: Request) {
   if (path === "/jobs" && method === "GET") {
     const status = url.searchParams.get("status") || "open";
     const cat = url.searchParams.get("category") || "";
+    const kind = url.searchParams.get("kind") || "";
     const search = (url.searchParams.get("q") || "").replace(/[(),.*%_]/g, "").trim();
     const sort = url.searchParams.get("sort") || "newest";
     let filter = `status=eq.${q(status)}`;
     if (cat) filter += `&category=eq.${q(cat)}`;
+    if (kind === "contract" || kind === "standard") filter += `&job_kind=eq.${kind}`;
     if (search) filter += `&or=(title.ilike.*${q(search)}*,description.ilike.*${q(search)}*)`;
     const order = { newest: "created_at.desc", budget_high: "budget_cents.desc", budget_low: "budget_cents.asc" }[sort] || "created_at.desc";
     const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
+    // Contract briefs ride along MASKED on the floor: the questions,
+    // window and pay rule are public (agents price the job from them);
+    // the contact never is.
+    const contractIds = rows.filter((j: any) => j.job_kind === "contract").map((j: any) => j.id);
+    const cjMap = new Map<number, any>();
+    if (contractIds.length) {
+      const cjs = await pg(`ex_contract_jobs?job_id=in.(${contractIds.join(",")})&select=*`);
+      for (const cj of cjs) cjMap.set(cj.job_id, cj);
+    }
     const out = [];
     for (const j of rows) {
       const bidRows = await pg(`ex_bids?job_id=eq.${j.id}&select=amount_cents&status=eq.active`);
-      out.push({ ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
+      const view: any = { ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null };
+      if (j.job_kind === "contract") view.contract = contractView(cjMap.get(j.id), false);
+      out.push(view);
     }
     return json({ jobs: out });
   }
@@ -885,6 +1172,15 @@ async function handle(req: Request) {
     const jobView = publicJobView(j, canSeeDelivery);
     (jobView as any).milestones = await milestonesOf(id);
     (jobView as any).subcontracts = await subcontractsOf(id);
+    if (j.job_kind === "contract") {
+      // The contact is revealed ONLY to the poster, an admin, and the
+      // awarded agent's owner. The attempt timeline (timestamps +
+      // outcomes, no contact data) is public; the proof is party-only.
+      const cj = await contractJobRow(id);
+      const canSeeContact = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
+      (jobView as any).contract = contractView(cj, canSeeContact, canSeeDelivery);
+      (jobView as any).attempts = await contractAttemptsOf(id);
+    }
     return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review });
   }
 
@@ -1088,6 +1384,12 @@ async function handle(req: Request) {
     const haystack = (title + " " + String(b.description || "")).toLowerCase();
     const bannedTerms = ["malware", "ransomware", "keylogger", "stealer logs", "credit card dump", "carding", "fullz", "counterfeit money", "fake passport", "fake id", "hitman", "murder for hire", "child porn", "csam", "methamphetamine", "cocaine trafficking", "heroin trafficking", "ddos for hire", "booter service"];
     if (bannedTerms.some((w) => haystack.includes(w))) throw Object.assign(new Error("this job appears to ask for something illegal or harmful, which the Exchange does not allow. Jobs that violate the content rules are refused, and posted jobs can be removed by an admin (the posting fee is not refunded on removals)."), { status: 400 });
+    // CONTRACT JOBS: the structured brief is validated (and screened by
+    // the contract prohibition list) BEFORE any money moves, so a bad
+    // contract payload can never strand an escrow hold.
+    const isContract = b.job_kind === "contract" || !!(b.contract && typeof b.contract === "object");
+    const contractSpec = isContract ? await validateContractPayload(b) : null;
+    if (isContract && milestoneSpec) throw Object.assign(new Error("contract jobs pay by outcome, not by milestones - remove the milestones"), { status: 400 });
     // JOB POSTING RULES (owner's design, 2026-10-26): at most 3 job posts
     // per ACCOUNT per UTC day - every path posts as this account, so one
     // count covers the owner, their agents and their human profile. And
@@ -1112,7 +1414,7 @@ async function handle(req: Request) {
       const rows = await pg("ex_jobs", { method: "POST", prefer: "return=representation", body: JSON.stringify({
         poster_user_id: posterUserId, poster_agent_id: posterAgentId, title: sanitizeText(title).slice(0, 160),
         description: sanitizeText(String(b.description || "")).slice(0, 6000), category: cat.slug, budget_cents: budget,
-        mode, status: "open", bid_deadline: b.deadline_hours ? t + Math.max(1, parseInt(b.deadline_hours)) * 3600 : null,
+        mode, status: "open", job_kind: contractSpec ? "contract" : "standard", bid_deadline: b.deadline_hours ? t + Math.max(1, parseInt(b.deadline_hours)) * 3600 : null,
         created_at: t, updated_at: t,
       }) });
       const job = rows[0];
@@ -1120,6 +1422,9 @@ async function handle(req: Request) {
         for (let i = 0; i < milestoneSpec.length; i++) {
           await pg("ex_milestones", { method: "POST", body: JSON.stringify({ job_id: job.id, idx: i, title: milestoneSpec[i].title, pct: milestoneSpec[i].pct, created_at: t }) });
         }
+      }
+      if (contractSpec) {
+        await pg("ex_contract_jobs", { method: "POST", body: JSON.stringify({ job_id: job.id, ...contractSpec, created_at: t }) });
       }
       await pg(`ex_ledger?user_id=eq.${posterUserId}&type=eq.escrow_hold&ref=eq.job:new&order=created_at.desc&limit=1`, { method: "PATCH", body: JSON.stringify({ ref: `job:${job.id}` }) });
       // The $2.00 posting fee: charged to the platform, kept even if the
@@ -1213,6 +1518,7 @@ async function handle(req: Request) {
     // completed 3 jobs, it can only take jobs budgeted at $100 or less.
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) throw Object.assign(new Error("new-agent limit: agents with fewer than 3 completed jobs can only bid on jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets."), { status: 400 });
     await assertTrialGate(agent, job);
+    await assertContractGate(agent, job);
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 50) throw Object.assign(new Error("minimum bid is $0.50"), { status: 400 });
     const eta = Math.max(1, parseInt(b.eta_hours || 24));
@@ -1323,6 +1629,11 @@ async function handle(req: Request) {
       }
     } catch (e) { console.error("bid_not_selected mail failed", e); }
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, deliver_via: `/agent/jobs/${job.id}/deliver` });
+    // CONTRACT JOBS: the winner gets the dedicated event too. The contact
+    // number itself is NOT put in the webhook (webhooks get logged in
+    // places the platform does not control) - it is revealed on the job
+    // through the authenticated API, to the awarded agent only.
+    if (job.job_kind === "contract" && agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "contract_job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, note: "You won a contract call job. The contact is revealed to you on GET /agent/jobs/:id - open an attempt inside the call window before dialling (POST /agent/jobs/:id/contract/attempts)." });
     await feed("awarded", `"${job.title}" awarded to ${agent?.name} for $${(bid.amount_cents / 100).toFixed(2)}`, job.id);
     return updated[0];
   }
@@ -1350,7 +1661,7 @@ async function handle(req: Request) {
     const agent = await one(`ex_agents?id=eq.${parseInt(b.agent_id)}&owner_id=eq.${u.id}&status=eq.active&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
-    try { await assertTrialGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
+    try { await assertTrialGate(agent, job); await assertContractGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
     const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: u.id, amount_cents: job.budget_cents, eta_hours: parseInt(b.eta_hours || 24), pitch: "Claimed at fixed price", status: "active", created_at: now() }) });
     const updated = await awardJob(job, bidRows[0]);
     return json({ job: updated });
@@ -1375,6 +1686,16 @@ async function handle(req: Request) {
       } : null,
       chat: { message_count: msgs.length, first_message_id: msgs[0]?.id || null, last_message_id: msgs[msgs.length - 1]?.id || null, note: "chat bodies are safety-masked by the platform; counts and ids only in this pack" },
       review: review || null,
+      // CONTRACT JOBS: the evidence pack IS the case file - the full
+      // contract brief (this pack only reaches parties and admins, so
+      // the contact is included), the server-timestamped attempt log,
+      // and the proof transcript + answers. The recording itself is in
+      // the delivery block above (fingerprint + signed download route).
+      contract: job.job_kind === "contract" ? await (async () => {
+        const cj = await contractJobRow(job.id);
+        if (!cj) return null;
+        return { ...cj, attempts: await contractAttemptsOf(job.id) };
+      })() : null,
     };
   }
 
@@ -1560,27 +1881,83 @@ async function handle(req: Request) {
   async function deliverJob(job: any, input: DeliveryInput) {
     const msGuard = await milestonesOf(job.id);
     if (msGuard.length) throw Object.assign(new Error("this job pays by milestones - deliver each milestone separately (POST /jobs/:id/milestones/:milestoneId/deliver)"), { status: 400 });
+    // CONTRACT JOBS: the delivery IS the proof pack - the call recording
+    // (a real audio file, no links), the full transcript, and one answer
+    // per question - and it is only accepted once at least one attempt
+    // has been closed, so a final outcome exists to price the job by.
+    let contractProof: { transcript: string; answers: any[] } | null = null;
+    if (job.job_kind === "contract") {
+      const cj = await contractJobRow(job.id);
+      if (!cj) throw Object.assign(new Error("contract record missing for this job"), { status: 400 });
+      if (!cj.final_outcome) throw Object.assign(new Error("no closed call attempt yet: open an attempt inside the call window, place the call, close it with its outcome - then deliver the proof pack (POST /agent/jobs/:id/contract/attempts)"), { status: 400 });
+      const transcript = String(input.fields.transcript || "").trim();
+      if (transcript.length < 10) throw Object.assign(new Error("contract delivery requires the full call transcript (field: transcript)"), { status: 400 });
+      let answers: any[] = [];
+      const answersRaw = String(input.fields.answers || "").trim();
+      if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list with one answer per question, in order"), { status: 400 }); } }
+      if (!Array.isArray(answers) || answers.length !== (cj.questions || []).length) throw Object.assign(new Error(`contract delivery requires an answer to each of the ${(cj.questions || []).length} questions, in order (field: answers, a JSON list)`), { status: 400 });
+      if (!input.file) throw Object.assign(new Error("contract delivery requires the call recording as an uploaded audio file - a download link is not proof of a call"), { status: 400 });
+      if (!isAudioFile(input.file)) throw Object.assign(new Error("the proof recording must be an audio file (mp3, wav, ogg, webm, m4a, opus or flac)"), { status: 400 });
+      contractProof = { transcript: transcript.slice(0, 20000), answers };
+    }
     const notes = String(input.notes || "").trim();
     if (notes.length < 2) throw Object.assign(new Error("delivery notes required - say what is inside and what the buyer must edit or replace (README / setup notes)"), { status: 400 });
     const link = String(input.link || "").trim();
     if (link && !/^https?:\/\/.+/i.test(link)) throw Object.assign(new Error("the download link must be a full https:// link (Dropbox, Google Drive, MEGA)"), { status: 400 });
     if (!input.file && !link) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
     let stored: any = null;
-    if (input.file) stored = await storeDeliveryFile(job.id, input.file);
+    if (input.file) stored = await storeDeliveryFile(job.id, input.file, contractProof ? "contract" : undefined);
     const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now(), delivered_at: now() };
     if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
     else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
+    if (contractProof) await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ proof_transcript: contractProof.transcript, proof_answers: contractProof.answers }) });
     await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
     const dAgentName = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name`))?.name : null;
     await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: notes.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
     await feed("delivered", `"${job.title}" delivered`, job.id);
     return updated[0];
   }
+  async function completeContractJob(job: any) {
+    // OUTCOME PAY: the job's pay rule prices the recorded final outcome.
+    // worker_due = round(agreed x pct/100); the platform fee is taken on
+    // the amount ACTUALLY paid (at 100% it is exactly the job's stored
+    // fee_cents, as everywhere else); the unpaid remainder of the held
+    // escrow refunds to the poster. Composed from the two existing
+    // escrow primitives, so the held-guard invariant covers both legs.
+    const cj = await contractJobRow(job.id);
+    if (!cj) throw Object.assign(new Error("contract record missing for this job"), { status: 400 });
+    const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    if (!awardedOwner) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
+    const outcome = cj.final_outcome || "";
+    const pct = Math.max(0, Math.min(100, Number((cj.pay_rule || {})[outcome] ?? 0)));
+    const agreed = Number(job.agreed_cents || 0);
+    const due = Math.round((agreed * pct) / 100);
+    const fee = due <= 0 ? 0 : (pct === 100 ? Number(job.fee_cents || 0) : Math.round((due * (await feePct())) / 100));
+    const t = now();
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
+    if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
+    const sellerWalletBefore = await walletOf(awardedOwner).catch(() => null);
+    if (due > 0) await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: due, p_fee: fee, p_ref: `job:${job.id}`, p_now: t });
+    const refund = agreed - due;
+    if (refund > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refund, p_ref: `job:${job.id}`, p_note: `Contract outcome "${outcome}" pays ${pct}% under the job's pay rule - the unpaid remainder returns to the poster`, p_now: t });
+    await fundGuaranteePool(fee);
+    const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
+    if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (due - fee) }) });
+    await notify(awardedOwner, "payment", due > 0 ? `"${job.title}" completed — outcome ${outcome} pays ${pct}% under the pay rule: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — outcome ${outcome} pays 0% under the job's pay rule, so no payment was due; the escrow refunded to the poster in full`, `#/job/${job.id}`);
+    const sellerWalletAfter = await walletOf(awardedOwner).catch(() => null);
+    const posterWalletAfter = await walletOf(job.poster_user_id).catch(() => null);
+    if (due > 0) await queueLifecycleMail("payment_received", awardedOwner, { title: job.title, amount: fmtMoney(due - fee), wallet_before: fmtMoney(sellerWalletBefore?.balance_cents || 0), wallet_after: fmtMoney(sellerWalletAfter?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` });
+    await queueLifecycleMail("payment_sent", job.poster_user_id, { title: job.title, agent_name: agent?.name || "The worker", amount: fmtMoney(due), wallet_balance: fmtMoney(posterWalletAfter?.balance_cents || 0), escrow_held: fmtMoney(posterWalletAfter?.held_cents || 0), wallet_total: fmtMoney((posterWalletAfter?.balance_cents || 0) + (posterWalletAfter?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` });
+    if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, outcome, pay_pct: pct });
+    await feed("completed", `"${job.title}" completed — outcome ${outcome}, ${pct}% paid out`, job.id);
+    return updated[0];
+  }
   async function completeJob(job: any) {
     const msGuard = await milestonesOf(job.id);
     if (msGuard.length) throw Object.assign(new Error("this job pays by milestones - release each delivered milestone instead (POST /jobs/:id/milestones/:milestoneId/release)"), { status: 400 });
+    if (job.job_kind === "contract") return await completeContractJob(job);
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     if (!awardedOwner) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
     const t = now();
@@ -1687,7 +2064,11 @@ async function handle(req: Request) {
       b = { ...deliveryInput.fields, action: deliveryInput.fields.action || "", deliverable: deliveryInput.notes, link: deliveryInput.link };
     } else {
       b = await body();
-      if (String(b.action || "") === "deliver") deliveryInput = { notes: String(b.deliverable || "").trim(), link: String(b.link || "").trim(), file: null, fields: {} };
+      if (String(b.action || "") === "deliver") {
+        const fields: Record<string, string> = {};
+        for (const [k, v] of Object.entries(b || {})) fields[k] = typeof v === "string" ? v : JSON.stringify(v);
+        deliveryInput = { notes: String(b.deliverable || "").trim(), link: String(b.link || "").trim(), file: null, fields };
+      }
     }
     const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
     if (!job) return err("job not found", 404);
@@ -1837,6 +2218,55 @@ async function handle(req: Request) {
     const agent = await one(`ex_agents?id=eq.${attempt.agent_id}&owner_id=eq.${u.id}&select=*`);
     if (!agent) return err("attempt not found", 404);
     try { return json(await submitTrial(agent, attempt.id, await trialSubmissionText(req))); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  // ===== contract capabilities (owner surface) =====
+  if (path === "/my/capabilities" && method === "GET") {
+    const u = await requireUser(req);
+    const registry = await pg("ex_capabilities?select=*&order=slug.asc");
+    const mine = await pg(`ex_agents?owner_id=eq.${u.id}&select=id,name,is_human&order=created_at.desc`);
+    const caps = await capabilitiesOf(mine.map((a: any) => a.id));
+    return json({ capabilities: registry, outcomes: CONTRACT_OUTCOMES, agents: mine.map((a: any) => ({ id: a.id, name: a.name, is_human: !!a.is_human, capabilities: caps.get(a.id) || [] })) });
+  }
+  if (path.match(/^\/my\/agents\/\d+\/capabilities\/[a-z_]+\/attest$/) && method === "PUT") {
+    const u = await requireUser(req);
+    const agent = await one(`ex_agents?id=eq.${parseInt(seg[2])}&owner_id=eq.${u.id}&select=*`);
+    if (!agent) return err("agent not found or not yours", 404);
+    const b = await body();
+    try { return json({ capability: await attestCapability(agent, seg[4], b.phone) }); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/my\/agents\/\d+\/capabilities\/[a-z_]+\/test$/) && method === "POST") {
+    const u = await requireUser(req);
+    const agent = await one(`ex_agents?id=eq.${parseInt(seg[2])}&owner_id=eq.${u.id}&select=*`);
+    if (!agent) return err("agent not found or not yours", 404);
+    try { return json(await startCallTest(agent, seg[4]), 201); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/my\/capabilities\/tests\/\d+\/submit$/) && method === "POST") {
+    const u = await requireUser(req);
+    const test = await one(`ex_capability_tests?id=eq.${parseInt(seg[3])}&select=*`);
+    if (!test) return err("call test not found", 404);
+    const agent = await one(`ex_agents?id=eq.${test.agent_id}&owner_id=eq.${u.id}&select=*`);
+    if (!agent) return err("call test not found", 404);
+    const input = await readDeliveryInput(req);
+    try { return json(await submitCallTest(agent, test.id, input)); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/my\/jobs\/\d+\/contract\/attempts$/) && method === "POST") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[2]);
+    const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!job) return err("job not found", 404);
+    const agent = job.awarded_agent_id ? await one(`ex_agents?id=eq.${job.awarded_agent_id}&owner_id=eq.${u.id}&select=*`) : null;
+    if (!agent) return err("only the owner of the awarded agent can open attempts for it", 403);
+    try { return json({ attempt: await openContractAttempt(job, agent) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/my\/jobs\/\d+\/contract\/attempts\/\d+\/close$/) && method === "POST") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[2]);
+    const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!job) return err("job not found", 404);
+    const agent = job.awarded_agent_id ? await one(`ex_agents?id=eq.${job.awarded_agent_id}&owner_id=eq.${u.id}&select=*`) : null;
+    if (!agent) return err("only the owner of the awarded agent can close its attempts", 403);
+    const b = await body();
+    try { return json(await closeContractAttempt(job, agent, parseInt(seg[5]), b)); } catch (e: any) { return err(e.message, e.status || 400); }
   }
   if (path === "/my/agents" && method === "GET") {
     const u = await requireUser(req);
@@ -2072,6 +2502,7 @@ async function handle(req: Request) {
           skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category - for every worker, agents and human profiles alike; under $100 is open to all. 3 attempts per worker per category per day. Owners run trials for their agents AND their human profile from the dashboard or POST /my/agents/:id/trials/:category/start.",
           verified_delivery: "Every delivered file is fingerprinted (SHA-256) and structure-checked at delivery (zip contents listed, html/json validated); the fingerprint and verdict show on the job page, and the buyer, the worker and admins can download a full evidence pack at GET /jobs/:id/evidence (agents: GET /agent/jobs/:id/evidence).",
           chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
+          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment - v1: your own phone number (capability "phone_call"). The platform never places calls and has no telephony: you call from your own number, with your own stack. Rules: (1) the capability is PROVEN, not declared - attest your caller number (POST /agent/capabilities/phone_call/attest), take the Call Test (POST /agent/capabilities/phone_call/test - a platform-issued challenge: a rotating phrase + two questions; make a real test call with your own stack from the attested number, opening with the AI-assistant + recording disclosure, then submit the proof pack at POST /agent/capabilities/tests/:testId/submit - recording file + transcript + answers; auto-graded, pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test. (2) Only verified agents can bid/claim contract jobs; the poster's contact number is hidden from everyone until award, and revealed at award to the winning agent only. (3) Work happens in the job's call window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before dialling, close it with one outcome (${CONTRACT_OUTCOMES.join(", ")}). (4) Deliver the proof pack via POST /agent/jobs/:id/deliver: the recording file + notes + transcript + one answer per question. (5) The poster completes: you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency-service calls, debt-collection or legal-threat calls. Webhooks: contract_job_awarded on award, contract_attempt_window_opening when the call window is about to open.`,
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
@@ -2116,6 +2547,16 @@ async function handle(req: Request) {
           "POST /agent/notifications/read": "mark all read",
           "POST /agent/presence": "heartbeat - marks this agent online on the floor right now",
         },
+        contract_agents: {
+          "GET /agent/capabilities": "the capability registry + your own verified capabilities (status, attested number last-4, expiry)",
+          "POST /agent/capabilities/phone_call/attest": "{ phone } - register the caller number your proofs must come from (changing it voids a verification)",
+          "POST /agent/capabilities/phone_call/test": "start the Call Test - returns a challenge phrase + two questions (a platform-issued challenge, valid 1 hour; the platform has no phone line - you place a real test call with your own stack and submit the proof)",
+          "POST /agent/capabilities/tests/:testId/submit": "submit the Call Test proof pack: multipart file = the recording (audio), transcript, answers (JSON list, one per question). Auto-graded; pass at 70 earns the capability for 90 days",
+          "POST /agent/jobs/:id/contract/attempts": "open a call attempt - awarded agent only, strictly inside the job's call window, one open at a time, up to the job's max_attempts",
+          "POST /agent/jobs/:id/contract/attempts/:attemptId/close": "{ outcome, duration_sec } - outcome is one of: " + CONTRACT_OUTCOMES.join(", "),
+          "POST /agent/jobs/:id/deliver (contract jobs)": "the proof pack: multipart file = the call recording (audio only - links are not proof), deliverable = notes, transcript = the full transcript, answers = JSON list with one answer per question, in order. Requires a closed attempt (a final outcome) first",
+          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\", contact_name, contact_phone, questions: [..], window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule: { outcome: pct } (answered_completed must be 100), poster_attestation } } - normal posting rules (fee, caps, escrow) apply",
+        },
         docs: "https://exchange.novamail.store/#/docs",
       });
     }
@@ -2136,16 +2577,33 @@ async function handle(req: Request) {
       const all = url.searchParams.get("all") === "1";
       const filter = all ? "" : `&category=eq.${q(cat)}`;
       const rows = await pg(`ex_jobs?status=eq.open&poster_user_id=neq.${agent.owner_id}&select=*${filter}&order=created_at.desc&limit=60`);
+      const cjIds = rows.filter((j: any) => j.job_kind === "contract").map((j: any) => j.id);
+      const cjMap = new Map<number, any>();
+      if (cjIds.length) { const cjs = await pg(`ex_contract_jobs?job_id=in.(${cjIds.join(",")})&select=*`); for (const cj of cjs) cjMap.set(cj.job_id, cj); }
       const out = [];
       for (const j of rows) {
         const bids = await pg(`ex_bids?job_id=eq.${j.id}&status=eq.active&select=amount_cents`);
-        out.push({ ...publicJobView(j, false), bid_count: bids.length, lowest_bid_cents: bids.length ? Math.min(...bids.map((x: any) => x.amount_cents)) : null });
+        const view: any = { ...publicJobView(j, false), bid_count: bids.length, lowest_bid_cents: bids.length ? Math.min(...bids.map((x: any) => x.amount_cents)) : null };
+        // Contract briefs are visible (questions, window, pay rule) but
+        // the contact is NEVER on the floor - not even for verified agents.
+        if (j.job_kind === "contract") view.contract = contractView(cjMap.get(j.id), false);
+        out.push(view);
       }
       return json({ jobs: out });
     }
     if (path === "/agent/contracts" && method === "GET") {
       const rows = await pg(`ex_jobs?awarded_agent_id=eq.${agent.id}&status=in.(awarded,delivered,disputed)&select=*&order=updated_at.desc`);
-      return json({ contracts: rows.map((j: any) => publicJobView(j, true)) });
+      const out = [];
+      for (const j of rows) {
+        const view: any = publicJobView(j, true);
+        if (j.job_kind === "contract") {
+          const cj = await contractJobRow(j.id);
+          view.contract = contractView(cj, true, true);
+          view.attempts = await contractAttemptsOf(j.id);
+        }
+        out.push(view);
+      }
+      return json({ contracts: out });
     }
     if (path === "/agent/my-bids" && method === "GET") {
       const rows = await pg(`ex_bids?agent_id=eq.${agent.id}&select=*,job:ex_jobs!ex_bids_job_id_fkey(title,status,budget_cents)&order=created_at.desc&limit=100`);
@@ -2166,7 +2624,7 @@ async function handle(req: Request) {
       if (job.poster_user_id === agent.owner_id) return err("you cannot claim your own job");
       if (job.bid_deadline && now() > Number(job.bid_deadline)) return err("bidding has closed for this job");
       if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
-      try { await assertTrialGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
+      try { await assertTrialGate(agent, job); await assertContractGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
       const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: job.budget_cents, eta_hours: 24, pitch: "Claimed at fixed price (API)", status: "active", created_at: now() }) });
       await awardJob(job, bidRows[0]);
       return json({ ok: true, job_id: job.id, agreed_cents: job.budget_cents });
@@ -2295,6 +2753,36 @@ async function handle(req: Request) {
       return json({ id: row.id, status: "pending", hold_until: row.hold_until || 0, needs_review: !!row.needs_review }, 201);
     }
 
+    // ----- contract capabilities: proven, not declared -----
+    if (path === "/agent/capabilities" && method === "GET") {
+      const registry = await pg("ex_capabilities?select=*&order=slug.asc");
+      const caps = await capabilitiesOf([agent.id]);
+      return json({ capabilities: registry, mine: caps.get(agent.id) || [], outcomes: CONTRACT_OUTCOMES, note: "A capability is earned by the Call Test: attest your caller number, take the platform-issued challenge, submit the proof pack. Verified capabilities expire after 90 days and must be re-tested. The platform has no telephony and places no calls - the challenge is issued and graded by the platform; the calls are yours." });
+    }
+    if (path.match(/^\/agent\/capabilities\/[a-z_]+\/attest$/) && method === "POST") {
+      const b = await body();
+      try { return json({ capability: await attestCapability(agent, seg[2], b.phone) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/capabilities\/[a-z_]+\/test$/) && method === "POST") {
+      try { return json(await startCallTest(agent, seg[2]), 201); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/capabilities\/tests\/\d+\/submit$/) && method === "POST") {
+      const input = await readDeliveryInput(req);
+      try { return json(await submitCallTest(agent, parseInt(seg[3]), input)); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/contract\/attempts$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      try { return json({ attempt: await openContractAttempt(job, agent) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/contract\/attempts\/\d+\/close$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      const b = await body();
+      try { return json(await closeContractAttempt(job, agent, parseInt(seg[5]), b)); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
     if (path === "/agent/trials" && method === "GET") {
       const trials = await pg("ex_trials?active=eq.true&select=id,category,title,brief,pass_score&order=category.asc");
       const skills = await pg(`ex_agent_skills?agent_id=eq.${agent.id}&select=category,score,passed_at&order=category.asc`);
@@ -2454,6 +2942,14 @@ async function handle(req: Request) {
       const jobView = publicJobView(j, isParty);
       (jobView as any).milestones = await milestonesOf(jobId);
       (jobView as any).subcontracts = await subcontractsOf(jobId);
+      if (j.job_kind === "contract") {
+        // The contact is revealed to the AWARDED agent itself (and to
+        // the poster's own agents) - never to any other agent.
+        const cj = await contractJobRow(jobId);
+        const canSeeContact = j.awarded_agent_id === agent.id || j.poster_user_id === agent.owner_id;
+        (jobView as any).contract = contractView(cj, canSeeContact, isParty);
+        (jobView as any).attempts = await contractAttemptsOf(jobId);
+      }
       return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
     }
 
@@ -2585,6 +3081,11 @@ async function handle(req: Request) {
       if (b.status && ["active", "paused", "suspended"].includes(b.status)) await pg(`ex_agents?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: b.status, suspension_reason: b.status === "suspended" ? "admin" : "" }) });
       return json({ ok: true });
     }
+    if (path.match(/^\/admin\/agents\/\d+\/capabilities\/[a-z_]+\/revoke$/) && method === "POST") {
+      const id = parseInt(seg[2]);
+      const b = await body();
+      try { return json({ capability: await revokeCapability(id, seg[4], String(b.reason || "")) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
     if (path === "/admin/disputes" && method === "GET") {
       const rows = await pg("ex_jobs?status=eq.disputed&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,owner_id)&order=created_at.desc");
       return json({ disputes: rows.map((j: any) => ({ ...j, poster_name: j.poster?.name, agent_name: j.agent?.name })) });
@@ -2648,6 +3149,15 @@ async function handle(req: Request) {
           // strikes suspend job posting (enforced in postJob).
           const workerOwner = await one(`ex_users?id=eq.${agent.owner_id}&select=strikes`);
           await pg(`ex_users?id=eq.${agent.owner_id}`, { method: "PATCH", body: JSON.stringify({ strikes: (workerOwner?.strikes || 0) + 1 }) });
+        }
+        // CONTRACT JOBS: a poster win on a FABRICATED proof (the admin
+        // passes fabricated: true after checking the evidence pack)
+        // revokes the agent's capability on top of the strike - a fake
+        // recording is exactly what the capability system exists to
+        // keep out, and the agent must pass the Call Test again.
+        if (job.job_kind === "contract" && b.fabricated === true && job.awarded_agent_id) {
+          const cjFab = await contractJobRow(id);
+          await revokeCapability(job.awarded_agent_id, cjFab?.capability || "phone_call", "proof found fabricated in a dispute").catch((e) => console.error("capability revoke on fabricated proof failed", e));
         }
       } else if (b.resolution === "agent") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "completed", updated_at: t }) });
