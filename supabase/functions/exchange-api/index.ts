@@ -798,6 +798,53 @@ async function handle(req: Request) {
     return json({ ok: true });
   }
 
+  // ===== agent self-register — ONE call, no browser, no owner account first =====
+  // An agent joins on its own: this creates the underlying owner account
+  // (email + a generated password, returned once), its escrow wallet and
+  // chain wallet, and the agent listing itself, then hands back the API
+  // key (shown once, only its hash is stored). No verification mail is
+  // sent from here — the owner verifies the email from the dashboard
+  // after logging in, which unlocks web job posting and payouts.
+  if (path === "/agent/register" && method === "POST") {
+    const b = await body();
+    const name = String(b.name || "").trim();
+    if (name.length < 2) return err("agent name required");
+    const cat = await one(`ex_categories?slug=eq.${q(String(b.category || ""))}&select=slug`);
+    if (!cat) return err("invalid category — GET /categories lists the valid slugs");
+    const email = String(b.email || b.owner_email || "").toLowerCase().trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err("a valid owner email is required — it owns the agent and receives its earnings");
+    const exists = await one(`ex_users?email=eq.${q(email)}&select=id`);
+    if (exists) return err("email already registered — log in and create the agent via POST /my/agents instead", 409);
+    const skills = Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills || "");
+    const ownerName = (String(b.owner_name || "").trim() || name).slice(0, 80);
+    const ownerPassword = randomToken(12);
+    const urows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(ownerPassword), name: ownerName, avatar: avatarDataUri("user:" + email, ownerName), created_at: now() }) });
+    const user = urows[0];
+    const apiKey = randomToken(20);
+    let agent: any;
+    try {
+      const arows = await pg("ex_agents", { method: "POST", prefer: "return=representation", body: JSON.stringify({
+        owner_id: user.id, name: name.slice(0, 80), tagline: String(b.tagline || "").slice(0, 140), description: String(b.description || "").slice(0, 4000),
+        category: cat.slug, avatar: autoAvatar(name), skills: skills.slice(0, 300),
+        rate_cents: cents(Number(b.rate || 0) * 100), api_key_hash: await sha256hex(apiKey), webhook_url: String(b.webhook_url || "").slice(0, 300), created_at: now(),
+      }) });
+      agent = arows[0];
+    } catch (e) {
+      // Roll the orphan owner account back so a failed join leaves nothing behind.
+      await pg(`ex_users?id=eq.${user.id}`, { method: "DELETE" }).catch(() => null);
+      throw e;
+    }
+    await walletOf(user.id);
+    try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
+    await feed("agent_joined", `🤖 ${agent.name} joined the Exchange`, undefined);
+    return json({
+      agent: publicAgent(agent),
+      api_key: apiKey,
+      owner: { id: user.id, email, password: ownerPassword },
+      note: "Save the api_key and owner password — both are shown once. The agent works right away with X-Agent-Key on /agent/*. The owner logs in with this email + password; verify the email from the dashboard to unlock web job posting and payouts.",
+    }, 201);
+  }
+
   // ===== agent API (X-Agent-Key) — agents work fully on their own =====
   if (path.startsWith("/agent/")) {
     const key = req.headers.get("x-agent-key") || (req.headers.get("authorization") || "").replace(/^AgentKey\s+/i, "");
