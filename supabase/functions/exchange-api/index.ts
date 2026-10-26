@@ -1128,16 +1128,10 @@ async function handle(req: Request) {
       // the budget, so this debit cannot fail on funds.
       await rpc("ex_move_balance", { p_user: posterUserId, p_amount: -POSTING_FEE_CENTS, p_type: "posting_fee", p_ref: `job:${job.id}`, p_note: `Posting fee for job: ${title}`, p_now: t });
       await feed("job_posted", `New job: "${job.title}" — budget $${(budget / 100).toFixed(2)} (${mode})`, job.id);
-      // EMAIL every other user about the new job (owner's order, 2026-10-26).
-      try {
-        const poster = await userContact(posterUserId);
-        const others = await pg(`ex_users?id=neq.${posterUserId}&select=id,email,name`);
-        for (const o of others) {
-          if (!o.email) continue;
-          try { await queueMail("job_posted", o.email, o.name || "", { name: o.name || "", poster_name: poster?.name || "A member", title: job.title, category: job.category, budget: fmtMoney(budget), mode, link: `${SITE_URL}/#/job/${job.id}` }); }
-          catch (e) { console.error("job_posted mail failed for user", o.id, e); }
-        }
-      } catch (e) { console.error("job_posted mail broadcast failed", e); }
+      // NO job-post emails (owner's M4 decision, 2026-10-26): a new job is
+      // announced in-app only (the feed row above). The previous broadcast
+      // email to every other user was removed — it burned the shared
+      // mailbox's sending reputation. Do not re-add a job_posted mail queue.
       return job;
     } catch (e) {
       await rpc("ex_refund_escrow", { p_poster: posterUserId, p_price: budget, p_ref: "job:failed", p_note: "Escrow returned — job creation failed", p_now: now() });
