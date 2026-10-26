@@ -118,9 +118,40 @@ async function authUser(req: Request): Promise<User | null> {
   return user;
 }
 async function requireUser(req: Request): Promise<User> {
-  const u = await authUser(req);
+  const u = await authUser(req) || await authUserByApiKey(req);
   if (!u) throw Object.assign(new Error("unauthorized"), { status: 401 });
   return u;
+}
+// ---------- personal API keys (every user gets one) ----------
+// A user's personal API key authenticates the SAME account-level routes the
+// web JWT guards (wallet, jobs, my agents, notifications, profile) via the
+// X-API-Key header or "Authorization: ApiKey <key>". Only the SHA-256 hash
+// is stored; the plaintext is shown exactly once, when minted.
+async function userApiKeyRow(userId: number) {
+  return await one(`ex_users?id=eq.${userId}&select=api_key_hash,api_key_created_at`);
+}
+async function mintUserApiKey(userId: number): Promise<string> {
+  const key = randomToken(20);
+  await pg(`ex_users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify({ api_key_hash: await sha256hex(key), api_key_created_at: now() }) });
+  return key;
+}
+// Returns a fresh plaintext key ONLY when the account has none yet (new
+// signup, or an older account's first login) — otherwise null.
+async function ensureUserApiKey(userId: number): Promise<string | null> {
+  const row = await userApiKeyRow(userId);
+  if (row?.api_key_hash) return null;
+  return await mintUserApiKey(userId);
+}
+async function authUserByApiKey(req: Request): Promise<User | null> {
+  let key = req.headers.get("x-api-key") || "";
+  if (!key) {
+    const a = req.headers.get("authorization") || "";
+    if (a.startsWith("ApiKey ")) key = a.slice(7).trim();
+  }
+  if (!key) return null;
+  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at`);
+  if (!user || user.suspended) return null;
+  return user;
 }
 async function walletOf(userId: number) {
   let w = await one(`ex_wallets?user_id=eq.${userId}&select=*`);
@@ -395,8 +426,10 @@ async function handle(req: Request) {
     try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
     if (b.work) { try { await createHumanProfile(user, b.work); } catch { /* profile can be created later via /my/worker-profile */ } }
     try { await queueVerifyMail({ id: user.id, email, name }); } catch (e) { console.error("verify mail queue failed for user", user.id, e); }
+    // Every user gets a personal API key at signup — shown once, here.
+    const apiKey = await mintUserApiKey(user.id);
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
-    return json({ token, user: { id: user.id, email, name, role: user.role, avatar: user.avatar, email_verified: false } }, 201);
+    return json({ token, api_key: apiKey, user: { id: user.id, email, name, role: user.role, avatar: user.avatar, email_verified: false, has_api_key: true }, note: "Save your api_key — it is shown once. Use it as the X-API-Key header to run your account from code; rotate it any time from the dashboard." }, 201);
   }
   if (path === "/auth/login" && method === "POST") {
     const b = await body();
@@ -404,8 +437,11 @@ async function handle(req: Request) {
     const user = await one(`ex_users?email=eq.${q(email)}&select=*`);
     if (!user || !(await verifyPassword(String(b.password || ""), user.password_hash))) return err("invalid email or password", 401);
     if (user.suspended) return err("account suspended", 403);
+    // Accounts created before personal API keys existed are issued one on
+    // this login — every user ends up with a key. Shown once, only then.
+    const freshKey = user.api_key_hash ? null : await mintUserApiKey(user.id);
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
-    return json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, bio: user.bio, email_verified: !!user.email_verified } });
+    return json({ token, api_key: freshKey, user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, bio: user.bio, email_verified: !!user.email_verified, has_api_key: true } });
   }
   if (path === "/auth/me" && method === "GET") {
     const u = await requireUser(req);
@@ -413,7 +449,8 @@ async function handle(req: Request) {
     let cw: any = null;
     try { cw = await chainWalletOf(u.id); } catch (e) { console.error("chain wallet load failed for user", u.id, e); }
     const unreadRows = await pg(`ex_notifications?user_id=eq.${u.id}&is_read=eq.false&select=id`);
-    return json({ user: u, wallet: w, crypto_wallet: cw ? { btc_address: cw.btc_address, evm_address: cw.evm_address } : null, unread_notifications: unreadRows.length });
+    const keyRow = await userApiKeyRow(u.id).catch(() => null);
+    return json({ user: { ...u, has_api_key: !!keyRow?.api_key_hash, api_key_created_at: keyRow?.api_key_created_at || null }, wallet: w, crypto_wallet: cw ? { btc_address: cw.btc_address, evm_address: cw.evm_address } : null, unread_notifications: unreadRows.length });
   }
   if (path === "/auth/profile" && method === "PUT") {
     const u = await requireUser(req);
@@ -753,6 +790,17 @@ async function handle(req: Request) {
     return json({ payouts, deposits });
   }
 
+  // ===== my personal API key =====
+  if (path === "/my/api-key" && method === "GET") {
+    const u = await requireUser(req);
+    const row = await userApiKeyRow(u.id);
+    return json({ has_api_key: !!row?.api_key_hash, api_key_created_at: row?.api_key_created_at || null, header: "X-API-Key", note: "The key itself is shown only once, when it is created or rotated." });
+  }
+  if (path === "/my/api-key/rotate" && method === "POST") {
+    const u = await requireUser(req);
+    const apiKey = await mintUserApiKey(u.id);
+    return json({ api_key: apiKey, note: "Save it now — shown once. The old key stops working immediately. Use it as the X-API-Key header on any account route." });
+  }
   // ===== my agents =====
   if (path === "/my/worker-profile" && method === "POST") {
     const u = await requireUser(req);
@@ -873,12 +921,14 @@ async function handle(req: Request) {
     }
     await walletOf(user.id);
     try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
+    // The owner account gets its own personal API key too — every user has one.
+    const ownerApiKey = await mintUserApiKey(user.id);
     await feed("agent_joined", `🤖 ${agent.name} joined the Exchange`, undefined);
     return json({
       agent: publicAgent(agent),
       api_key: apiKey,
-      owner: { id: user.id, email, password: ownerPassword },
-      note: "Save the api_key and owner password — both are shown once. The agent works right away with X-Agent-Key on /agent/*. The owner logs in with this email + password; verify the email from the dashboard to unlock web job posting and payouts.",
+      owner: { id: user.id, email, password: ownerPassword, api_key: ownerApiKey },
+      note: "Save the api_key, the owner password and the owner api_key — all are shown once. The agent works right away with X-Agent-Key on /agent/*; the owner_api_key runs the account itself via X-API-Key. The owner logs in with this email + password; verify the email from the dashboard to unlock web job posting and payouts.",
     }, 201);
   }
 
