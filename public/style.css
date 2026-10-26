@@ -215,8 +215,18 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
 .notif{display:flex;gap:11px;align-items:center;padding:12px 6px;border-bottom:1px solid var(--line);font-size:14px}
 .notif:last-child{border-bottom:none}
 .notif.unread{border-left:3px solid var(--gold);padding-left:12px;background:linear-gradient(90deg,rgba(242,179,61,.06),transparent 65%)}
-.notif .feed-ic{flex:none;width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:rgba(242,179,61,.1);border:1px solid rgba(242,179,61,.25);color:var(--gold)}
-.notif .feed-ic .ic{width:16px;height:16px}
+.n-ic{flex:none;width:38px;height:38px;border-radius:12px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;color:#fff;background:linear-gradient(145deg,#9aa5b8,#5b6373 55%,#39404e);box-shadow:inset 0 1px 1px rgba(255,255,255,.6),inset 0 -4px 7px rgba(0,0,0,.35),0 7px 15px rgba(0,0,0,.45);animation:nFloat 3.4s ease-in-out infinite}
+.n-ic .ic{width:19px;height:19px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.5))}
+.n-ic::before{content:"";position:absolute;inset:0;border-radius:12px;background:linear-gradient(180deg,rgba(255,255,255,.38),rgba(255,255,255,0) 55%);pointer-events:none}
+.n-ic.gold{background:linear-gradient(145deg,#ffdc82,#e9a41b 55%,#96690a)}
+.n-ic.mint{background:linear-gradient(145deg,#aef08a,#57b52e 55%,#2c6413)}
+.n-ic.red{background:linear-gradient(145deg,#ffa08d,#e05252 55%,#8c2222)}
+.n-ic.violet{background:linear-gradient(145deg,#d7abff,#8b5cf6 55%,#4e24a3)}
+.n-ic.blue{background:linear-gradient(145deg,#95ceff,#3b82f6 55%,#1c4c9c)}
+@keyframes nFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-2.5px)}}
+.notif.unread .n-ic{animation:nFloat 2.1s ease-in-out infinite}
+.notif.unread .n-ic::after{content:"";position:absolute;inset:0;border-radius:12px;background:linear-gradient(115deg,transparent 32%,rgba(255,255,255,.55) 50%,transparent 66%);background-size:260% 100%;animation:nShine 2.4s ease-in-out infinite;pointer-events:none}
+@keyframes nShine{0%{background-position:130% 0}60%,100%{background-position:-70% 0}}
 .msg{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:13px;padding:10px 14px;margin:8px 0;max-width:82%}
 .msg.me{margin-left:auto;background:rgba(242,179,61,.13);border-color:rgba(242,179,61,.35)}
 .msg small{color:var(--mut);display:flex;align-items:center;gap:6px;margin-bottom:3px}
