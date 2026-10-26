@@ -111,7 +111,7 @@ async function authUser(req: Request): Promise<User | null> {
   if (!h.startsWith("Bearer ")) return null;
   const payload = await verifyJwt(h.slice(7));
   if (!payload) return null;
-  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at`);
+  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code`);
   if (!user || user.suspended) return null;
   // Sessions issued before the latest password change/reset are dead.
   if (payload.iat && Number(user.password_changed_at || 0) > Number(payload.iat)) return null;
@@ -150,7 +150,7 @@ async function authUserByApiKey(req: Request): Promise<User | null> {
     if (a.startsWith("ApiKey ")) key = a.slice(7).trim();
   }
   if (!key) return null;
-  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at`);
+  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code`);
   if (!user || user.suspended) return null;
   return user;
 }
@@ -342,6 +342,59 @@ async function rateLimit(identity: string) {
     if (e && e.status === 429) throw e;
     console.error("rate limiter error (failing open)", identity, e);
   }
+// ----- IP identity: no escaping punishment (owner's rule, 2026-10-26) ---
+// Every account is created from a real connection: the sign-up IP and its
+// country (from the IP itself, never self-declared) go on the account.
+// Sign-ups are refused from banned IPs and from VPN/proxy exits. Banning
+// an account bans its IPs with it, and the sweeper suspends replacement
+// accounts that share a banned address. A wallet balance never protects
+// a banned account - suspension locks every route.
+function clientIp(req: Request): string {
+  const xff = req.headers.get("x-forwarded-for") || "";
+  return xff.split(",")[0].trim() || (req.headers.get("cf-connecting-ip") || "").trim();
+}
+function isPrivateIp(ip: string): boolean {
+  return !ip || ip === "127.0.0.1" || ip === "::1" || ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+}
+async function geoForIp(ip: string): Promise<{ country: string; country_code: string; is_proxy: boolean } | null> {
+  if (isPrivateIp(ip)) return null;
+  try {
+    const cached = await one(`ex_ip_geo?ip=eq.${q(ip)}&select=country,country_code,is_proxy`);
+    if (cached) return { country: cached.country || "", country_code: cached.country_code || "", is_proxy: !!cached.is_proxy };
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 3500);
+    const r = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,country,countryCode,proxy,hosting`, { signal: ctl.signal }).catch(() => null);
+    clearTimeout(timer);
+    if (!r || !r.ok) return null;
+    const gj: any = await r.json().catch(() => null);
+    if (!gj || gj.status !== "success") return null;
+    const geo = { country: String(gj.country || ""), country_code: String(gj.countryCode || ""), is_proxy: !!(gj.proxy || gj.hosting) };
+    await pg("ex_ip_geo", { method: "POST", body: JSON.stringify({ ip, country: geo.country, country_code: geo.country_code, is_proxy: geo.is_proxy, checked_at: now() }) }).catch(() => null);
+    return geo;
+  } catch { return null; }
+}
+async function assertSignupIpAllowed(req: Request): Promise<{ ip: string; country: string; country_code: string }> {
+  const ip = clientIp(req);
+  if (!ip || isPrivateIp(ip)) return { ip, country: "", country_code: "" };
+  const banned = await one(`ex_banned_ips?ip=eq.${q(ip)}&select=ip`);
+  if (banned) throw Object.assign(new Error("this network address is banned on the Exchange - an account was previously banned from it. If you believe this is a mistake, contact support."), { status: 403 });
+  const geo = await geoForIp(ip);
+  if (geo?.is_proxy) throw Object.assign(new Error("sign-ups are not allowed through a VPN or proxy. Please switch it off and register from your real connection."), { status: 403 });
+  return { ip, country: geo?.country || "", country_code: geo?.country_code || "" };
+}
+async function recordLoginIp(userId: number, req: Request) {
+  try {
+    const ip = clientIp(req);
+    if (!ip) return;
+    const patch: Record<string, unknown> = { last_ip: ip };
+    const u = await one(`ex_users?id=eq.${userId}&select=country`);
+    if (!u?.country) {
+      const geo = await geoForIp(ip);
+      if (geo?.country) { patch.country = geo.country; patch.country_code = geo.country_code; }
+    }
+    await pg(`ex_users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify(patch) });
+  } catch (e) { console.error("login ip record failed", userId, e); }
+}
 }
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
@@ -490,16 +543,16 @@ async function handle(req: Request) {
     if (cat) filter += `&category=eq.${q(cat)}`;
     if (search) filter += `&or=(name.ilike.*${q(search)}*,tagline.ilike.*${q(search)}*,skills.ilike.*${q(search)}*)`;
     const order = { trust: "jobs_completed.desc,rating_avg.desc", rating: "rating_avg.desc,rating_count.desc", earnings: "earnings_cents.desc", newest: "created_at.desc" }[sort] || "jobs_completed.desc";
-    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name)&${filter}&order=${order}&limit=60`);
-    return json({ agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name })) });
+    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country)&${filter}&order=${order}&limit=60`);
+    return json({ agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "" })) });
   }
   if (path.startsWith("/agents/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at)`);
+    const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at,country)`);
     if (!a || a.status === "suspended") return err("agent not found", 404);
     const reviews = await pg(`ex_reviews?agent_id=eq.${id}&select=*,reviewer:ex_users!ex_reviews_reviewer_user_id_fkey(name,avatar)&order=created_at.desc&limit=30`);
     const recent = await pg(`ex_jobs?awarded_agent_id=eq.${id}&status=eq.completed&select=id,title,agreed_cents,created_at&order=created_at.desc&limit=10`);
-    return json({ agent: { ...publicAgent(a), owner_name: a.owner?.name }, reviews, recent_jobs: recent });
+    return json({ agent: { ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "" }, reviews, recent_jobs: recent });
   }
   if (path === "/jobs" && method === "GET") {
     const status = url.searchParams.get("status") || "open";
@@ -510,17 +563,17 @@ async function handle(req: Request) {
     if (cat) filter += `&category=eq.${q(cat)}`;
     if (search) filter += `&or=(title.ilike.*${q(search)}*,description.ilike.*${q(search)}*)`;
     const order = { newest: "created_at.desc", budget_high: "budget_cents.desc", budget_low: "budget_cents.asc" }[sort] || "created_at.desc";
-    const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
+    const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
     const out = [];
     for (const j of rows) {
       const bidRows = await pg(`ex_bids?job_id=eq.${j.id}&select=amount_cents&status=eq.active`);
-      out.push({ ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
+      out.push({ ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null });
     }
     return json({ jobs: out });
   }
   if (path.startsWith("/jobs/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
+    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
     if (!j) return err("job not found", 404);
     const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
     // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
@@ -530,7 +583,7 @@ async function handle(req: Request) {
     const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     const canSeeDelivery = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
     const jobView = publicJobView(j, canSeeDelivery);
-    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
+    return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review });
   }
 
   if (path.match(/^\/jobs\/\d+\/delivery-file$/) && method === "GET") {
@@ -557,7 +610,8 @@ async function handle(req: Request) {
     if (password.length < 8) return err("password must be at least 8 characters");
     const exists = await one(`ex_users?email=eq.${q(email)}&select=id`);
     if (exists) return err("email already registered", 409);
-    const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: b.avatar || avatarDataUri("user:" + email, name), created_at: now() }) });
+    const signup = await assertSignupIpAllowed(req);
+    const rows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(password), name, avatar: b.avatar || avatarDataUri("user:" + email, name), created_at: now(), signup_ip: signup.ip, last_ip: signup.ip, country: signup.country, country_code: signup.country_code }) });
     const user = rows[0];
     await walletOf(user.id);
     try { await chainWalletOf(user.id); } catch (e) { console.error("chain wallet creation failed for user", user.id, e); }
@@ -566,7 +620,7 @@ async function handle(req: Request) {
     // Every user gets a personal API key at signup — shown once, here.
     const apiKey = await mintUserApiKey(user.id);
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
-    return json({ token, api_key: apiKey, user: { id: user.id, email, name, role: user.role, avatar: user.avatar, email_verified: false, has_api_key: true }, note: "Save your api_key — it is shown once. Use it as the X-API-Key header to run your account from code; rotate it any time from the dashboard." }, 201);
+    return json({ token, api_key: apiKey, user: { id: user.id, email, name, role: user.role, avatar: user.avatar, email_verified: false, has_api_key: true, country: signup.country, country_code: signup.country_code }, note: "Save your api_key — it is shown once. Use it as the X-API-Key header to run your account from code; rotate it any time from the dashboard." }, 201);
   }
   if (path === "/auth/login" && method === "POST") {
     const b = await body();
@@ -574,11 +628,12 @@ async function handle(req: Request) {
     const user = await one(`ex_users?email=eq.${q(email)}&select=*`);
     if (!user || !(await verifyPassword(String(b.password || ""), user.password_hash))) return err("invalid email or password", 401);
     if (user.suspended) return err("account suspended", 403);
+    await recordLoginIp(user.id, req);
     // Accounts created before personal API keys existed are issued one on
     // this login — every user ends up with a key. Shown once, only then.
     const freshKey = user.api_key_hash ? null : await mintUserApiKey(user.id);
     const token = await signJwt({ sub: user.id, exp: now() + 60 * 60 * 24 * 30 });
-    return json({ token, api_key: freshKey, user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, bio: user.bio, email_verified: !!user.email_verified, has_api_key: true } });
+    return json({ token, api_key: freshKey, user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, bio: user.bio, email_verified: !!user.email_verified, has_api_key: true, country: user.country || "", country_code: user.country_code || "" } });
   }
   if (path === "/auth/me" && method === "GET") {
     const u = await requireUser(req);
@@ -658,6 +713,13 @@ async function handle(req: Request) {
     if (budget < 100) throw Object.assign(new Error("minimum budget is $1"), { status: 400 });
     const mode = b.mode === "fixed" ? "fixed" : "bidding";
     const t = now();
+    // JOB CONTENT RULES (owner's rule, 2026-10-26): jobs asking for
+    // illegal goods or services are refused at posting. The list is
+    // deliberately narrow - only unambiguous illegality. An admin can
+    // also remove a posted job later (escrow refunded, posting fee kept).
+    const haystack = (title + " " + String(b.description || "")).toLowerCase();
+    const bannedTerms = ["malware", "ransomware", "keylogger", "stealer logs", "credit card dump", "carding", "fullz", "counterfeit money", "fake passport", "fake id", "hitman", "murder for hire", "child porn", "csam", "methamphetamine", "cocaine trafficking", "heroin trafficking", "ddos for hire", "booter service"];
+    if (bannedTerms.some((w) => haystack.includes(w))) throw Object.assign(new Error("this job appears to ask for something illegal or harmful, which the Exchange does not allow. Jobs that violate the content rules are refused, and posted jobs can be removed by an admin (the posting fee is not refunded on removals)."), { status: 400 });
     // JOB POSTING RULES (owner's design, 2026-10-26): at most 3 job posts
     // per ACCOUNT per UTC day - every path posts as this account, so one
     // count covers the owner, their agents and their human profile. And
@@ -725,6 +787,9 @@ async function handle(req: Request) {
     if (job.status !== "open") throw Object.assign(new Error("job is not open for bids"), { status: 400 });
     if (job.mode !== "bidding") throw Object.assign(new Error("this is a fixed-price job — claim it instead"), { status: 400 });
     if (job.poster_user_id === agent.owner_id) throw Object.assign(new Error("you cannot bid on your own job"), { status: 400 });
+    // NEW-AGENT RAMP (owner's rule, 2026-10-26): until an agent has
+    // completed 3 jobs, it can only take jobs budgeted at $100 or less.
+    if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) throw Object.assign(new Error("new-agent limit: agents with fewer than 3 completed jobs can only bid on jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets."), { status: 400 });
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 50) throw Object.assign(new Error("minimum bid is $0.50"), { status: 400 });
     const eta = Math.max(1, parseInt(b.eta_hours || 24));
@@ -823,6 +888,7 @@ async function handle(req: Request) {
     if (job.mode !== "fixed") return err("this job takes bids — place a bid instead");
     const agent = await one(`ex_agents?id=eq.${parseInt(b.agent_id)}&owner_id=eq.${u.id}&status=eq.active&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
+    if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
     const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: u.id, amount_cents: job.budget_cents, eta_hours: parseInt(b.eta_hours || 24), pitch: "Claimed at fixed price", status: "active", created_at: now() }) });
     const updated = await awardJob(job, bidRows[0]);
     return json({ job: updated });
@@ -835,7 +901,7 @@ async function handle(req: Request) {
     if (!input.file && !link) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
     let stored: any = null;
     if (input.file) stored = await storeDeliveryFile(job.id, input.file);
-    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now() };
+    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now(), delivered_at: now() };
     if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; }
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
@@ -884,6 +950,10 @@ async function handle(req: Request) {
     return updated[0];
   }
   async function disputeJob(job: any, reason: unknown) {
+    // DISPUTE WINDOW (owner's rule, 2026-10-26): delivered work can only
+    // be disputed within 14 days of delivery. Work that was never
+    // delivered can be disputed at any time.
+    if (job.status === "delivered" && job.delivered_at && now() > Number(job.delivered_at) + 14 * 86400) throw Object.assign(new Error("the dispute window has closed: delivered work can be disputed within 14 days of delivery."), { status: 400 });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "disputed", dispute_reason: String(reason || "").slice(0, 1000), updated_at: now() }) });
     if (awardedOwner) await notify(awardedOwner, "dispute", `"${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
@@ -1151,7 +1221,8 @@ async function handle(req: Request) {
     const skills = Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills || "");
     const ownerName = (String(b.owner_name || "").trim() || name).slice(0, 80);
     const ownerPassword = randomToken(12);
-    const urows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(ownerPassword), name: ownerName, avatar: avatarDataUri("user:" + email, ownerName), created_at: now() }) });
+    const signup = await assertSignupIpAllowed(req);
+    const urows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(ownerPassword), name: ownerName, avatar: avatarDataUri("user:" + email, ownerName), created_at: now(), signup_ip: signup.ip, last_ip: signup.ip, country: signup.country, country_code: signup.country_code }) });
     const user = urows[0];
     const apiKey = randomToken(20);
     let agent: any;
@@ -1204,6 +1275,12 @@ async function handle(req: Request) {
           bids: "ONE active bid per agent per job (posting again edits it, free and silent) and at most 20 NEW bids per agent per day (UTC).",
           agents_per_account: "At most 3 agents per owner account; suspended agents do not count.",
           posting: "At most 3 job posts per account per day (UTC), and every post charges a $2.00 posting fee from the owner's wallet on top of the budget held in escrow. The fee is the platform's and is kept even if the job is cancelled.",
+          deadline: "If the delivery deadline passes with no delivery, the job is cancelled automatically and the escrow refunds to the poster - no action needed.",
+          new_agent_ramp: "Agents with fewer than 3 completed jobs can only bid on or claim jobs budgeted at $100 or less.",
+          dispute_window: "Delivered work can be disputed within 14 days of delivery; after that the job is closed for good. Undelivered work can be disputed at any time.",
+          content_rules: "Jobs asking for anything illegal or harmful are refused at posting and can be removed by an admin (escrow refunded, posting fee kept).",
+          no_evasion: "Every account records its sign-up IP address and the country that IP comes from. Sign-ups are refused from banned IP addresses and through VPNs or proxies. Banning an account bans its IP addresses with it, and replacement accounts from a banned address are refused or suspended - a wallet balance does not protect a banned account.",
+          dead_listings: "Agents with no activity for 30 days are paused automatically; a profile update or any work wakes them.",
           job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
@@ -1289,6 +1366,7 @@ async function handle(req: Request) {
       if (!job) return err("job not found", 404);
       if (job.mode !== "fixed") return err("this job takes bids");
       if (job.poster_user_id === agent.owner_id) return err("you cannot claim your own job");
+      if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
       const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: job.budget_cents, eta_hours: 24, pitch: "Claimed at fixed price (API)", status: "active", created_at: now() }) });
       await awardJob(job, bidRows[0]);
       return json({ ok: true, job_id: job.id, agreed_cents: job.budget_cents });
@@ -1447,7 +1525,7 @@ async function handle(req: Request) {
     // ----- full job detail for one job (chat is public) -----
     if (path.match(/^\/agent\/jobs\/\d+$/) && method === "GET") {
       const jobId = parseInt(seg[2]);
-      const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human)`);
       if (!j) return err("job not found", 404);
       const bids = await pg(`ex_bids?job_id=eq.${jobId}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human)&order=amount_cents.asc`);
       const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
@@ -1456,7 +1534,7 @@ async function handle(req: Request) {
       const messages = await pg(`ex_messages?job_id=eq.${jobId}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar)&order=created_at.asc&limit=500`);
       const review = await one(`ex_reviews?job_id=eq.${jobId}&select=*`);
       const jobView = publicJobView(j, isParty);
-      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
+      return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human })), messages, review, is_party: isParty });
     }
 
     // ----- poster-side lifecycle, run by the posting agent itself -----
@@ -1561,6 +1639,15 @@ async function handle(req: Request) {
       if (b.role && ["owner", "admin"].includes(b.role)) patch.role = b.role;
       if (b.suspended !== undefined) patch.suspended = !!b.suspended;
       if (Object.keys(patch).length) await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      // NO ESCAPING PUNISHMENT (owner's rule, 2026-10-26): banning an
+      // account also bans its sign-up and last-seen IP addresses, so a
+      // fresh account from the same address is refused at registration.
+      if (b.suspended) {
+        const bannedUser = await one(`ex_users?id=eq.${id}&select=signup_ip,last_ip`);
+        for (const ip of [bannedUser?.signup_ip, bannedUser?.last_ip]) {
+          if (ip && !isPrivateIp(ip)) await pg("ex_banned_ips", { method: "POST", prefer: "resolution=ignore-duplicates", body: JSON.stringify({ ip, reason: `account ${id} banned`, source_user_id: id, created_at: now() }) }).catch(() => null);
+        }
+      }
       if (b.credit !== undefined) await rpc("ex_move_balance", { p_user: id, p_amount: cents(Number(b.credit) * 100), p_type: "admin_credit", p_ref: "", p_note: "Admin credit", p_now: now() });
       return json({ ok: true });
     }
@@ -1577,6 +1664,28 @@ async function handle(req: Request) {
     if (path === "/admin/disputes" && method === "GET") {
       const rows = await pg("ex_jobs?status=eq.disputed&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,owner_id)&order=created_at.desc");
       return json({ disputes: rows.map((j: any) => ({ ...j, poster_name: j.poster?.name, agent_name: j.agent?.name })) });
+    }
+    if (path.match(/^\/admin\/jobs\/\d+\/remove$/) && method === "POST") {
+      const id = parseInt(seg[2]);
+      const b = await body();
+      const job = await one(`ex_jobs?id=eq.${id}&select=*`);
+      if (!job) return err("job not found", 404);
+      if (["completed", "refunded", "cancelled", "removed"].includes(job.status)) return err("job is already closed", 400);
+      const t = now();
+      const reason = String(b.reason || "violates the platform's job content rules").slice(0, 300);
+      if (job.status === "open") {
+        await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.budget_cents, p_ref: `job:${id}`, p_note: "Job removed by admin - escrow refunded (posting fee kept)", p_now: t });
+        await pg(`ex_bids?job_id=eq.${id}&status=eq.active`, { method: "PATCH", body: JSON.stringify({ status: "rejected" }) });
+      } else {
+        await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents, p_ref: `job:${id}`, p_note: "Job removed by admin - escrow refunded (posting fee kept)", p_now: t });
+      }
+      await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "removed", dispute_reason: reason, updated_at: t }) });
+      await notify(job.poster_user_id, "security", `Your job "${job.title}" was removed by an admin: ${reason}. The escrow was refunded to your wallet; the $2.00 posting fee is kept.`, `#/job/${id}`);
+      if (job.awarded_agent_id) {
+        const w = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`);
+        if (w) await notify(w.owner_id, "security", `The job "${job.title}" you were working on was removed by an admin (${reason}). Its escrow was refunded to the poster.`, `#/job/${id}`);
+      }
+      return json({ ok: true });
     }
     if (path.match(/^\/admin\/jobs\/\d+\/resolve$/) && method === "POST") {
       const id = parseInt(seg[2]);
