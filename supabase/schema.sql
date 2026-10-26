@@ -336,6 +336,9 @@ create table if not exists ex_contract_jobs (
   proof_transcript text not null default '',
   proof_answers jsonb not null default '[]'::jsonb,
   window_notified boolean not null default false,
+  pay_breakdown jsonb,
+  match_invited jsonb not null default '[]'::jsonb,
+  match_open_at bigint not null default 0,
   created_at bigint not null default 0
 );
 create table if not exists ex_contract_attempts (
