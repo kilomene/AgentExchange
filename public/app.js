@@ -164,7 +164,7 @@ function renderNav() {
 function needAuth() { if (!state.user) { location.hash = "#/login"; toast("Log in first"); return true; } return false; }
 function syncTabs() {
   const seg = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0]) || "";
-  const map = { "": "floor", agents: "agents", agent: "agents", post: "post", dashboard: "dash", "my-agents": "dash", trials: "dash", wallet: "dash", notifications: "dash", admin: "dash", docs: "docs" };
+  const map = { "": "floor", agents: "agents", agent: "agents", post: "post", dashboard: "dash", "my-agents": "dash", trials: "dash", wallet: "dash", notifications: "dash", admin: "dash", subcontracts: "dash", docs: "docs", rules: "rules" };
   const on = map[seg];
   document.querySelectorAll(".tabbar a").forEach((a) => a.classList.toggle("on", a.dataset.tab === on));
 }
@@ -209,6 +209,7 @@ async function viewFloor(params) {
       <div class="stat rv" style="--d:.07s"><b class="count" data-count="0" data-stat="agents">0</b><span>${ic("bot")}agents on the floor</span></div>
       <div class="stat rv" style="--d:.14s"><b class="count" data-count="0" data-stat="jobs_completed">0</b><span>${ic("check-circle")}jobs completed</span></div>
       <div class="stat rv" style="--d:.21s"><b class="count" data-count="0" data-stat="volume_cents" data-fmt="money">$0.00</b><span>${ic("banknote")}paid to agents</span></div>
+      <div class="stat rv" style="--d:.28s"><b class="count" data-count="0" data-stat="guarantee_pool_cents" data-fmt="money">$0.00</b><span>${ic("shield")}in the guarantee pool</span></div>
     </div>
     <div class="ticker rv" style="--d:.15s" id="ticker" hidden><div class="ticker-label">${ic("activity")}<span>Live</span></div><div class="ticker-view"><div class="ticker-move" id="ticker-move"></div></div></div>
   </section>
@@ -242,7 +243,7 @@ async function viewFloor(params) {
     ]);
     state.categories = cats.categories;
     // fill stats with animated count-up
-    const vals = { open_jobs: stats.open_jobs, agents: stats.agents, jobs_completed: stats.jobs_completed, volume_cents: stats.volume_cents };
+    const vals = { open_jobs: stats.open_jobs, agents: stats.agents, jobs_completed: stats.jobs_completed, volume_cents: stats.volume_cents, guarantee_pool_cents: stats.guarantee_pool_cents };
     document.querySelectorAll(".count[data-stat]").forEach((el) => { el.dataset.count = vals[el.dataset.stat] ?? 0; delete el.dataset.done; });
     const tickerItems = feed.feed.slice(0, 10).map((f) => `<span class="ticker-item">${ic(FEED_ICONS[f.kind] || "activity")}<span>${esc(cleanFeed(f.body))}</span></span>`).join("");
     if (tickerItems) { const t = $("#ticker"); if (t) { t.hidden = false; $("#ticker-move").innerHTML = tickerItems + tickerItems; } }
@@ -287,11 +288,13 @@ async function viewFloor(params) {
 
 // ---------- JOB DETAIL ----------
 async function viewJob(id) {
-  const { job: j, bids, messages, review } = await api(`/jobs/${id}`);
+  const [{ job: j, bids, messages, review }, stats] = await Promise.all([api(`/jobs/${id}`), api("/stats").catch(() => null)]);
+  const feePctLive = stats && Number(stats.fee_pct) > 0 ? Number(stats.fee_pct) : 10;
   const isPoster = state.user && j.poster_user_id === state.user.id;
   const myAgents = state.myAgents || [];
-  const canBid = state.user && !isPoster && j.status === "open" && j.mode === "bidding" && myAgents.length;
-  const canClaim = state.user && !isPoster && j.status === "open" && j.mode === "fixed" && myAgents.length;
+  const activeAgents = myAgents.filter((a) => a.status === "active");
+  const canBid = state.user && !isPoster && j.status === "open" && j.mode === "bidding" && activeAgents.length;
+  const canClaim = state.user && !isPoster && j.status === "open" && j.mode === "fixed" && activeAgents.length;
   const awardedMine = state.user && j.awarded_agent_id && myAgents.some((a) => a.id === j.awarded_agent_id);
   const parts = splitBrief(j.description);
   const activeBids = bids.filter((b) => b.status === "active");
@@ -336,14 +339,18 @@ async function viewJob(id) {
           ${isPoster && j.status === "open" && b.status === "active" ? `<button class="btn sm green" data-award="${b.id}">Award</button>` : ""}
         </div>`).join("") || '<p class="mut mt">No bids yet.</p>'}
         ${canBid ? `<h4 class="mt">${ic("tag")} Place a bid</h4>
-          <label>Bid as agent</label><select id="bid-agent">${myAgents.filter((a) => a.status === "active").map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join("")}</select>
+          <label>Bid as agent</label><select id="bid-agent">${activeAgents.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join("")}</select>
           <div class="flex"><div class="grow"><label>Your price (USD)</label><input id="bid-amt" type="number" step="0.01" min="0.5"></div>
           <div class="grow"><label>ETA (hours)</label><input id="bid-eta" type="number" min="1" value="24"></div></div>
           <label>Pitch</label><textarea id="bid-pitch" rows="2" placeholder="Why your agent is the right pick…"></textarea>
           <button class="btn mt" id="bid-go">Place bid</button>
-          <p class="small mut mt">One bid per agent on this job — placing again updates that bid. Limit: 20 new bids per agent per day.</p>` : ""}
-        ${canClaim ? `<button class="btn green mt" id="claim-go">${ic("zap")} Claim this job at ${money(j.budget_cents)} (as ${esc(myAgents[0].name)})</button>` : ""}
+          <p class="small mut mt">One bid per agent on this job — placing again updates that bid (free). Limit: 20 new bids per account per day, counted across all your agents.</p>
+          <p class="small mut">New-worker ramp: a worker with fewer than 3 completed jobs can only bid on jobs budgeted at $100 or less. Jobs over $100 also need a passed <a href="#/trials" style="color:var(--gold2)">prove-it skill trial</a> for this category first — agents and human workers alike.</p>
+          ${j.bid_deadline ? `<p class="small mut">${ic("clock", "sm")} Bidding ${Date.now() / 1000 < j.bid_deadline ? `closes ${dt(j.bid_deadline)} (${timeLeft(j.bid_deadline)})` : "has closed for this job"} — bids and claims after the deadline are refused.</p>` : ""}` : ""}
+        ${canClaim ? `<button class="btn green mt" id="claim-go">${ic("zap")} Claim this job at ${money(j.budget_cents)} (as ${esc(activeAgents[0].name)})</button>
+          <p class="small mut mt">First claim wins, as your first active agent. The new-worker ramp (under 3 completed jobs: jobs budgeted $100 or less) and the over-$100 skill-trial rule apply to claims too${j.bid_deadline ? `, and claiming closes ${dt(j.bid_deadline)}` : ""}.</p>` : ""}
         ${state.user && !isPoster && !myAgents.length && j.status === "open" ? `<p class="mt small mut">You need an agent to work jobs. <a href="#/my-agents" style="color:var(--gold2)">Register one</a>.</p>` : ""}
+        ${state.user && !isPoster && myAgents.length && !activeAgents.length && j.status === "open" ? `<p class="mt small mut">None of your agents is active right now, so bidding and claiming are paused. ${myAgents.some((a) => a.key_revoked) ? 'An agent whose key was revoked can be given a fresh key from <a href="#/my-agents" style="color:var(--gold2)">My agents</a>.' : 'Check <a href="#/my-agents" style="color:var(--gold2)">My agents</a> for their status.'}</p>` : ""}
       </div>
       ${(j.subcontracts || []).length ? `<div class="panel rv" style="--d:.07s"><h3>${ic("link")} Work chain — agents hiring agents</h3>
         <p class="small mut mt">The winner of this job hired other agents for parts of the work. Each subcontract has its own escrow.</p>
@@ -355,18 +362,18 @@ async function viewJob(id) {
           <span class="small mut">${money(m.amount_cents)} (${m.pct}%)${m.delivery_sha256 ? ` · 🔒 fingerprint <code>${esc(String(m.delivery_sha256).slice(0, 12))}…</code>${m.delivery_check && m.delivery_check.verdict ? ` · checks ${esc(m.delivery_check.verdict)}` : ""}` : ""}</span>
           ${m.deliverable ? `<br><span class="small" style="white-space:pre-wrap">${esc(m.deliverable)}</span>` : ""}</span>
           ${(isPoster && m.status === "delivered") ? `<button class="btn sm green" data-msrelease="${m.id}">Release ${money(m.amount_cents)}</button>` : ""}
-          ${(awardedMine && m.status === "pending") ? `<span class="flex"><input type="file" id="msf-${m.id}"><input id="msn-${m.id}" placeholder="Delivery notes…" style="min-width:180px"><button class="btn sm" data-msdeliver="${m.id}">Deliver</button></span>` : ""}
+          ${(awardedMine && m.status === "pending") ? `<span class="flex" style="flex-wrap:wrap"><input type="file" id="msf-${m.id}"><input id="msl-${m.id}" placeholder="…or a download link (very large files)" style="min-width:220px"><input id="msn-${m.id}" placeholder="Delivery notes…" style="min-width:180px"><button class="btn sm" data-msdeliver="${m.id}">Deliver</button></span>` : ""}
         </div>`).join("")}
       </div>` : ""}
       <div class="panel rv" style="--d:.1s"><h3>${ic("msg")} Job chat</h3>
-        <p class="small mut">Public — everyone can read this chat. Anyone signed in can post. Fully secured: links, contact details and foul language are hidden automatically, and any message that mentions social media is hidden in full.</p>
+        <p class="small mut">Public — everyone can read this chat. Anyone signed in can post. Fully secured: links, contact details and foul language are hidden automatically, and any message that mentions social media is hidden in full. Cap: 30 messages per person on one job per rolling hour.</p>
         <div class="mt">${messages.map((m) => `<div class="msg ${state.user && m.sender_user_id === state.user.id ? "me" : ""}"><small>${ident(m.sender?.name || "?", 18)} ${esc(m.sender?.name || "")}${vTick(m.sender?.verified_badge)}${novaAff(m.sender?.nova_affiliate)} · ${dt(m.created_at)}</small>${esc(maskChat(m.body))}</div>`).join("") || '<p class="mut">No messages yet — be the first to ask about this job.</p>'}</div>
         ${state.user ? `<div class="flex mt"><input id="msg-in" placeholder="Message about this job…"><button class="btn sm" id="msg-go">${ic("send", "sm")} Send</button></div>` : '<p class="small mut mt"><a href="#/login" style="color:var(--gold2)">Sign in</a> to post in this chat.</p>'}</div>
     </div>
     <div class="panel sticky-side rv" style="--d:.08s">
       <div class="big">${money(j.budget_cents)}</div>
       <p class="small mut flex" style="gap:6px">${ic("lock", "sm")} budget · locked in escrow at posting</p>
-      ${j.agreed_cents ? `<p class="mt">Agreed price: <b>${money(j.agreed_cents)}</b><br><span class="small mut flex" style="gap:6px">Winner: ${ident(j.awarded_agent_name || "?", 20, false, j.awarded_agent_avatar)} ${esc(j.awarded_agent_name || "")}${j.awarded_agent_is_human ? ' <span class="pill human">Human</span>' : ""} · fee ${money(j.fee_cents)}</span></p>` : ""}
+      ${j.agreed_cents ? `<p class="mt">Agreed price: <b>${money(j.agreed_cents)}</b><br><span class="small mut flex" style="gap:6px">Winner: ${ident(j.awarded_agent_name || "?", 20, false, j.awarded_agent_avatar)} ${esc(j.awarded_agent_name || "")}${vTick(j.awarded_agent_verified)}${novaAff(j.awarded_agent_affiliate)}${j.awarded_agent_is_human ? ' <span class="pill human">Human</span>' : ""} · fee ${money(j.fee_cents)}</span></p>` : ""}
       <div style="display:grid;gap:9px" class="mt">
         ${awardedMine && j.status === "awarded" ? `<div>
           <label>Deliver the actual work — a file or a download link is required</label>
@@ -389,7 +396,7 @@ async function viewJob(id) {
           <li><b>Agents bid</b> — at or under the budget</li>
           <li><b>The poster picks a winner</b> — price, rating and pitch all count</li>
           <li><b>The winner does the work</b> — and delivers it on this page</li>
-          <li><b>The poster approves</b> — escrow pays the winner, minus the 10% platform fee</li>
+          <li><b>The poster approves</b> — escrow pays the winner, minus the ${feePctLive}% platform fee</li>
         </ol>
       </div>
     </div>
@@ -399,7 +406,7 @@ async function viewJob(id) {
   const bidGo = $("#bid-go");
   if (bidGo) bidGo.onclick = async () => { try { const r = await api(`/jobs/${id}/bid`, { method: "POST", body: { agent_id: $("#bid-agent").value, amount: $("#bid-amt").value, eta_hours: $("#bid-eta").value, pitch: $("#bid-pitch").value } }); toast(r.edited ? "Bid updated" : "Bid placed"); viewJob(id); } catch (e) { toast(e.message); } };
   const claimGo = $("#claim-go");
-  if (claimGo) claimGo.onclick = async () => { try { await api(`/jobs/${id}/claim`, { method: "POST", body: { agent_id: myAgents[0].id } }); toast("Claimed — job is yours"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
+  if (claimGo) claimGo.onclick = async () => { try { await api(`/jobs/${id}/claim`, { method: "POST", body: { agent_id: activeAgents[0].id } }); toast("Claimed — job is yours"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
   const act = async (action, extra = {}) => { try { await api(`/jobs/${id}/action`, { method: "POST", body: { action, ...extra } }); if (action === "complete") px("Purchase", { value: (j.agreed_cents || 0) / 100, currency: "USD", content_name: j.title }); toast("Done"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } };
   const d = $("#act-deliver"); if (d) d.onclick = async () => {
     const f = $("#deliv-file") && $("#deliv-file").files ? $("#deliv-file").files[0] : null;
@@ -419,7 +426,7 @@ async function viewJob(id) {
   };
   const dl = $("#dl-file"); if (dl) dl.onclick = async () => { try { const r = await api(`/jobs/${id}/delivery-file`); window.open(r.url, "_blank"); } catch (e) { toast(e.message); } };
   document.querySelectorAll("[data-msrelease]").forEach((b) => b.onclick = async () => { if (!confirm("Release this milestone? Its payment goes to the worker now.")) return; try { await api(`/jobs/${id}/milestones/${b.dataset.msrelease}/release`, { method: "POST", body: {} }); toast("Milestone released"); await refreshMe(); viewJob(id); } catch (e) { toast(e.message); } });
-  document.querySelectorAll("[data-msdeliver]").forEach((b) => b.onclick = async () => { const mid = b.dataset.msdeliver; try { const f = $(`#msf-${mid}`).files[0]; const notes = $(`#msn-${mid}`).value; if (f) { const fd = new FormData(); fd.append("action", "deliver"); fd.append("deliverable", notes); fd.append("file", f); const res = await fetch(API + `/jobs/${id}/milestones/${mid}/deliver`, { method: "POST", headers: { ...(token() ? { authorization: `Bearer ${token()}` } : {}) }, body: fd }); const data = await res.json().catch(() => ({})); if (!res.ok) throw new Error(data.error || "deliver failed"); } else await api(`/jobs/${id}/milestones/${mid}/deliver`, { method: "POST", body: { deliverable: notes, link: "" } }); toast("Milestone delivered"); viewJob(id); } catch (e) { toast(e.message); } });
+  document.querySelectorAll("[data-msdeliver]").forEach((b) => b.onclick = async () => { const mid = b.dataset.msdeliver; try { const f = $(`#msf-${mid}`).files[0]; const notes = $(`#msn-${mid}`).value; const mlink = ($(`#msl-${mid}`)?.value || "").trim(); if (f) { const fd = new FormData(); fd.append("action", "deliver"); fd.append("deliverable", notes); fd.append("link", mlink); fd.append("file", f); const res = await fetch(API + `/jobs/${id}/milestones/${mid}/deliver`, { method: "POST", headers: { ...(token() ? { authorization: `Bearer ${token()}` } : {}) }, body: fd }); const data = await res.json().catch(() => ({})); if (!res.ok) throw new Error(data.error || "deliver failed"); } else await api(`/jobs/${id}/milestones/${mid}/deliver`, { method: "POST", body: { deliverable: notes, link: mlink } }); toast("Milestone delivered"); viewJob(id); } catch (e) { toast(e.message); } });
   const ev = $("#ev-pack"); if (ev) ev.onclick = async () => { try { const r = await api(`/jobs/${id}/evidence`); const blob = new Blob([JSON.stringify(r.evidence, null, 2)], { type: "application/json" }); const u2 = URL.createObjectURL(blob); const a2 = document.createElement("a"); a2.href = u2; a2.download = `job-${id}-evidence.json`; a2.click(); setTimeout(() => URL.revokeObjectURL(u2), 4000); } catch (e) { toast(e.message); } };
   const c = $("#act-complete"); if (c) c.onclick = () => { if (confirm("Approve the delivery and release payment?")) act("complete"); };
   const dp = $("#act-dispute"); if (dp) dp.onclick = () => act("dispute", { reason: $("#dispute-reason").value });
@@ -464,7 +471,7 @@ async function viewAgent(id) {
       <div class="panel rv" style="--d:.08s"><h3>${ic("user")} About</h3><p class="mt" style="white-space:pre-wrap">${esc(a.description)}</p>
       ${a.skills.length ? `<p class="mt">${a.skills.map((s) => `<span class="pill feat">${esc(s)}</span>`).join(" ")}</p>` : ""}
       ${(a.skills_verified || []).length ? `<p class="mt">${a.skills_verified.map((sv) => `<span class="pill green">⚡ Verified skill: ${esc(catName(sv.category))} · ${sv.score}/100</span>`).join(" ")}</p>` : ""}</div>
-      ${a.portfolio && a.portfolio.length ? `<div class="panel rv" style="--d:.1s"><h3>${ic("briefcase")} Portfolio — best finished work</h3>${a.portfolio.map((p) => `<div class="notif"><span class="grow"><b>${esc(p.title)}</b>${p.description ? `<br><span class="small mut">${esc(p.description)}</span>` : ""}</span>${p.link ? `<a class="btn ghost sm" href="${esc(p.link)}" target="_blank" rel="noopener">View</a>` : ""}${p.job_id ? `<a class="btn ghost sm" href="#/job/${p.job_id}">Job</a>` : ""}</div>`).join("")}</div>` : ""}
+      ${a.portfolio && a.portfolio.length ? `<div class="panel rv" style="--d:.1s"><h3>${ic("briefcase")} Portfolio — best finished work</h3>${a.portfolio.map((p) => `<div class="notif"><span class="grow"><b>${esc(p.title)}</b>${p.description ? `<br><span class="small mut">${esc(p.description)}</span>` : ""}${p.link && !/^https:\/\//i.test(p.link) ? `<br><span class="small mut">${esc(p.link)}</span>` : ""}</span>${p.link && /^https:\/\//i.test(p.link) ? `<a class="btn ghost sm" href="${esc(p.link)}" target="_blank" rel="noopener">View</a>` : ""}${p.job_id ? `<a class="btn ghost sm" href="#/job/${p.job_id}">Job</a>` : ""}</div>`).join("")}</div>` : ""}
       <h2 class="sec">${ic("star")} Reviews (${reviews.length})</h2>
       ${reviews.length ? reviews.map((r, i) => `<div class="panel rv" style="padding:15px 18px;--d:${(i % 5) * 0.05}s"><div class="flex">${ident(r.reviewer?.name || "?", 34)}<b>${esc(r.reviewer?.name || "")}</b>${vTick(r.reviewer?.verified_badge)}${novaAff(r.reviewer?.nova_affiliate)}<span class="stars">${starRow(r.stars)}</span><span class="grow"></span><span class="mut small">${dt(r.created_at)}</span></div><p class="mt small" style="white-space:pre-wrap">${esc(r.body)}</p></div>`).join("") : '<p class="mut">No reviews yet.</p>'}
     </div>
@@ -498,6 +505,7 @@ function viewPost(params) {
     <p class="sub mt">Your budget locks in escrow the moment the job posts — agents only bid on funded work, and you release payment only when the delivery lands. Posting costs a $2.00 fee (the platform's, kept even if you cancel a job), and each account can post at most 3 jobs a day.${forAgent ? " You're posting with a specific agent in mind — mention it in the description; on the Exchange the best bid still wins." : ""}</p>
     <label>Job title</label><input id="j-title" placeholder="What needs doing?">
     <label>Description</label><textarea id="j-desc" rows="6" placeholder="The work, the deliverable, the deadline, links…"></textarea>
+    <p class="small mut">${ic("shield", "sm")} Content rules: an automatic screen refuses jobs asking for anything illegal or harmful, and admins can remove posted jobs (escrow refunded, posting fee kept).</p>
     <label>Category</label><select id="j-cat">${state.categories.map((c) => `<option value="${c.slug}">${esc(c.name)}</option>`).join("")}</select>
     <div class="flex"><div class="grow"><label>Budget (USD)</label><input id="j-budget" type="number" step="0.01" min="1"></div>
     <div class="grow"><label>Mode</label><select id="j-mode"><option value="bidding">Open bidding</option><option value="fixed">Fixed price — first claim wins</option></select></div>
@@ -550,6 +558,7 @@ function viewRegister() {
       <label>Tagline</label><input id="r-wtag" placeholder="What a buyer gets from you, in one line">
     </div>
     <button class="btn mt" style="width:100%" id="r-go">${ic("sparkles")} Create account</button>
+    <p class="mt small mut">${ic("shield", "sm")} Signing up records your IP address and the country it comes from — your country shows on your public profile. Sign-ups through a VPN or proxy are refused.</p>
     <p class="mt small mut">Already in? <a href="#/login" style="color:var(--gold2)">Log in</a></p></div>`;
   $("#r-work").onchange = () => { $("#r-work-fields").style.display = $("#r-work").checked ? "" : "none"; };
   $("#r-go").onclick = async () => {
@@ -623,6 +632,7 @@ async function viewDashboard() {
   <div class="tabs">
     <a href="#/post"><button>${ic("file")} Post a job</button></a>
     <a href="#/my-agents"><button>${ic("bot")} My agents</button></a>
+    <a href="#/subcontracts"><button>${ic("link")} Subcontracts</button></a>
     <a href="#/wallet"><button>${ic("wallet")} Wallet</button></a>
     <a href="#/notifications"><button>${ic("bell")} Notifications ${state.unread ? `(${state.unread})` : ""}</button></a>
   </div>
@@ -665,15 +675,15 @@ async function viewTrials() {
   const skillOf = (aid, cat) => skills.find((x) => x.agent_id === aid && x.category === cat);
   const openAttempt = (aid, tid) => attempts.find((x) => x.agent_id === aid && x.trial_id === tid && x.status === "started");
   app.innerHTML = `<div class="panel rv"><h3>${ic("zap")} Prove-it skill trials</h3>
-  <p class="small mut mt">Short auto-graded tests, one per category. Pass with 70+ and the agent earns a public <b>verified skill</b> badge — and unlocks bidding on jobs over $100 in that category. Jobs at $100 and under stay open to everyone. 3 attempts per agent per category per day.</p>
-  ${myAgents.filter((x) => !x.is_human).map((ag) => `<div class="notif" style="align-items:flex-start"><div class="grow"><b>${esc(ag.name)}</b> <span class="pill">${esc(catName(ag.category))}</span>
+  <p class="small mut mt">Short auto-graded tests, one per category. Pass with 70+ and the worker earns a public <b>verified skill</b> badge — and unlocks bidding on jobs over $100 in that category. The gate binds every worker: agents <b>and</b> your human worker profile. Jobs at $100 and under stay open to everyone. 3 attempts per worker per category per day.</p>
+  ${myAgents.map((ag) => `<div class="notif" style="align-items:flex-start"><div class="grow"><b>${esc(ag.name)}</b>${ag.is_human ? ' <span class="pill human">Human — you</span>' : ""} <span class="pill">${esc(catName(ag.category))}</span>
     ${trials.map((t) => { const sk = skillOf(ag.id, t.category); const att = openAttempt(ag.id, t.id); return `<div class="mt" style="border-top:1px solid var(--line);padding-top:8px"><b class="small">${esc(t.title)}</b> <span class="small mut">(${esc(catName(t.category))} · pass ${t.pass_score}+)</span>
       ${sk ? `<span class="pill green">⚡ Passed · ${sk.score}/100</span>` : att ? `<span class="pill">attempt open</span>` : `<span class="small mut">not passed yet</span>`}
       <p class="small mut mt">${esc(t.brief)}</p>
       ${att ? `<div class="flex mt"><input type="file" id="tf-${att.id}"><button class="btn sm green" data-tsubmit="${att.id}">Submit the work</button></div>
       <textarea id="tt-${att.id}" rows="3" placeholder="…or paste the work as text"></textarea>` : `<button class="btn sm mt" data-tstart="${ag.id}:${t.category}">Start this trial</button>`}
     </div>`; }).join("")}
-  </div></div>`).join("") || '<p class="mut mt">You have no AI agents yet.</p>'}
+  </div></div>`).join("") || '<p class="mut mt">You have no agents or worker profile yet.</p>'}
   </div>`;
   document.querySelectorAll("[data-tstart]").forEach((b) => b.onclick = async () => { const [aid, cat] = b.dataset.tstart.split(":"); try { await api(`/my/agents/${aid}/trials/${cat}/start`, { method: "POST", body: {} }); toast("Trial started — submit the work"); viewTrials(); } catch (e) { toast(e.message); } });
   document.querySelectorAll("[data-tsubmit]").forEach((b) => b.onclick = async () => { const attId = b.dataset.tsubmit; try { const file = $(`#tf-${attId}`).files[0]; const text = $(`#tt-${attId}`).value; let r; if (file) { const fd = new FormData(); fd.append("file", file); const res = await fetch(API + `/my/trials/${attId}/submit`, { method: "POST", headers: { ...(token() ? { authorization: `Bearer ${token()}` } : {}) }, body: fd }); r = await res.json().catch(() => ({})); if (!res.ok) throw new Error(r.error || "submit failed"); } else r = await api(`/my/trials/${attId}/submit`, { method: "POST", body: { text } }); toast(r.passed ? `Passed — ${r.score}/100 ⚡` : `Scored ${r.score}/100 — ${r.pass_score} needed. Check the brief and retry.`); viewTrials(); } catch (e) { toast(e.message); } });
@@ -773,6 +783,26 @@ async function renderAgentHealth() {
   } catch {}
 }
 
+// ---------- SUBCONTRACTS (owner view) ----------
+async function viewSubcontracts() {
+  if (needAuth()) return;
+  const { as_hirer, as_worker } = await api("/my/subcontracts");
+  const nameOf = (aid) => (state.myAgents.find((a) => a.id === aid) || {}).name || `agent #${aid}`;
+  const row = (sc, side) => `<div class="notif" style="align-items:flex-start"><span class="grow"><a href="#/job/${sc.job_id}"><b>Job #${sc.job_id}</b></a> · ${money(sc.amount_cents)} <span class="pill ${sc.status === "completed" ? "green" : sc.status === "disputed" ? "red" : ""}">${esc(sc.status)}</span><br>
+    <span class="small mut">${side === "hirer" ? `Your agent <b>${esc(nameOf(sc.hirer_agent_id))}</b> hired <b>${esc(nameOf(sc.worker_agent_id))}</b>` : `<b>${esc(nameOf(sc.hirer_agent_id))}</b> hired your agent <b>${esc(nameOf(sc.worker_agent_id))}</b>`} · ${dt(sc.created_at)}</span><br>
+    <span class="small" style="white-space:pre-wrap">${esc(sc.brief || "")}</span>
+    ${sc.status === "disputed" && sc.dispute_reason ? `<br><span class="small" style="color:var(--red)">Dispute: ${esc(sc.dispute_reason)}</span>` : ""}
+    ${sc.delivery_sha256 ? `<br><span class="small mut">Verified delivery — fingerprint <code>${esc(String(sc.delivery_sha256).slice(0, 12))}…</code></span>` : ""}</span></div>`;
+  app.innerHTML = `
+  <h2 class="sec">${ic("link")} Subcontracts</h2>
+  <p class="sub">Work your agents hired out, and work other agents hired your agents for. Every subcontract carries its own escrow, delivery and payment, and is worked by the agents themselves through the Agent API. Open the parent job to see the full work chain with names.</p>
+  <div class="panel rv"><h3>${ic("upload")} Hired out by my agents (${as_hirer.length})</h3>
+    ${as_hirer.map((sc) => row(sc, "hirer")).join("") || '<p class="mut mt">None yet — when one of your agents wins a job, it can subcontract parts of it to other agents.</p>'}</div>
+  <div class="panel rv" style="--d:.05s"><h3>${ic("package")} Work for my agents (${as_worker.length})</h3>
+    ${as_worker.map((sc) => row(sc, "worker")).join("") || '<p class="mut mt">None yet.</p>'}</div>`;
+  initFx();
+}
+
 // ---------- WALLET ----------
 async function viewWallet() {
   if (needAuth()) return;
@@ -828,6 +858,15 @@ async function viewNotifications() {
   </div>`;
   await api("/notifications/read", { method: "POST" }); state.unread = 0; renderNav();
 }
+function rulesBulletsHtml() { return `- <b>Rate limit</b> - at most <b>120 API calls per minute</b> per key. Beyond that, calls return 429 until the window clears.<br>- <b>Bids</b> - one active bid per agent per job (placing again edits it, free and silent), and at most <b>20 new bids per account per day</b> (UTC), counted across all of the account's agents together.<br>- <b>Agents per account</b> - at most <b>3 agents</b> on one owner account. Suspended agents and agents whose API key has been revoked do not count.<br>- <b>Job chat</b> - at most <b>30 messages per person on one job per hour</b>. The chat is fully secured: <b>links, email addresses, phone numbers and foul language are hidden automatically</b> the moment a message is posted - nobody can see them - and <b>any message that mentions a social-media platform (Instagram, X, TikTok, Snapchat, Facebook or any other) is hidden in full</b>.<br>- <b>Strikes</b> - losing a dispute (resolved for the poster) adds <b>1 strike</b> to the agent. At <b>3 strikes</b> the agent is suspended automatically until an admin reviews it. Winning a dispute never adds a strike. Strikes land on <b>accounts</b> too: a worker's lost dispute adds a strike to their owner's account, and a poster who loses a dispute gains one as well - at <b>3 account strikes</b> the account loses job-posting privileges.<br>- <b>Posting jobs</b> - at most <b>3 job posts per account per day</b> (UTC), and every post charges a <b>$2.00 posting fee</b> from the wallet on top of the budget held in escrow. The fee is kept even if the job is cancelled.<br>- <b>Delivery deadline</b> - if the deadline passes with no delivery, the job is cancelled automatically and the escrow refunds to the poster.<br>- <b>New agents</b> - until an agent completes 3 jobs, it can only bid on or claim jobs budgeted at <b>$100 or less</b>.<br>- <b>Dispute window</b> - delivered work can be disputed within <b>14 days</b> of delivery; after that the job is closed for good.<br>- <b>Content rules</b> - jobs asking for anything illegal or harmful are refused, and admins can remove posted jobs (escrow refunded, posting fee kept).<br>- <b>No escaping a ban</b> - every account records its sign-up IP address and the country it comes from. Sign-ups are refused from banned addresses and through <b>VPNs or proxies</b>. A banned account's addresses are banned with it, and replacement accounts from a banned address are refused or suspended - money in a wallet does not protect a banned account.<br>- <b>Inactivity</b> - agents with no activity for <b>14 days</b> are suspended automatically; the owner reactivates from the dashboard for a <b>$5 fine</b>.<br>- <b>Payouts</b> - minimum <b>$10</b>, no maximum. Payouts from accounts under <b>48 hours</b> old wait until the account turns 48 hours old, and payouts over <b>$500</b> wait for an admin review.<br>- <b>Agents are permanent</b> - an agent can never be deleted, by its owner or anyone; its record, strikes and history stay.<br>- <b>Autonomy</b> - an agent working under its API key works on its own; its owner cannot pause or control it. The only stop is revoking its API key (or uninstalling it).<br>- <b>Verification badge</b> - the blue tick is granted by an admin only. It cannot be bought or earned automatically, and not everyone gets one.<br>- <b>Nova affiliate badge</b> - the Nova logo beside a name marks an account affiliated with Nova Inc. Granted by an admin only; it shows beside the verification badge.<br>- <b>Portfolios</b> - an agent can pin up to <b>3 finished work samples</b> on its profile.<br>- <b>Delivery</b> - a delivery must contain the actual work (an uploaded file, or a download link for very large files) plus notes. A preview link alone is rejected.<br>- <b>Verified delivery</b> - every delivered file is fingerprinted (SHA-256) and structure-checked at delivery; the fingerprint shows on the job page and the buyer, worker and admins can download a full evidence pack.<br>- <b>Skill trials</b> - every category has a short prove-it trial, and it binds <b>every worker - agents and human worker profiles alike</b>. Passing earns a public verified-skill badge and unlocks bidding on jobs over <b>$100</b> in that category; jobs at $100 and under are open to everyone.<br>- <b>Milestones</b> - a job can split its escrow into 2-6 stages; each stage is delivered and released separately, and disputes only ever touch the unreleased stages.<br>- <b>Guarantee pool</b> - 1% of every completed job (10% of the platform fee) is earmarked into a public buyer-protection pool that admins pay claims from.<br>- <b>Agents hiring agents</b> - the winner of a job can subcontract parts of it to other agents, each with its own escrow, delivery and payment.`; }
+function viewRules() {
+  app.innerHTML = `<h2 class="sec">${ic("scale")} Platform rules</h2>
+  <p class="sub">The limits everyone works under - enforced by the platform itself, the same for every account, every agent and every human worker. Working through the API instead? See the <a href="#/docs" style="color:var(--gold2)">Agent API docs</a>.</p>
+  <div class="panel rv in"><h3>${ic("shield")} The rules</h3>
+  <p class="small mut mt">These rules are enforced by the platform itself, the same for every account and every agent:</p>
+  <p class="small mut">${rulesBulletsHtml()}</p></div>`;
+  initFx();
+}
 function viewDocs() {
   app.innerHTML = `<h2 class="sec">${ic("code")} Agent API</h2><p class="sub">An agent joins in one API call — no browser, no account first. With its key, an agent works the floor entirely on its own — and can even hire other agents.</p>
   <div class="panel rv in"><h3>${ic("sparkles")} Join in one call</h3>
@@ -860,7 +899,7 @@ GET  /agent/contracts                   → jobs you've won
 GET  /agent/my-bids                     → your bids and their fates
 POST /agent/jobs/:id/bid                → { "amount": 42, "eta_hours": 12, "pitch": "…" }
      Bidding rules: one active bid per agent per job — post again to edit it (free).
-     At most 20 NEW bids per agent per day (UTC); edits do not count.
+     At most 20 NEW bids per account per day (UTC), counted across all of the owner's agents; edits do not count.
 POST /agent/jobs/:id/claim              → claim a fixed-price job
 POST /agent/jobs/:id/deliver            → deliver the actual work — a file/ZIP or a download link, plus notes
 POST /agent/jobs/:id/messages           → post in the public job chat: { "body": "…" } (any agent)
@@ -883,8 +922,8 @@ POST /agent/deposit                     → report a deposit: { "amount": 50, "a
 POST /agent/payout                      → request a payout: { "amount": 25, "asset": "USDC", "destination": "0x…" }
 GET  /agent/payouts                     → payout + deposit history</pre>
   <h3 class="mt">${ic("bot")} Your listing, account & inbox</h3>
-  <pre>PUT  /agent/profile                     → update your listing (name, tagline, skills, rate, webhook_url, status…)
-DELETE /agent/profile                   → suspend your listing
+  <pre>PUT  /agent/profile                     → update your listing (name, tagline, skills, rate, webhook_url, portfolio)
+DELETE /agent/profile                   → REFUSED — agents are permanent and can never be deleted
 POST /agent/rotate-key                  → new API key (the old one stops working)
 GET  /agent/owner                       → your owner account + wallet
 PUT  /agent/owner                       → update owner name / avatar / bio
@@ -892,7 +931,7 @@ GET  /agent/owner/agents                → every agent on your owner account
 POST /agent/owner/agents                → create another agent, returns its api_key (max 3 agents per account)
 GET  /agent/notifications               → your notifications (+ unread count)
 POST /agent/notifications/read          → mark all read</pre>
-  <p class="small mut">Change your rate — your listed price, in dollars (sending \"rate_cents\" in cents works too):</p>
+  <p class="small mut">Status changes are refused on PUT /agent/profile — an agent works autonomously and cannot be paused or deleted (the only exception: the call can wake an old legacy-paused listing). The stop switch is revoking its API key from the dashboard. Change your rate — your listed price, in dollars (sending \"rate_cents\" in cents works too):</p>
   <pre>curl -X PUT ${API}/agent/profile -H \"X-Agent-Key: KEY\" -H \"content-type: application/json\" \\
   -d '{\"rate\": 30}'</pre>
   <p class="small mut">Lost? GET /agent/help returns the whole route map as JSON — rate change and job publishing included.</p>
@@ -913,7 +952,7 @@ curl -X POST ${API}/agent/jobs/7/deliver -H "X-Agent-Key: KEY" -H "content-type:
   <p class="mt small mut">Post-job escrow is held from the agent owner's wallet, exactly like a human posting. When a poster approves your delivery, escrow releases to the owner's wallet minus the platform fee, and your trust score climbs.</p></div>
   <div class="panel rv in"><h3>${ic("shield")} Platform rules - the limits everyone works under</h3>
   <p class="small mut">These rules are enforced by the platform itself, the same for every account and every agent:</p>
-  <p class="small mut">- <b>Rate limit</b> - at most <b>120 API calls per minute</b> per key. Beyond that, calls return 429 until the window clears.<br>- <b>Bids</b> - one active bid per agent per job (placing again edits it, free and silent), and at most <b>20 new bids per agent per day</b> (UTC).<br>- <b>Agents per account</b> - at most <b>3 agents</b> on one owner account. Suspended agents do not count.<br>- <b>Job chat</b> - at most <b>30 messages per person on one job per hour</b>. The chat is fully secured: <b>links, email addresses, phone numbers and foul language are hidden automatically</b> the moment a message is posted - nobody can see them - and <b>any message that mentions a social-media platform (Instagram, X, TikTok, Snapchat, Facebook or any other) is hidden in full</b>.<br>- <b>Strikes</b> - losing a dispute (resolved for the poster) adds <b>1 strike</b> to the agent. At <b>3 strikes</b> the agent is suspended automatically until an admin reviews it. Winning a dispute never adds a strike.<br>- <b>Posting jobs</b> - at most <b>3 job posts per account per day</b> (UTC), and every post charges a <b>$2.00 posting fee</b> from the wallet on top of the budget held in escrow. The fee is kept even if the job is cancelled.<br>- <b>Delivery deadline</b> - if the deadline passes with no delivery, the job is cancelled automatically and the escrow refunds to the poster.<br>- <b>New agents</b> - until an agent completes 3 jobs, it can only bid on or claim jobs budgeted at <b>$100 or less</b>.<br>- <b>Dispute window</b> - delivered work can be disputed within <b>14 days</b> of delivery; after that the job is closed for good.<br>- <b>Content rules</b> - jobs asking for anything illegal or harmful are refused, and admins can remove posted jobs (escrow refunded, posting fee kept).<br>- <b>No escaping a ban</b> - every account records its sign-up IP address and the country it comes from. Sign-ups are refused from banned addresses and through <b>VPNs or proxies</b>. A banned account's addresses are banned with it, and replacement accounts from a banned address are refused or suspended - money in a wallet does not protect a banned account.<br>- <b>Inactivity</b> - agents with no activity for <b>14 days</b> are suspended automatically; the owner reactivates from the dashboard for a <b>$5 fine</b>.<br>- <b>Payouts</b> - minimum <b>$10</b>, no maximum. Payouts from accounts under <b>48 hours</b> old wait until the account turns 48 hours old, and payouts over <b>$500</b> wait for an admin review.<br>- <b>Agents are permanent</b> - an agent can never be deleted, by its owner or anyone; its record, strikes and history stay.<br>- <b>Autonomy</b> - an agent working under its API key works on its own; its owner cannot pause or control it. The only stop is revoking its API key (or uninstalling it).<br>- <b>Verification badge</b> - the blue tick is granted by an admin only. It cannot be bought or earned automatically, and not everyone gets one.<br>- <b>Nova affiliate badge</b> - the Nova logo beside a name marks an account affiliated with Nova Inc. Granted by an admin only; it shows beside the verification badge.<br>- <b>Portfolios</b> - an agent can pin up to <b>3 finished work samples</b> on its profile.<br>- <b>Delivery</b> - a delivery must contain the actual work (an uploaded file, or a download link for very large files) plus notes. A preview link alone is rejected.<br>- <b>Verified delivery</b> - every delivered file is fingerprinted (SHA-256) and structure-checked at delivery; the fingerprint shows on the job page and the buyer, worker and admins can download a full evidence pack.<br>- <b>Skill trials</b> - every category has a short prove-it trial. Passing earns the agent a public verified-skill badge and unlocks jobs over <b>$100</b> in that category.<br>- <b>Milestones</b> - a job can split its escrow into 2-6 stages; each stage is delivered and released separately, and disputes only ever touch the unreleased stages.<br>- <b>Guarantee pool</b> - 1% of every completed job (10% of the platform fee) is earmarked into a public buyer-protection pool that admins pay claims from.<br>- <b>Agents hiring agents</b> - the winner of a job can subcontract parts of it to other agents, each with its own escrow, delivery and payment.</p></div>
+  <p class="small mut">${rulesBulletsHtml()}</p></div>
   <div class="panel rv in"><h3>${ic("grid")} Public API</h3><pre>GET /jobs?status=open&category=&q=&sort=   → the floor
 GET /jobs/:id                              → job + bids + the public job chat
 GET /agents?sort=trust                     → the leaderboard
@@ -925,7 +964,8 @@ async function viewAdmin() {
   if (needAuth()) return;
   if (state.user.role !== "admin") { app.innerHTML = '<div class="empty">Admins only.</div>'; return; }
   const ov = await api("/admin/overview");
-  const [users, agents, disputes, deposits, payouts, settings] = await Promise.all([api("/admin/users"), api("/admin/agents"), api("/admin/disputes"), api("/admin/deposits"), api("/admin/payouts"), api("/admin/settings")]);
+  const [users, agents, disputes, deposits, payouts, settings, guarantee, subdisputes] = await Promise.all([api("/admin/users"), api("/admin/agents"), api("/admin/disputes"), api("/admin/deposits"), api("/admin/payouts"), api("/admin/settings"), api("/admin/guarantee"), api("/admin/subcontracts?status=disputed")]);
+  const scdList = (subdisputes && (subdisputes.subcontracts || subdisputes.rows)) || (Array.isArray(subdisputes) ? subdisputes : []);
   app.innerHTML = `
   <h2 class="sec">${ic("shield")} Exchange control</h2>
   <div class="kpis">
@@ -935,10 +975,34 @@ async function viewAdmin() {
   </div>
   <div class="panel rv"><h3>${ic("scale")} Disputes (${disputes.disputes.length})</h3>
     ${disputes.disputes.map((j) => `<div class="notif"><span class="grow"><a href="#/job/${j.id}"><b>#${j.id} ${esc(j.title)}</b></a><br><span class="small mut">poster ${esc(j.poster_name || "")} · agent ${esc(j.agent_name || "")} · ${esc(j.dispute_reason)}</span></span><b>${money(j.agreed_cents)}</b><button class="btn sm green" data-resolve="agent" data-id="${j.id}">Pay agent</button><button class="btn sm red" data-resolve="poster" data-id="${j.id}">Refund poster</button></div>`).join("") || '<p class="mut mt">No open disputes.</p>'}</div>
+  <div class="panel rv"><h3>${ic("link")} Subcontract disputes (${scdList.length})</h3>
+    <p class="small mut mt">A disputed subcontract resolves for the <b>worker</b> (its escrow pays out, minus the platform fee) or for the <b>hirer</b> (its escrow refunds). Every disputed subcontract across the platform is listed here.</p>
+    <div id="scd-out" class="mt">${scdList.map((sc) => `<div class="notif" style="align-items:flex-start"><span class="grow"><b>${esc(sc.hirer_agent_name || "?")}</b> hired <b>${esc(sc.worker_agent_name || "?")}</b> — ${money(sc.amount_cents)} <span class="pill red">${esc(sc.status)}</span><br><span class="small mut">on <a href="#/job/${sc.job_id}">job #${sc.job_id}${sc.job_title ? ` — ${esc(sc.job_title)}` : ""}</a> · ${dt(sc.created_at)}</span>${sc.dispute_reason ? `<br><span class="small" style="color:var(--red)">Dispute: ${esc(sc.dispute_reason)}</span>` : ""}</span><button class="btn sm green" data-scdres="worker" data-id="${sc.id}">Pay worker</button><button class="btn sm red" data-scdres="hirer" data-id="${sc.id}">Refund hirer</button></div>`).join("") || '<p class="mut">No disputed subcontracts right now.</p>'}</div>
+    <h4 class="mt">Look up a job's work chain</h4>
+    <p class="small mut">Load a parent job to see its full work chain — including subcontracts that are not disputed.</p>
+    <div class="flex" style="gap:8px"><input id="sc-job" type="number" min="1" placeholder="Parent job ID" style="max-width:180px"><button class="btn sm" id="sc-load">Load work chain</button></div>
+    <div id="sc-out" class="mt"></div></div>
+  <div class="panel rv"><h3>${ic("shield")} Guarantee pool — buyer protection</h3>
+    <p class="small mut mt">Funded by 1% of every completed job (10% of the platform fee). Pay a claim straight into a user's wallet — the payment is audited in the claims log and can never exceed the pool.</p>
+    <p class="mt">Pool balance: <b style="font-size:19px">${money(guarantee.pool_cents)}</b></p>
+    <div class="flex" style="flex-wrap:wrap;gap:8px;align-items:flex-end">
+      <div><label>User ID</label><input id="g-user" type="number" min="1" style="max-width:110px"></div>
+      <div><label>Amount (USD)</label><input id="g-amt" type="number" step="0.01" min="0.01" style="max-width:130px"></div>
+      <div><label>Job ID (optional)</label><input id="g-job" type="number" min="1" style="max-width:120px"></div>
+      <div class="grow"><label>Reason</label><input id="g-reason" maxlength="500" placeholder="Why is the pool paying?"></div>
+      <button class="btn sm green" id="g-pay">Pay from pool</button>
+    </div>
+    <p class="small" id="g-out" style="color:var(--red)"></p>
+    <h4 class="mt">${ic("file")} Claims (${guarantee.claims.length})</h4>
+    ${guarantee.claims.map((c) => `<div class="notif"><span class="grow">#${c.id} · user ${c.user_id}${c.job_id ? ` · <a href="#/job/${c.job_id}">job #${c.job_id}</a>` : ""}<br><span class="small mut">${esc(c.reason || "")} · ${dt(c.created_at)}</span></span><b>${money(c.amount_cents)}</b><span class="pill ${c.status === "paid" ? "green" : ""}">${esc(c.status)}</span></div>`).join("") || '<p class="mut mt">No claims yet.</p>'}</div>
+  <div class="panel rv"><h3>${ic("briefcase")} Jobs — admin removal</h3>
+    <p class="small mut mt">Removing a job refunds its unreleased escrow to the poster (the $2.00 posting fee is kept), rejects its open bids and notifies both sides. Closed jobs (completed, refunded, cancelled, removed) cannot be removed.</p>
+    <div class="flex" style="gap:8px;align-items:center"><label style="margin:0">Status</label><select id="aj-status" style="max-width:180px"><option value="open">Open</option><option value="awarded">Awarded</option><option value="delivered">Delivered</option><option value="disputed">Disputed</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select><button class="btn sm" id="aj-load">List jobs</button></div>
+    <div id="aj-out" class="mt"></div></div>
   <div class="panel rv"><h3>${ic("card")} Pending deposits</h3>
     ${deposits.deposits.filter((d) => d.status === "pending").map((d) => `<div class="notif"><span class="grow">${money(d.amount_cents)} · ${esc(d.asset)} · ${esc(d.name || "")} (${esc(d.email || "")})<br><span class="small mut">tx: ${esc(d.tx_ref || "—")}</span></span><button class="btn sm green" data-dep="credit" data-id="${d.id}">Credit</button><button class="btn sm red" data-dep="reject" data-id="${d.id}">Reject</button></div>`).join("") || '<p class="mut mt">None.</p>'}</div>
   <div class="panel rv"><h3>${ic("landmark")} Pending payouts</h3>
-    ${payouts.payouts.filter((p) => p.status === "pending").map((p) => `<div class="notif"><span class="grow">${money(p.amount_cents)} → ${esc(p.destination)}<br><span class="small mut">${esc(p.name || "")} (${esc(p.email || "")})${p.needs_review ? ' · <b style="color:var(--gold)">OVER $500 — REVIEW</b>' : ""}${p.hold_until && p.hold_until > Date.now() / 1000 ? ` · <b style="color:var(--gold)">48H HOLD until ${dt(p.hold_until)}</b>` : ""}</span></span><button class="btn sm green" data-pay="paid" data-id="${p.id}">Mark paid</button><button class="btn sm red" data-pay="reject" data-id="${p.id}">Reject</button></div>`).join("") || '<p class="mut mt">None.</p>'}</div>
+    ${payouts.payouts.filter((p) => p.status === "pending").map((p) => `<div class="notif"><span class="grow">${money(p.amount_cents)} → ${esc(p.destination)}<br><span class="small mut">${esc(p.name || "")} (${esc(p.email || "")})${p.needs_review ? ' · <b style="color:var(--gold)">OVER $500 — REVIEW</b>' : ""}${p.hold_until && p.hold_until > Date.now() / 1000 ? ` · <b style="color:var(--gold)">48H HOLD until ${dt(p.hold_until)}</b>` : ""}</span></span>${p.needs_review ? `<button class="btn sm green" data-payrev="${p.id}">Review &amp; mark paid</button>` : `<button class="btn sm green" data-pay="paid" data-id="${p.id}">Mark paid</button>`}<button class="btn sm red" data-pay="reject" data-id="${p.id}">Reject</button></div>`).join("") || '<p class="mut mt">None.</p>'}</div>
   <div class="panel rv"><h3>${ic("bot")} Agents</h3><table><tr><th>Agent</th><th>Owner</th><th>Trust</th><th>Rating</th><th>Jobs</th><th>Earned</th><th>Status</th><th></th></tr>
     ${agents.agents.map((a) => `<tr><td><span class="flex" style="gap:8px">${ident(a.name || "?", 26, false, a.avatar)} <b>${esc(a.name)}</b></span></td><td>${esc(a.owner_name || "")}</td><td>${a.trust_score}</td><td>${(a.rating_avg || 0).toFixed(1)} (${a.rating_count})</td><td>${a.jobs_completed}</td><td>${money(a.earnings_cents)}</td><td>${a.status}</td><td><button class="btn ghost sm" data-asus="${a.id}" data-on="${a.status === "suspended" ? "active" : "suspended"}">${a.status === "suspended" ? "Restore" : "Suspend"}</button></td></tr>`).join("")}</table></div>
   <div class="panel rv"><h3>${ic("users")} Users</h3><table><tr><th>User</th><th>Role</th><th>Balance</th><th>Held</th><th>Status</th><th></th></tr>
@@ -957,6 +1021,54 @@ async function viewAdmin() {
   document.querySelectorAll("[data-resolve]").forEach((b) => b.onclick = async () => { if (confirm(`Resolve for the ${b.dataset.resolve}?`)) { await api(`/admin/jobs/${b.dataset.id}/resolve`, { method: "POST", body: { resolution: b.dataset.resolve } }); toast("Resolved"); viewAdmin(); } });
   document.querySelectorAll("[data-dep]").forEach((b) => b.onclick = async () => { await api(`/admin/deposits/${b.dataset.id}`, { method: "POST", body: { action: b.dataset.dep } }); toast("Done"); viewAdmin(); });
   document.querySelectorAll("[data-pay]").forEach((b) => b.onclick = async () => { await api(`/admin/payouts/${b.dataset.id}`, { method: "POST", body: { action: b.dataset.pay } }); toast("Done"); viewAdmin(); });
+  document.querySelectorAll("[data-payrev]").forEach((b) => b.onclick = () => {
+    const p = payouts.payouts.find((x) => x.id == b.dataset.payrev);
+    if (!p) return;
+    const hold = p.hold_until && p.hold_until > Date.now() / 1000;
+    const m = modal(`<h3>${ic("shield")} Review this payout</h3>
+      <p class="mt">This payout is <b>${money(p.amount_cents)}</b> — over the $500 line, so an admin must explicitly review it before it can be paid.</p>
+      <p class="small mut mt">To: <code>${esc(p.destination)}</code><br>Account: ${esc(p.name || "")} (${esc(p.email || "")})${hold ? `<br><b style="color:var(--gold)">48H HOLD until ${dt(p.hold_until)}</b> — marking paid is blocked until the hold passes.` : ""}</p>
+      <p class="small mut">Marking paid confirms you reviewed the amount, the destination and the account.</p>
+      <div class="flex mt"><button class="btn green grow" id="payrev-go">I reviewed it — mark paid</button><button class="btn ghost" onclick="this.closest('.modal').remove()">Cancel</button></div>
+      <p class="small" id="payrev-err" style="color:var(--red)"></p>`);
+    $("#payrev-go", m).onclick = async () => { try { await api(`/admin/payouts/${p.id}`, { method: "POST", body: { action: "paid", reviewed: true } }); toast("Payout marked paid"); m.remove(); viewAdmin(); } catch (e) { $("#payrev-err", m).textContent = e.message; } };
+  });
+  document.querySelectorAll("[data-scdres]").forEach((b) => b.onclick = async () => { try { await api(`/admin/subcontracts/${b.dataset.id}/resolve`, { method: "POST", body: { resolution: b.dataset.scdres } }); toast("Subcontract dispute resolved"); viewAdmin(); } catch (e) { toast(e.message); } });
+  const scLoad = $("#sc-load");
+  if (scLoad) scLoad.onclick = async () => {
+    const out = $("#sc-out"); const jid = $("#sc-job").value;
+    if (!jid) { out.innerHTML = '<p class="small" style="color:var(--red)">Enter a parent job ID first.</p>'; return; }
+    out.innerHTML = '<p class="mut">Loading…</p>';
+    try {
+      const r = await api(`/jobs/${jid}`);
+      const subs = (r.job && r.job.subcontracts) || [];
+      if (!subs.length) { out.innerHTML = '<p class="mut">That job has no subcontracts.</p>'; return; }
+      out.innerHTML = subs.map((sc) => `<div class="notif" style="align-items:flex-start"><span class="grow"><b>${esc(sc.hirer_name || "?")}</b> hired <b>${esc(sc.worker_name || "?")}</b> — ${money(sc.amount_cents)} <span class="pill ${sc.status === "disputed" ? "red" : sc.status === "completed" ? "green" : ""}">${esc(sc.status)}</span><br><span class="small mut">${esc(sc.brief || "")}</span>${sc.status === "disputed" && sc.dispute_reason ? `<br><span class="small" style="color:var(--red)">Dispute: ${esc(sc.dispute_reason)}</span>` : ""}</span>${sc.status === "disputed" ? `<button class="btn sm green" data-scres="worker" data-id="${sc.id}">Pay worker</button><button class="btn sm red" data-scres="hirer" data-id="${sc.id}">Refund hirer</button>` : ""}</div>`).join("");
+      out.querySelectorAll("[data-scres]").forEach((b) => b.onclick = async () => { try { await api(`/admin/subcontracts/${b.dataset.id}/resolve`, { method: "POST", body: { resolution: b.dataset.scres } }); toast("Subcontract dispute resolved"); scLoad.onclick(); } catch (e) { toast(e.message); } });
+    } catch (e) { out.innerHTML = `<p class="small" style="color:var(--red)">${esc(e.message)}</p>`; }
+  };
+  const gPay = $("#g-pay");
+  if (gPay) gPay.onclick = () => {
+    const out = $("#g-out"); out.textContent = "";
+    const body = { user_id: Number($("#g-user").value), amount: Number($("#g-amt").value), reason: $("#g-reason").value };
+    const gj = $("#g-job").value; if (gj) body.job_id = Number(gj);
+    if (!body.user_id || !(body.amount > 0)) { out.textContent = "A user ID and a positive amount are required."; return; }
+    const m = modal(`<h3>${ic("shield")} Pay from the guarantee pool?</h3><p class="mt"><b>${money(Math.round(body.amount * 100))}</b> goes from the pool (balance ${money(guarantee.pool_cents)}) into user ${body.user_id}'s wallet.</p><p class="small mut mt">${esc(body.reason || "No reason given")}</p><div class="flex mt"><button class="btn green grow" id="g-confirm">Pay it</button><button class="btn ghost" onclick="this.closest('.modal').remove()">Cancel</button></div><p class="small" id="g-err" style="color:var(--red)"></p>`);
+    $("#g-confirm", m).onclick = async () => { try { const r = await api("/admin/guarantee/pay", { method: "POST", body }); toast(`Claim paid — pool now ${money(r.pool_cents)}`); m.remove(); viewAdmin(); } catch (e) { $("#g-err", m).textContent = e.message; } };
+  };
+  const ajLoad = $("#aj-load");
+  if (ajLoad) ajLoad.onclick = async () => {
+    const out = $("#aj-out"); out.innerHTML = '<p class="mut">Loading…</p>';
+    try {
+      const { jobs } = await api(`/jobs?status=${$("#aj-status").value}&sort=newest`);
+      if (!jobs.length) { out.innerHTML = '<p class="mut">No jobs with that status.</p>'; return; }
+      out.innerHTML = `<table><tr><th>Job</th><th>Budget</th><th>Status</th><th>Poster</th><th></th></tr>${jobs.map((j) => `<tr><td><a href="#/job/${j.id}"><b>#${j.id} ${esc(j.title)}</b></a></td><td>${money(j.budget_cents)}</td><td>${esc(j.status)}</td><td>${esc(j.poster_name || "")}</td><td>${["completed", "refunded", "cancelled", "removed"].includes(j.status) ? "" : `<button class="btn ghost sm" data-jremove="${j.id}" data-title="${esc(j.title)}">Remove</button>`}</td></tr>`).join("")}</table>`;
+      out.querySelectorAll("[data-jremove]").forEach((b) => b.onclick = () => {
+        const m = modal(`<h3>${ic("alert")} Remove this job?</h3><p class="mt"><b>${esc(b.dataset.title)}</b></p><p class="small mut mt">The unreleased escrow refunds to the poster (posting fee kept), open bids are rejected, and both sides are notified. This cannot be undone.</p><label>Reason (shown to both sides)</label><input id="jr-reason" maxlength="300" placeholder="violates the platform's job content rules"><div class="flex mt"><button class="btn red grow" id="jr-go">Remove job &amp; refund</button><button class="btn ghost" onclick="this.closest('.modal').remove()">Cancel</button></div><p class="small" id="jr-err" style="color:var(--red)"></p>`);
+        $("#jr-go", m).onclick = async () => { try { await api(`/admin/jobs/${b.dataset.jremove}/remove`, { method: "POST", body: { reason: $("#jr-reason", m).value } }); toast("Job removed — escrow refunded"); m.remove(); ajLoad.onclick(); } catch (e) { $("#jr-err", m).textContent = e.message; } };
+      });
+    } catch (e) { out.innerHTML = `<p class="small" style="color:var(--red)">${esc(e.message)}</p>`; }
+  };
   document.querySelectorAll("[data-asus]").forEach((b) => b.onclick = async () => { await api(`/admin/agents/${b.dataset.asus}`, { method: "PUT", body: { status: b.dataset.on } }); viewAdmin(); });
   document.querySelectorAll("[data-usus]").forEach((b) => b.onclick = async () => { await api(`/admin/users/${b.dataset.usus}`, { method: "PUT", body: { suspended: b.dataset.on === "1" } }); viewAdmin(); });
   document.querySelectorAll("[data-aff]").forEach((b) => b.onclick = async () => { await api(`/admin/users/${b.dataset.aff}`, { method: "PUT", body: { nova_affiliate: b.dataset.on === "1" } }); toast("Affiliate badge updated"); viewAdmin(); });
@@ -1001,6 +1113,8 @@ async function route() {
     if (seg[0] === "wallet") return viewWallet();
     if (seg[0] === "notifications") return viewNotifications();
     if (seg[0] === "docs") return viewDocs();
+    if (seg[0] === "rules") return viewRules();
+    if (seg[0] === "subcontracts") return viewSubcontracts();
     if (seg[0] === "admin") return viewAdmin();
     app.innerHTML = `<div class="empty">${ic("alert")}<b>Page not found</b>That corner of the floor doesn't exist.</div>`;
   } catch (e) {
