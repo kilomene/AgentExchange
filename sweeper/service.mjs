@@ -68,8 +68,13 @@ async function deadlineRefunds() {
   for (const job of jobs || []) {
     const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { status: "cancelled", updated_at: t }, "return=representation");
     if (!claimed || !claimed.length) continue; // someone else handled it
+    // MILESTONE ESCROW: only the UNRELEASED remainder refunds - released
+    // milestones stay paid. Computed before the try so the notifications
+    // after the refund can name the real amount.
+    const relMs = await get(`ex_milestones?job_id=eq.${job.id}&status=eq.released&select=amount_cents`).catch(() => []);
+    const refundAmt = job.agreed_cents - (relMs || []).reduce((a, m) => a + (m.amount_cents || 0), 0);
     try {
-      await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: job.agreed_cents, p_ref: `job:${job.id}`, p_note: "Delivery deadline passed with no delivery - escrow automatically refunded", p_now: t });
+      if (refundAmt > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refundAmt, p_ref: `job:${job.id}`, p_note: "Delivery deadline passed - unreleased escrow automatically refunded (released milestones stay paid)", p_now: t });
     } catch (e) {
       await patch(`ex_jobs?id=eq.${job.id}`, { status: "awarded", updated_at: t }).catch(() => {});
       console.error(`deadline refund FAILED for job ${job.id} (status reverted, will retry):`, e.message);
@@ -77,8 +82,8 @@ async function deadlineRefunds() {
     }
     const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
     const wallet = (await get(`ex_wallets?user_id=eq.${job.poster_user_id}&select=balance_cents`))[0];
-    await notify(job.poster_user_id, "payment", `"${job.title}" was cancelled automatically - the delivery deadline passed with no delivery, and your escrow (${money(job.agreed_cents)}) was refunded to your wallet`, `#/job/${job.id}`);
-    if (poster) await queueMail("job_auto_refunded", poster, { name: poster.name || "", title: job.title, amount: money(job.agreed_cents), wallet_after: wallet ? money(wallet.balance_cents) : "", link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("poster mail failed", e.message));
+    await notify(job.poster_user_id, "payment", `"${job.title}" was cancelled automatically - the delivery deadline passed with no delivery, and your unreleased escrow (${money(refundAmt)}) was refunded to your wallet`, `#/job/${job.id}`);
+    if (poster) await queueMail("job_auto_refunded", poster, { name: poster.name || "", title: job.title, amount: money(refundAmt), wallet_after: wallet ? money(wallet.balance_cents) : "", link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("poster mail failed", e.message));
     if (job.awarded_agent_id) {
       const agent = (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id`))[0];
       if (agent) {
