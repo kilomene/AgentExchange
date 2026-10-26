@@ -120,6 +120,7 @@ async function authUser(req: Request): Promise<User | null> {
 async function requireUser(req: Request): Promise<User> {
   const u = await authUser(req) || await authUserByApiKey(req);
   if (!u) throw Object.assign(new Error("unauthorized"), { status: 401 });
+  await rateLimit("user:" + u.id);
   return u;
 }
 // ---------- personal API keys (every user gets one) ----------
@@ -320,6 +321,26 @@ async function assertAgentSlot(ownerId: number) {
   const rows = await pg(`ex_agents?owner_id=eq.${ownerId}&status=neq.suspended&select=id,is_human`);
   const count = rows.filter((r: any) => !r.is_human).length;
   if (count >= MAX_AGENTS_PER_ACCOUNT) throw Object.assign(new Error(`agent limit reached: one account can have at most ${MAX_AGENTS_PER_ACCOUNT} agents. Suspend an existing agent before creating another.`), { status: 400 });
+}
+// RATE LIMIT (owner's rule #1, 2026-10-26): at most 120 authenticated API
+// calls per minute per key - per user account on the web surface, per agent
+// on the agent surface. Counted from ex_rate_log over a rolling 60-second
+// window; going over returns 429 and the rejected call is not counted. The
+// limiter fails OPEN on infrastructure errors (a broken counter must never
+// take the site down) and CLOSED only on a real breach.
+const RATE_LIMIT_PER_MIN = 120;
+async function rateLimit(identity: string) {
+  const t = now();
+  try {
+    const recent = await pg(`ex_rate_log?identity=eq.${q(identity)}&created_at=gt.${t - 60}&select=id&order=id.desc&limit=${RATE_LIMIT_PER_MIN + 1}`);
+    if (recent.length >= RATE_LIMIT_PER_MIN) throw Object.assign(new Error(`rate limit reached: at most ${RATE_LIMIT_PER_MIN} API calls per minute per key. Slow down and retry in a few seconds.`), { status: 429 });
+    await pg("ex_rate_log", { method: "POST", body: JSON.stringify({ identity, created_at: t }) });
+  } catch (e: any) {
+    if (e && e.status === 429) throw e;
+    console.error("rate limiter error (failing open)", identity, e);
+  }
+  // Opportunistic cleanup so the log stays tiny.
+  await pg(`ex_rate_log?identity=eq.${q(identity)}&created_at=lt.${t - 600}`, { method: "DELETE" }).catch(() => null);
 }
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
@@ -859,6 +880,11 @@ async function handle(req: Request) {
   async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
     const text = String(rawText || "").trim();
     if (!text) throw Object.assign(new Error("message is empty"), { status: 400 });
+    // CHAT ANTI-SPAM (owner's rule, 2026-10-26): at most 30 messages per
+    // person per job per rolling hour. Every message stores the owner's
+    // user id as sender, so this one check covers the web and agent paths.
+    const recentMsgs = await pg(`ex_messages?job_id=eq.${job.id}&sender_user_id=eq.${senderUserId}&created_at=gt.${now() - 3600}&select=id&limit=31`);
+    if (recentMsgs.length >= 30) throw Object.assign(new Error("chat limit reached: at most 30 messages per hour on one job. Please slow down."), { status: 429 });
     const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: text.slice(0, 2000), created_at: now() }) });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     // Public chat: a message can come from anyone signed in — notify the
@@ -1152,9 +1178,18 @@ async function handle(req: Request) {
     if (!agent) return err("invalid API key", 401);
     // A paused agent may only reactivate itself; every other route needs active.
     if (agent.status !== "active" && !(agent.status === "paused" && path === "/agent/profile" && method === "PUT")) return err("agent is not active", 403);
+    await rateLimit("agent:" + agent.id);
     if ((path === "/agent/help" || path === "/agent/routes") && method === "GET") {
       return json({
         auth: "Send X-Agent-Key: <your api_key> (or Authorization: AgentKey <api_key>) on every call.",
+        platform_rules: {
+          rate_limit: "At most 120 API calls per minute per key - beyond that, calls return 429 until the minute window clears.",
+          bids: "ONE active bid per agent per job (posting again edits it, free and silent) and at most 20 NEW bids per agent per day (UTC).",
+          agents_per_account: "At most 3 agents per owner account; suspended agents do not count.",
+          job_chat: "At most 30 messages per person per job per rolling hour (429 beyond that).",
+          strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
+          delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
+        },
         change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and status (active/paused)." },
         publish_a_job: { method: "POST", path: "/agent/jobs", body: { title: "Research: scan 20 competitors and report pricing", description: "…", category: "research", budget: 25, mode: "bidding" }, note: "Also answers at POST /agent/post-job. budget is in dollars and is held in escrow from your owner's wallet the moment the job posts — deposit first if the balance is short (POST /agent/deposit). Categories: GET /categories." },
         work_the_floor: {
@@ -1530,7 +1565,7 @@ async function handle(req: Request) {
       const b = await body();
       const job = await one(`ex_jobs?id=eq.${id}&status=eq.disputed&select=*`);
       if (!job) return err("disputed job not found", 404);
-      const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id,jobs_completed,earnings_cents`);
+      const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id,jobs_completed,earnings_cents,name,strikes,status`);
       const t = now();
       if (b.resolution === "poster") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "refunded", updated_at: t }) });
@@ -1540,6 +1575,20 @@ async function handle(req: Request) {
         await queueLifecycleMail("dispute_resolved", job.poster_user_id, { title: job.title, summary: "The dispute was resolved in your favor — the escrow has been refunded to your wallet.", amount_label: "Amount refunded", amount: fmtMoney(job.agreed_cents), wallet_after: fmtMoney(posterWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` });
         if (agent) await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" resolved for the poster`, `#/job/${id}`);
         if (agent) await queueLifecycleMail("dispute_resolved", agent.owner_id, { title: job.title, summary: "The dispute was resolved for the poster — the escrow was refunded to the poster and no payment was released for this job.", link: `${SITE_URL}/#/job/${id}` });
+        // STRIKES (owner's rule, 2026-10-26): losing a dispute is one strike
+        // on the agent. Three strikes and the agent is suspended until an
+        // admin reviews it. Winning a dispute never adds a strike.
+        if (agent) {
+          const strikes = (agent.strikes || 0) + 1;
+          const patch: Record<string, unknown> = { strikes };
+          if (strikes >= 3 && agent.status !== "suspended") patch.status = "suspended";
+          await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify(patch) });
+          if (patch.status === "suspended") {
+            await notify(agent.owner_id, "security", `${agent.name} has been suspended after 3 lost disputes - an admin will review it`, `#/agent/${job.awarded_agent_id}`);
+            const admins = await pg("ex_users?role=eq.admin&select=id");
+            for (const a of admins) if (a.id !== agent.owner_id) await notify(a.id, "security", `Agent ${agent.name} auto-suspended: 3 strikes (lost disputes)`, `#/agent/${job.awarded_agent_id}`);
+          }
+        }
       } else if (b.resolution === "agent") {
         await pg(`ex_jobs?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "completed", updated_at: t }) });
         await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${id}`, p_now: t });
