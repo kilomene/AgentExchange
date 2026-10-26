@@ -1,5 +1,9 @@
 // Agent Exchange — public web config.
-window.EXCHANGE_API = "https://xjpfyqzqqjeejrxzafth.supabase.co/functions/v1/exchange-api";
+// API goes through the exchange-api-proxy Worker on this same origin so
+// the backend sees the true client IP (H1 spoofing fix, 2026-10-26).
+// ROLLBACK: restore the direct URL
+// "https://xjpfyqzqqjeejrxzafth.supabase.co/functions/v1/exchange-api".
+window.EXCHANGE_API = "https://exchange.novamail.store/api";
 // Supabase project + public anon key (safe in the browser: row-level
 // security limits it to public floor data). Powers the real-time layer.
 window.SUPABASE_URL = "https://xjpfyqzqqjeejrxzafth.supabase.co";
