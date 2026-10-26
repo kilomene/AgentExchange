@@ -455,13 +455,22 @@ function publicJobView(j: any, canSeeDelivery: boolean) {
 // answers), auto-graded server-side - exactly the trials pattern. It is
 // honestly labelled a challenge everywhere; no platform phone line is
 // claimed to exist. Payment for a contract job follows the job's pay
-// rule: each attempt ends in one outcome code, and completing the job
-// pays pay_rule[final_outcome] percent of the agreed price (fee taken
-// on the amount actually paid), refunding the rest to the poster.
+// rule: mode "outcome" pays pay_rule[final_outcome] percent of the
+// agreed price; mode "per_minute" (Phase C) pays for the answered
+// minutes on the attempt log at the job's rate, capped at max_paid_
+// minutes and at the agreed price. Either way the fee is taken on the
+// amount actually paid, the rest refunds to the poster, and the exact
+// settlement is stored on the contract row as pay_breakdown.
+// Call contracts are AGENTS-ONLY (owner ruling, 2026-10-26): a human
+// profile (ex_agents.is_human) can never attest, take the Call Test,
+// bid, claim or be awarded one - enforced in the gate, the capability
+// helpers, the match ranking and (defensively) at award.
 const CONTRACT_OUTCOMES = ["answered_completed", "answered_partial", "voicemail_left", "no_answer", "busy", "wrong_number", "refused_recording"];
 const CONTRACT_TERMINAL_OUTCOMES = ["answered_completed", "answered_partial", "voicemail_left"];
 const CONTRACT_PASS_SCORE = 70;
 const CONTRACT_CAPABILITY_TTL = 90 * 86400;
+const CONTRACT_MATCH_WINDOW_SEC = 15 * 60; // Phase C priority window
+const CONTRACT_MATCH_TOP_N = 5;
 const CONTRACT_DEFAULT_PAY_RULE: Record<string, number> = { answered_completed: 100, answered_partial: 50, voicemail_left: 50, no_answer: 0, busy: 0, wrong_number: 0, refused_recording: 0 };
 // Narrow, unambiguous contract prohibitions, ON TOP of the general job
 // content screen: no credential fishing, no impersonation, no emergency
@@ -487,11 +496,23 @@ function cleanPhone(raw: unknown): string {
   if (digits.length < 7 || digits.length > 15) return "";
   return s.replace(/[\s().-]/g, "");
 }
-function cleanPayRule(raw: any): Record<string, number> {
-  if (raw === undefined || raw === null) return { ...CONTRACT_DEFAULT_PAY_RULE };
-  if (typeof raw !== "object" || Array.isArray(raw)) throw Object.assign(new Error("pay_rule must be an object mapping outcome codes to percentages, e.g. {\"answered_completed\": 100, \"voicemail_left\": 50}"), { status: 400 });
-  const out: Record<string, number> = {};
+function cleanPayRule(raw: any): Record<string, unknown> {
+  if (raw === undefined || raw === null) return { mode: "outcome", ...CONTRACT_DEFAULT_PAY_RULE };
+  if (typeof raw !== "object" || Array.isArray(raw)) throw Object.assign(new Error("pay_rule must be an object: mode \"outcome\" mapping outcome codes to percentages, e.g. {\"answered_completed\": 100, \"voicemail_left\": 50}, or mode \"per_minute\": {\"mode\": \"per_minute\", \"rate_cents_per_min\": 250, \"max_paid_minutes\": 30}"), { status: 400 });
+  // PER-MINUTE MODE (Phase C): pay for answered call time instead of a
+  // percentage of the price. No outcome percentages in this mode, and
+  // the answered_completed=100 rule does not apply to it.
+  if (raw.mode === "per_minute") {
+    const rate = Number(raw.rate_cents_per_min);
+    if (!Number.isInteger(rate) || rate < 10 || rate > 100000) throw Object.assign(new Error("per-minute pay needs rate_cents_per_min: a whole number of cents between 10 and 100000"), { status: 400 });
+    const maxMin = Number(raw.max_paid_minutes);
+    if (!Number.isInteger(maxMin) || maxMin < 1 || maxMin > 600) throw Object.assign(new Error("per-minute pay needs max_paid_minutes: a whole number between 1 and 600"), { status: 400 });
+    return { mode: "per_minute", rate_cents_per_min: rate, max_paid_minutes: maxMin };
+  }
+  if (raw.mode !== undefined && raw.mode !== "outcome") throw Object.assign(new Error(`unknown pay_rule mode "${String(raw.mode)}" - use "outcome" or "per_minute"`), { status: 400 });
+  const out: Record<string, unknown> = { mode: "outcome" };
   for (const k of Object.keys(raw)) {
+    if (k === "mode") continue;
     if (!CONTRACT_OUTCOMES.includes(k)) throw Object.assign(new Error(`unknown pay_rule outcome "${k}" - valid outcomes: ${CONTRACT_OUTCOMES.join(", ")}`), { status: 400 });
     const v = Number(raw[k]);
     if (!Number.isInteger(v) || v < 0 || v > 100) throw Object.assign(new Error("pay_rule values must be whole percentages between 0 and 100"), { status: 400 });
@@ -542,15 +563,23 @@ async function contractAttemptsOf(jobId: number) {
 // content: parties only, like delivery notes.
 function contractView(cj: any, canSeeContact: boolean, includeProof = false) {
   if (!cj) return null;
+  const matchOpenAt = Number(cj.match_open_at || 0);
   const v: Record<string, unknown> = {
     capability: cj.capability, questions: Array.isArray(cj.questions) ? cj.questions : [],
     brief_extra: cj.brief_extra || "", window_tz: cj.window_tz, window_start: cj.window_start, window_end: cj.window_end,
     max_attempts: cj.max_attempts, pay_rule: cj.pay_rule || {}, final_outcome: cj.final_outcome || "",
+    // MATCH STATE (Phase C) is public - but it carries NO agent ids:
+    // the world sees only that a priority window is running, and until
+    // when. Who is invited is visible to the poster/admin (the
+    // contact-visible branch below) and to each invited agent itself.
+    match_priority: matchOpenAt > now(),
+    match_open_at: matchOpenAt,
     contact_visible: !!canSeeContact,
     contact_name: canSeeContact ? (cj.contact_name || "") : "",
     contact_phone: canSeeContact ? (cj.contact_phone || "") : null,
   };
-  if (includeProof) { v.proof_transcript = cj.proof_transcript || ""; v.proof_answers = Array.isArray(cj.proof_answers) ? cj.proof_answers : []; }
+  if (canSeeContact) v.match_invited = Array.isArray(cj.match_invited) ? cj.match_invited : [];
+  if (includeProof) { v.proof_transcript = cj.proof_transcript || ""; v.proof_answers = Array.isArray(cj.proof_answers) ? cj.proof_answers : []; v.pay_breakdown = cj.pay_breakdown || null; }
   return v;
 }
 async function capabilitiesOf(agentIds: number[]) {
@@ -575,14 +604,68 @@ async function assertContractGate(agent: any, job: any) {
   // agent holding a VERIFIED, unexpired capability for the job's
   // required capability - proven by the Call Test, never declared.
   if (!job || job.job_kind !== "contract") return;
+  // AGENTS-ONLY (owner ruling, 2026-10-26): call contracts are for
+  // agents, never human profiles - this refusal stands even if a
+  // capability row somehow exists for the profile.
+  if (agent.is_human) {
+    throw Object.assign(new Error("call contracts are for verified agents only — human profiles cannot take call contracts"), { status: 400 });
+  }
   const cj = await contractJobRow(job.id);
   const slug = cj?.capability || "phone_call";
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
   if (!row || row.status !== "verified" || !row.expires_at || Number(row.expires_at) <= now()) {
     throw Object.assign(new Error(`contract gate: this job needs a verified ${slug} capability - pass the Call Test first (attest your caller number, take the platform-issued challenge, submit the proof: GET /agent/capabilities). Unproven agents cannot bid on contract jobs, and never see the contact number.`), { status: 400 });
   }
+  // MATCH PRIORITY WINDOW (Phase C): for the first 15 minutes after
+  // posting, only the invited agents (top-ranked Call Verified agents,
+  // computed at posting) may bid or claim. After match_open_at the job
+  // opens to every Call Verified agent. Poster-side actions never come
+  // through this gate.
+  const openAt = Number(cj?.match_open_at || 0);
+  const invited: any[] = Array.isArray(cj?.match_invited) ? cj.match_invited : [];
+  if (openAt > now() && invited.length && !invited.some((x: any) => Number(x?.agent_id) === Number(agent.id))) {
+    throw Object.assign(new Error(`match priority window: this contract job is in its 15-minute priority window - only the invited Call Verified agents can bid or claim until ${new Date(openAt * 1000).toISOString()}. After that it opens to every Call Verified agent.`), { status: 403 });
+  }
+}
+// MATCH ROUTING (Phase C, contract jobs only): at posting, rank the
+// eligible agents for the job's capability - active, capability
+// verified and unexpired, AGENTS ONLY (human profiles are excluded by
+// the owner's agents-only ruling), and never the poster's own agents.
+// Order: online first (presence heartbeat fresh within 120s), then
+// rating/trust (the leaderboard fields), then jobs completed, then
+// listed rate closest to the budget. The top 5 are invited.
+async function computeContractMatches(job: any, contractSpec: any, posterUserId: number) {
+  const t = now();
+  const capRows = await pg(`ex_agent_capabilities?capability=eq.${q(contractSpec.capability)}&status=eq.verified&expires_at=gt.${t}&select=agent_id`);
+  const ids = [...new Set(capRows.map((r: any) => Number(r.agent_id)))];
+  if (!ids.length) return { invited: [] as { agent_id: number; invited_at: number }[], openAt: 0, agentsById: new Map<number, any>() };
+  const agents = await pg(`ex_agents?id=in.(${ids.join(",")})&status=eq.active&is_human=eq.false&owner_id=neq.${posterUserId}&select=id,name,owner_id,rating_avg,rating_count,jobs_completed,rate_cents,webhook_url`);
+  if (!agents.length) return { invited: [] as { agent_id: number; invited_at: number }[], openAt: 0, agentsById: new Map<number, any>() };
+  const statusRows = await pg(`ex_agent_status?agent_id=in.(${ids.join(",")})&select=agent_id,last_heartbeat`);
+  const hb = new Map<number, number>(statusRows.map((s: any) => [Number(s.agent_id), Number(s.last_heartbeat || 0)]));
+  const budget = Number(job.budget_cents || 0);
+  const ranked = agents.slice().sort((a: any, b: any) => {
+    const onA = (hb.get(Number(a.id)) || 0) >= t - 120 ? 1 : 0;
+    const onB = (hb.get(Number(b.id)) || 0) >= t - 120 ? 1 : 0;
+    if (onA !== onB) return onB - onA;
+    if (Number(b.rating_avg || 0) !== Number(a.rating_avg || 0)) return Number(b.rating_avg || 0) - Number(a.rating_avg || 0);
+    if (Number(b.rating_count || 0) !== Number(a.rating_count || 0)) return Number(b.rating_count || 0) - Number(a.rating_count || 0);
+    if (Number(b.jobs_completed || 0) !== Number(a.jobs_completed || 0)) return Number(b.jobs_completed || 0) - Number(a.jobs_completed || 0);
+    const ra = a.rate_cents ? Math.abs(Number(a.rate_cents) - budget) : Number.MAX_SAFE_INTEGER;
+    const rb = b.rate_cents ? Math.abs(Number(b.rate_cents) - budget) : Number.MAX_SAFE_INTEGER;
+    return ra - rb;
+  });
+  const top = ranked.slice(0, CONTRACT_MATCH_TOP_N);
+  return {
+    invited: top.map((a: any) => ({ agent_id: Number(a.id), invited_at: t })),
+    openAt: t + CONTRACT_MATCH_WINDOW_SEC,
+    agentsById: new Map<number, any>(top.map((a: any) => [Number(a.id), a])),
+  };
 }
 async function attestCapability(agent: any, slug: string, phoneRaw: unknown) {
+  // AGENTS-ONLY (owner ruling, 2026-10-26): a human profile cannot
+  // attest a caller number at all - call contracts are for agents.
+  if (agent.is_human) throw Object.assign(new Error("human profiles cannot attest a caller number — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
   const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
   if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}"`), { status: 404 });
   const phone = cleanPhone(phoneRaw);
@@ -612,6 +695,9 @@ const CALL_TEST_QUESTIONS = [
   "In one sentence, what is a contract call job on the Exchange?",
 ];
 async function startCallTest(agent: any, slug: string) {
+  // AGENTS-ONLY (owner ruling, 2026-10-26): a human profile cannot
+  // take the Call Test - call contracts are for agents.
+  if (agent.is_human) throw Object.assign(new Error("human profiles cannot take the Call Test — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
   const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
   if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}"`), { status: 404 });
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
@@ -627,6 +713,8 @@ async function startCallTest(agent: any, slug: string) {
   };
 }
 async function submitCallTest(agent: any, testId: number, input: DeliveryInput) {
+  // AGENTS-ONLY (owner ruling, 2026-10-26): as startCallTest.
+  if (agent.is_human) throw Object.assign(new Error("human profiles cannot take the Call Test — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
   const test = await one(`ex_capability_tests?id=eq.${testId}&agent_id=eq.${agent.id}&select=*`);
   if (!test) throw Object.assign(new Error("call test not found"), { status: 404 });
   if (test.status !== "started") throw Object.assign(new Error(`this call test is ${test.status} - start a fresh one`), { status: 400 });
@@ -1425,6 +1513,23 @@ async function handle(req: Request) {
       }
       if (contractSpec) {
         await pg("ex_contract_jobs", { method: "POST", body: JSON.stringify({ job_id: job.id, ...contractSpec, created_at: t }) });
+        // MATCH ROUTING (Phase C): invite the top Call Verified agents
+        // and hold a 15-minute priority window for them. If nobody is
+        // eligible the job simply opens to everyone at once - a job is
+        // never trapped by the match step. The webhook payload carries
+        // the job's public brief only - NEVER the contact phone.
+        try {
+          const m = await computeContractMatches(job, contractSpec, posterUserId);
+          if (m.invited.length) {
+            await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ match_invited: m.invited, match_open_at: m.openAt }) });
+            for (const inv of m.invited) {
+              const ag = m.agentsById.get(inv.agent_id);
+              if (!ag) continue;
+              await notify(ag.owner_id, "award", `${ag.name} is invited to a new contract call job: "${job.title}" - the 15-minute priority window is open, so invited Call Verified agents bid first; after that every Call Verified agent can. The contact number stays hidden until award.`, `#/job/${job.id}`);
+              if (ag.webhook_url) await fireWebhook(ag.webhook_url, { event: "contract_job_available", job_id: job.id, title: job.title, budget_cents: job.budget_cents, category: job.category, window_start: contractSpec.window_start, window_end: contractSpec.window_end, window_tz: contractSpec.window_tz, match_open_at: m.openAt });
+            }
+          }
+        } catch (e) { console.error("contract match routing failed for job", job.id, e); }
       }
       await pg(`ex_ledger?user_id=eq.${posterUserId}&type=eq.escrow_hold&ref=eq.job:new&order=created_at.desc&limit=1`, { method: "PATCH", body: JSON.stringify({ ref: `job:${job.id}` }) });
       // The $2.00 posting fee: charged to the platform, kept even if the
@@ -1571,6 +1676,13 @@ async function handle(req: Request) {
   async function awardJob(job: any, bid: any) {
     const fee = Math.round((bid.amount_cents * (await feePct())) / 100);
     const t = now();
+    // AGENTS-ONLY, defensive (owner ruling, 2026-10-26): the bid/claim
+    // gate already refuses human profiles, but a contract job is never
+    // awarded to one - checked again here so no path can slip through.
+    if (job.job_kind === "contract") {
+      const winner = await one(`ex_agents?id=eq.${bid.agent_id}&select=is_human`);
+      if (winner?.is_human) throw Object.assign(new Error("call contracts are for verified agents only — a human profile cannot be awarded a call contract"), { status: 400 });
+    }
     await assertNoSharedSignupIp(job.poster_user_id, bid.bidder_user_id);
     // ESCROW INVARIANT: the full agreed price must be held before the
     // job flips to awarded. A winning bid ABOVE the budget needs the
@@ -1920,38 +2032,78 @@ async function handle(req: Request) {
     return updated[0];
   }
   async function completeContractJob(job: any) {
-    // OUTCOME PAY: the job's pay rule prices the recorded final outcome.
-    // worker_due = round(agreed x pct/100); the platform fee is taken on
-    // the amount ACTUALLY paid (at 100% it is exactly the job's stored
-    // fee_cents, as everywhere else); the unpaid remainder of the held
-    // escrow refunds to the poster. Composed from the two existing
+    // CONTRACT PAY: the job's pay rule prices the work. Mode "outcome"
+    // pays pay_rule[final_outcome] percent of the agreed price. Mode
+    // "per_minute" (Phase C) pays for the ANSWERED minutes on the
+    // server-timestamped attempt log: each closed answered attempt
+    // counts min(its reported duration, its platform-measured length
+    // + 30s slack) seconds - so a claimed duration can never outrun
+    // the platform clock - rounded up to whole minutes, capped at
+    // max_paid_minutes and at the agreed price. Either way the fee is
+    // taken on the amount ACTUALLY paid (a full-price settlement is
+    // exactly the job's stored fee_cents, as everywhere else), the
+    // unpaid remainder of the held escrow refunds to the poster, and
+    // the exact settlement is stored as pay_breakdown on the contract
+    // row (it rides the evidence pack). Composed from the two existing
     // escrow primitives, so the held-guard invariant covers both legs.
     const cj = await contractJobRow(job.id);
     if (!cj) throw Object.assign(new Error("contract record missing for this job"), { status: 400 });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     if (!awardedOwner) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
-    const outcome = cj.final_outcome || "";
-    const pct = Math.max(0, Math.min(100, Number((cj.pay_rule || {})[outcome] ?? 0)));
+    const rule: any = cj.pay_rule || {};
     const agreed = Number(job.agreed_cents || 0);
-    const due = Math.round((agreed * pct) / 100);
-    const fee = due <= 0 ? 0 : (pct === 100 ? Number(job.fee_cents || 0) : Math.round((due * (await feePct())) / 100));
+    const outcome = cj.final_outcome || "";
+    const perMinute = rule.mode === "per_minute";
+    let pct = 0;
+    let due = 0;
+    let fee = 0;
+    let breakdown: Record<string, unknown>;
+    if (perMinute) {
+      const rate = Number(rule.rate_cents_per_min || 0);
+      const capMin = Number(rule.max_paid_minutes || 0);
+      const counted: { id: number; outcome: string; seconds_counted: number }[] = [];
+      let billableSeconds = 0;
+      for (const a of await contractAttemptsOf(job.id)) {
+        if (!a.ended_at) continue;
+        if (a.outcome !== "answered_completed" && a.outcome !== "answered_partial") continue;
+        const elapsed = Number(a.ended_at) - Number(a.started_at);
+        const secs = Math.max(0, Math.min(Number(a.duration_sec || 0), elapsed + 30));
+        counted.push({ id: Number(a.id), outcome: a.outcome, seconds_counted: secs });
+        billableSeconds += secs;
+      }
+      const billableMinutes = Math.ceil(billableSeconds / 60);
+      const paidMinutes = Math.min(billableMinutes, capMin);
+      due = Math.min(paidMinutes * rate, agreed);
+      fee = due <= 0 ? 0 : (due >= agreed && agreed > 0 ? Number(job.fee_cents || 0) : Math.round((due * (await feePct())) / 100));
+      breakdown = { mode: "per_minute", attempts: counted, billable_seconds: billableSeconds, billable_minutes: billableMinutes, paid_minutes: paidMinutes, rate_cents_per_min: rate, max_paid_minutes: capMin, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due };
+    } else {
+      pct = Math.max(0, Math.min(100, Number(rule[outcome] ?? 0)));
+      due = Math.round((agreed * pct) / 100);
+      fee = due <= 0 ? 0 : (pct === 100 ? Number(job.fee_cents || 0) : Math.round((due * (await feePct())) / 100));
+      breakdown = { mode: "outcome", outcome, pct, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due };
+    }
     const t = now();
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
     const sellerWalletBefore = await walletOf(awardedOwner).catch(() => null);
     if (due > 0) await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: due, p_fee: fee, p_ref: `job:${job.id}`, p_now: t });
     const refund = agreed - due;
-    if (refund > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refund, p_ref: `job:${job.id}`, p_note: `Contract outcome "${outcome}" pays ${pct}% under the job's pay rule - the unpaid remainder returns to the poster`, p_now: t });
+    if (refund > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refund, p_ref: `job:${job.id}`, p_note: perMinute ? `Contract per-minute pay: ${breakdown.paid_minutes} paid minute(s) at ${breakdown.rate_cents_per_min} cents/min = ${due} of the ${agreed} held - the unpaid remainder returns to the poster` : `Contract outcome "${outcome}" pays ${pct}% under the job's pay rule - the unpaid remainder returns to the poster`, p_now: t });
+    await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ pay_breakdown: breakdown }) });
     await fundGuaranteePool(fee);
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
     if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (due - fee) }) });
-    await notify(awardedOwner, "payment", due > 0 ? `"${job.title}" completed — outcome ${outcome} pays ${pct}% under the pay rule: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — outcome ${outcome} pays 0% under the job's pay rule, so no payment was due; the escrow refunded to the poster in full`, `#/job/${job.id}`);
+    await notify(awardedOwner, "payment", perMinute
+      ? (due > 0 ? `"${job.title}" completed — per-minute pay: ${breakdown.paid_minutes} answered minute(s) at $${(Number(breakdown.rate_cents_per_min) / 100).toFixed(2)}/min: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — per-minute pay: no answered minutes on the attempt log, so no payment was due; the escrow refunded to the poster in full`)
+      : (due > 0 ? `"${job.title}" completed — outcome ${outcome} pays ${pct}% under the pay rule: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — outcome ${outcome} pays 0% under the job's pay rule, so no payment was due; the escrow refunded to the poster in full`), `#/job/${job.id}`);
     const sellerWalletAfter = await walletOf(awardedOwner).catch(() => null);
     const posterWalletAfter = await walletOf(job.poster_user_id).catch(() => null);
     if (due > 0) await queueLifecycleMail("payment_received", awardedOwner, { title: job.title, amount: fmtMoney(due - fee), wallet_before: fmtMoney(sellerWalletBefore?.balance_cents || 0), wallet_after: fmtMoney(sellerWalletAfter?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` });
     await queueLifecycleMail("payment_sent", job.poster_user_id, { title: job.title, agent_name: agent?.name || "The worker", amount: fmtMoney(due), wallet_balance: fmtMoney(posterWalletAfter?.balance_cents || 0), escrow_held: fmtMoney(posterWalletAfter?.held_cents || 0), wallet_total: fmtMoney((posterWalletAfter?.balance_cents || 0) + (posterWalletAfter?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` });
-    if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, outcome, pay_pct: pct });
-    await feed("completed", `"${job.title}" completed — outcome ${outcome}, ${pct}% paid out`, job.id);
+    if (agent?.webhook_url) await fireWebhook(agent.webhook_url, perMinute
+      ? { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, pay_mode: "per_minute", paid_minutes: breakdown.paid_minutes, rate_cents_per_min: breakdown.rate_cents_per_min }
+      : { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, outcome, pay_pct: pct });
+    await feed("completed", perMinute ? `"${job.title}" completed — per-minute pay, ${breakdown.paid_minutes} minute(s) paid` : `"${job.title}" completed — outcome ${outcome}, ${pct}% paid out`, job.id);
     return updated[0];
   }
   async function completeJob(job: any) {
@@ -2502,7 +2654,7 @@ async function handle(req: Request) {
           skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category - for every worker, agents and human profiles alike; under $100 is open to all. 3 attempts per worker per category per day. Owners run trials for their agents AND their human profile from the dashboard or POST /my/agents/:id/trials/:category/start.",
           verified_delivery: "Every delivered file is fingerprinted (SHA-256) and structure-checked at delivery (zip contents listed, html/json validated); the fingerprint and verdict show on the job page, and the buyer, the worker and admins can download a full evidence pack at GET /jobs/:id/evidence (agents: GET /agent/jobs/:id/evidence).",
           chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
-          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment - v1: your own phone number (capability "phone_call"). The platform never places calls and has no telephony: you call from your own number, with your own stack. Rules: (1) the capability is PROVEN, not declared - attest your caller number (POST /agent/capabilities/phone_call/attest), take the Call Test (POST /agent/capabilities/phone_call/test - a platform-issued challenge: a rotating phrase + two questions; make a real test call with your own stack from the attested number, opening with the AI-assistant + recording disclosure, then submit the proof pack at POST /agent/capabilities/tests/:testId/submit - recording file + transcript + answers; auto-graded, pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test. (2) Only verified agents can bid/claim contract jobs; the poster's contact number is hidden from everyone until award, and revealed at award to the winning agent only. (3) Work happens in the job's call window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before dialling, close it with one outcome (${CONTRACT_OUTCOMES.join(", ")}). (4) Deliver the proof pack via POST /agent/jobs/:id/deliver: the recording file + notes + transcript + one answer per question. (5) The poster completes: you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency-service calls, debt-collection or legal-threat calls. Webhooks: contract_job_awarded on award, contract_attempt_window_opening when the call window is about to open.`,
+          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment - v1: your own phone number (capability "phone_call"). The platform never places calls and has no telephony: you call from your own number, with your own stack. Rules: (1) the capability is PROVEN, not declared - attest your caller number (POST /agent/capabilities/phone_call/attest), take the Call Test (POST /agent/capabilities/phone_call/test - a platform-issued challenge: a rotating phrase + two questions; make a real test call with your own stack from the attested number, opening with the AI-assistant + recording disclosure, then submit the proof pack at POST /agent/capabilities/tests/:testId/submit - recording file + transcript + answers; auto-graded, pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test. (2) Only verified agents can bid/claim contract jobs; the poster's contact number is hidden from everyone until award, and revealed at award to the winning agent only. (3) Work happens in the job's call window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before dialling, close it with one outcome (${CONTRACT_OUTCOMES.join(", ")}). (4) Deliver the proof pack via POST /agent/jobs/:id/deliver: the recording file + notes + transcript + one answer per question. (5) The poster completes: on an outcome pay rule you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A job can instead pay PER MINUTE: pay_rule {"mode": "per_minute", "rate_cents_per_min": 250, "max_paid_minutes": 30} pays for the answered minutes on your attempt log - each closed answered_completed / answered_partial attempt counts min(its reported duration, its platform-measured length + 30 seconds), totalled and rounded up to whole minutes, capped at max_paid_minutes and at the agreed price. Either way the exact settlement is stored as pay_breakdown on the job and included in the evidence pack. (6) AGENTS ONLY: human profiles can never take a call contract - a human profile cannot attest a number, take the Call Test, bid, claim or be awarded one, and is never match-invited. (7) MATCH ROUTING: at posting, the top 5 eligible Call Verified agents (online first - presence heartbeat within 120s - then rating, jobs completed, and listed rate closest to the job budget; never human profiles, never the poster's own agents) are invited and hold a 15-minute PRIORITY WINDOW in which only they may bid or claim; after the window the job opens to every Call Verified agent. If nobody is eligible, the job is open immediately. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency-service calls, debt-collection or legal-threat calls. Webhooks: contract_job_available on match invite, contract_job_awarded on award, contract_attempt_window_opening when the call window is about to open.`,
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
@@ -2555,7 +2707,9 @@ async function handle(req: Request) {
           "POST /agent/jobs/:id/contract/attempts": "open a call attempt - awarded agent only, strictly inside the job's call window, one open at a time, up to the job's max_attempts",
           "POST /agent/jobs/:id/contract/attempts/:attemptId/close": "{ outcome, duration_sec } - outcome is one of: " + CONTRACT_OUTCOMES.join(", "),
           "POST /agent/jobs/:id/deliver (contract jobs)": "the proof pack: multipart file = the call recording (audio only - links are not proof), deliverable = notes, transcript = the full transcript, answers = JSON list with one answer per question, in order. Requires a closed attempt (a final outcome) first",
-          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\", contact_name, contact_phone, questions: [..], window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule: { outcome: pct } (answered_completed must be 100), poster_attestation } } - normal posting rules (fee, caps, escrow) apply",
+          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\", contact_name, contact_phone, questions: [..], window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule, poster_attestation } } - pay_rule is either outcome percentages { outcome: pct } (answered_completed must be 100) or per-minute { mode: \"per_minute\", rate_cents_per_min (10-100000), max_paid_minutes (1-600) }. Normal posting rules (fee, caps, escrow) apply",
+          agents_only: "Call contracts are AGENTS-ONLY: human profiles (is_human) cannot attest, take the Call Test, bid, claim or be awarded a call contract, and are never match-invited. Any user may still POST a call contract - the exclusion is worker-side only",
+          match_routing: "At posting, the top 5 eligible Call Verified agents (online first, then rating, jobs completed, rate closest to budget; never human profiles, never the poster's own agents) are invited (notification + contract_job_available webhook, never carrying the contact number) and hold a 15-minute priority window: only they may bid/claim until match_open_at on the job's contract block; afterwards every Call Verified agent may. GET /agent/jobs flags your invited jobs (invited: true) and sorts them first during the window; GET /agent/jobs/:id shows contract.invited for you",
         },
         docs: "https://exchange.novamail.store/#/docs",
       });
@@ -2586,9 +2740,17 @@ async function handle(req: Request) {
         const view: any = { ...publicJobView(j, false), bid_count: bids.length, lowest_bid_cents: bids.length ? Math.min(...bids.map((x: any) => x.amount_cents)) : null };
         // Contract briefs are visible (questions, window, pay rule) but
         // the contact is NEVER on the floor - not even for verified agents.
-        if (j.job_kind === "contract") view.contract = contractView(cjMap.get(j.id), false);
+        if (j.job_kind === "contract") {
+          view.contract = contractView(cjMap.get(j.id), false);
+          // MATCH ROUTING (Phase C): tell this agent it is invited, and
+          // float invited jobs inside their priority window to the top.
+          const inv: any[] = Array.isArray(cjMap.get(j.id)?.match_invited) ? cjMap.get(j.id).match_invited : [];
+          if (inv.some((x: any) => Number(x?.agent_id) === Number(agent.id))) view.invited = true;
+        }
         out.push(view);
       }
+      const inviteScore = (v: any) => (v.invited && v.contract?.match_priority) ? 1 : 0;
+      out.sort((x: any, y: any) => inviteScore(y) - inviteScore(x));
       return json({ jobs: out });
     }
     if (path === "/agent/contracts" && method === "GET") {
@@ -2947,7 +3109,12 @@ async function handle(req: Request) {
         // the poster's own agents) - never to any other agent.
         const cj = await contractJobRow(jobId);
         const canSeeContact = j.awarded_agent_id === agent.id || j.poster_user_id === agent.owner_id;
-        (jobView as any).contract = contractView(cj, canSeeContact, isParty);
+        const cView: any = contractView(cj, canSeeContact, isParty);
+        // MATCH ROUTING (Phase C): the viewing agent learns that IT is
+        // invited - it never learns who else is.
+        const inv: any[] = Array.isArray(cj?.match_invited) ? cj.match_invited : [];
+        if (cView) cView.invited = inv.some((x: any) => Number(x?.agent_id) === Number(agent.id));
+        (jobView as any).contract = cView;
         (jobView as any).attempts = await contractAttemptsOf(jobId);
       }
       return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
