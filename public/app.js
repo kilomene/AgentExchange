@@ -162,6 +162,25 @@ function syncTabs() {
   document.querySelectorAll(".tabbar a").forEach((a) => a.classList.toggle("on", a.dataset.tab === on));
 }
 
+// ---------- JOB POSTERS & BRIEF STRUCTURE ----------
+const POSTER_SLUGS = ["development", "research", "writing", "content", "business", "personal", "social", "trading"];
+function posterFor(category) { return `/assets/posters/${POSTER_SLUGS.includes(category) ? category : "development"}.jpg`; }
+function timeLeft(ts) {
+  if (!ts) return "";
+  const s = ts - Math.floor(Date.now() / 1000);
+  if (s <= 0) return "bidding closed";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h left`;
+  if (h > 0) return `${h}h ${m}m left`;
+  return `${m}m left`;
+}
+function splitBrief(desc) {
+  const raw = String(desc || "");
+  const i = raw.indexOf("Deliverable:");
+  if (i < 0) return { brief: raw, deliverable: "" };
+  return { brief: raw.slice(0, i).trim(), deliverable: raw.slice(i + "Deliverable:".length).trim() };
+}
+
 // ---------- THE FLOOR ----------
 // The floor renders its full shell (hero, search, skeletons) BEFORE any
 // network call, then fills in live data. A failed fetch never leaves a dead
@@ -227,6 +246,7 @@ async function viewFloor(params) {
     if (!data.jobs.length) { grid.innerHTML = `<div class="empty">${ic("search")}<b>No open jobs here yet</b>Be the first — post a job and agents will bid on it.<br><a class="btn sm mt" href="#/post">${ic("plus", "sm")} Post a job</a></div>`; }
     else grid.innerHTML = data.jobs.map((j, i) => `
       <a class="acard rv" style="--d:${(i % 6) * 0.05}s" href="#/job/${j.id}">
+        <div class="poster"><img src="${posterFor(j.category)}" alt="" loading="lazy"><span class="poster-budget">${money(j.budget_cents)}</span>${j.bid_deadline ? `<span class="poster-time">${ic("clock", "sm")} ${timeLeft(j.bid_deadline)}</span>` : ""}</div>
         <div class="flex"><span class="pill">${catIcon(j.category)}${esc(catName(j.category))}</span><span class="pill ${j.mode === "fixed" ? "feat" : "purple"}">${j.mode === "fixed" ? `${ic("zap")}Fixed price` : `${ic("tag")}Bidding`}</span>${jobPill(j.status)}<span class="grow"></span><span class="mut small">${ago(j.created_at)}</span></div>
         <h3 style="font-size:17px">${esc(j.title)}</h3>
         <div class="tag">${esc(j.description.slice(0, 150))}${j.description.length > 150 ? "…" : ""}</div>
@@ -266,14 +286,23 @@ async function viewJob(id) {
   const canBid = state.user && !isPoster && j.status === "open" && j.mode === "bidding" && myAgents.length;
   const canClaim = state.user && !isPoster && j.status === "open" && j.mode === "fixed" && myAgents.length;
   const awardedMine = state.user && j.awarded_agent_id && myAgents.some((a) => a.id === j.awarded_agent_id);
+  const parts = splitBrief(j.description);
+  const activeBids = bids.filter((b) => b.status === "active");
+  const lowestBid = activeBids.length ? Math.min(...activeBids.map((b) => b.amount_cents)) : null;
   app.innerHTML = `
   <p class="mt"><a class="mut" href="#/">${ic("arrow-l", "sm")} The Floor</a></p>
   <div class="cols mt">
     <div>
       <div class="panel rv">
-        <div class="flex"><h3 class="grow" style="font-size:20px">${esc(j.title)}</h3>${jobPill(j.status)}</div>
-        <p class="mt small mut flex" style="gap:6px;flex-wrap:wrap">Posted by ${ident(j.poster_name || "?", 20)} <b style="color:var(--txt)">${esc(j.poster_name)}</b>${j.poster_agent_id ? " · via their agent" : ""} · ${ago(j.created_at)} · ${esc(catName(j.category))} · ${j.mode === "fixed" ? "fixed price" : "open bidding"}</p>
-        <p class="mt" style="white-space:pre-wrap">${esc(j.description)}</p>
+        <div class="job-hero"><img src="${posterFor(j.category)}" alt="">
+          <div class="job-hero-chips"><span class="pill">${catIcon(j.category)}${esc(catName(j.category))}</span><span class="pill ${j.mode === "fixed" ? "feat" : "purple"}">${j.mode === "fixed" ? "Fixed price" : "Open bidding"}</span>${jobPill(j.status)}</div>
+          <div class="job-hero-budget">${money(j.budget_cents)}<small>budget · locked in escrow</small></div>
+        </div>
+        <div class="flex"><h3 class="grow" style="font-size:20px">${esc(j.title)}</h3></div>
+        <p class="mt small mut flex" style="gap:6px;flex-wrap:wrap">Posted by ${ident(j.poster_name || "?", 20)} <b style="color:var(--txt)">${esc(j.poster_name)}</b>${j.poster_agent_id ? " · via their agent" : ""} · ${ago(j.created_at)} · ${esc(catName(j.category))} · ${j.mode === "fixed" ? "fixed price" : "open bidding"}${j.bid_deadline && j.status === "open" ? ` · ${ic("clock", "sm")} ${timeLeft(j.bid_deadline)} to bid` : ""}</p>
+        <h4 class="mt">${ic("briefcase")} The brief</h4>
+        <p class="mt" style="white-space:pre-wrap">${esc(parts.brief)}</p>
+        ${parts.deliverable ? `<div class="deliv-box"><h4>${ic("package")} What the winner delivers</h4><p style="white-space:pre-wrap">${esc(parts.deliverable)}</p></div>` : ""}
         ${j.deliverable ? `<h4 class="mt">${ic("package")} Delivered work</h4><p style="white-space:pre-wrap">${esc(j.deliverable)}</p>` : ""}
         ${j.status === "disputed" ? `<h4 class="mt">${ic("alert")} Dispute</h4><p>${esc(j.dispute_reason)}</p>` : ""}
         ${j.status === "completed" && isPoster && !review ? `
@@ -285,6 +314,7 @@ async function viewJob(id) {
       </div>
       <div class="panel rv" style="--d:.06s">
         <h3>${ic("tag")} Bids (${bids.length})</h3>
+        ${bids.length ? `<p class="small mut mt">${activeBids.length} active${lowestBid ? ` · lowest so far <b style="color:var(--gold2)">${money(lowestBid)}</b>` : ""}${j.status === "open" && j.bid_deadline ? ` · ${timeLeft(j.bid_deadline)} to bid` : ""} · updates live as bids land</p>` : ""}
         ${bids.map((b) => `<div class="notif">${ident(b.agent_name || "?", 34, false, b.agent_avatar)}
           <span class="grow"><a href="#/agent/${b.agent_id}"><b>${esc(b.agent_name)}</b></a> ${b.agent_is_human ? '<span class="pill human">Human</span>' : ""} ${stars(b.agent_rating || 0, b.agent_jobs || 0)}<br>
           <span class="small mut">${esc(b.pitch)} · ETA ${b.eta_hours}h · ${ago(b.created_at)}</span></span>
@@ -316,6 +346,15 @@ async function viewJob(id) {
         ${isPoster && j.status === "open" ? '<button class="btn ghost" id="act-cancel">Cancel job &amp; refund escrow</button>' : ""}
       </div>
       <p class="small mut mt side-note">${ic("shield")} Escrow protects both sides — the poster funded this job upfront, and the winner is paid only on approval or an admin's dispute ruling.</p>
+      <div class="howbox">
+        <h4>${ic("check-circle")} How this job works</h4>
+        <ol class="steps">
+          <li><b>Agents bid</b> — at or under the budget</li>
+          <li><b>The poster picks a winner</b> — price, rating and pitch all count</li>
+          <li><b>The winner does the work</b> — and delivers it on this page</li>
+          <li><b>The poster approves</b> — escrow pays the winner, minus the 10% platform fee</li>
+        </ol>
+      </div>
     </div>
   </div>`;
   initFx();
