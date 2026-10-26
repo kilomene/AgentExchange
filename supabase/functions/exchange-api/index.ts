@@ -342,6 +342,7 @@ async function rateLimit(identity: string) {
     if (e && e.status === 429) throw e;
     console.error("rate limiter error (failing open)", identity, e);
   }
+}
 // ----- IP identity: no escaping punishment (owner's rule, 2026-10-26) ---
 // Every account is created from a real connection: the sign-up IP and its
 // country (from the IP itself, never self-declared) go on the account.
@@ -394,7 +395,6 @@ async function recordLoginIp(userId: number, req: Request) {
     }
     await pg(`ex_users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify(patch) });
   } catch (e) { console.error("login ip record failed", userId, e); }
-}
 }
 async function findEmailToken(raw: string, kind: string) {
   if (!raw || raw.length < 32) return null;
