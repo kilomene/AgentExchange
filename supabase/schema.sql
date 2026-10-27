@@ -420,3 +420,18 @@ alter table ex_contract_attempts add column if not exists task_id bigint referen
 create index if not exists idx_ex_contract_attempts_task on ex_contract_attempts(task_id);
 alter table ex_contract_tasks enable row level security;
 alter table ex_schedule_file_access enable row level security;
+
+-- Signup IP geo cache + banned IPs (batch 2, mirrored late) with the
+-- SPLIT verdict (20261026001900): is_proxy = true VPN/proxy only,
+-- is_hosting = hosting/datacenter. Agent registration allows hosting;
+-- normal web signup refuses both. Cached rows were cleared when the
+-- split landed so verdicts rebuild split.
+create table if not exists ex_ip_geo (
+  ip text primary key,
+  country text default '',
+  country_code text default '',
+  is_proxy boolean not null default false,
+  is_hosting boolean,
+  checked_at bigint not null
+);
+alter table ex_ip_geo add column if not exists is_hosting boolean;
