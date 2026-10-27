@@ -20,6 +20,7 @@ import { loadConfig, SupabaseAdmin } from "./supabase.mjs";
 import { sendMail, buildMessage } from "./smtp.mjs";
 import { renderMail, FROM_NAME_EXPORT, TEMPLATE_KINDS } from "./templates.mjs";
 import { reservedDomainOf } from "./reserved.mjs";
+import { checkAndSuppress } from "./suppression.mjs";
 import { embed as embedWatermark } from "./watermark.mjs";
 
 const config = loadConfig();
@@ -107,18 +108,23 @@ function loadPool() {
 function savePool(p) {
   try { writeFileSync(POOL_FILE, JSON.stringify(p)); } catch { /* best-effort */ }
 }
+// Pool state is keyed per TRANSPORT, not per address: since 2026-10-26
+// the same From (no-reply@) exists on two transports (ZeptoMail primary +
+// Zoho fallback), and a park or send-count on one must never leak onto
+// the other.
+function senderKey(sender) { return `${sender.from}|${sender.host || "smtp.zoho.com"}`; }
 function senderParkedUntil(p, sender) {
-  return Math.max(p.parked[sender.from] || 0, p.parked[`auth:${sender.authUser}`] || 0);
+  return Math.max(p.parked[senderKey(sender)] || 0, p.parked[`auth:${sender.authUser}`] || 0);
 }
 function parkSender(p, sender, secs, scope) {
-  const key = scope === "auth" ? `auth:${sender.authUser}` : sender.from;
+  const key = scope === "auth" ? `auth:${sender.authUser}` : senderKey(sender);
   p.parked[key] = now() + secs;
   savePool(p);
   return p.parked[key];
 }
-function senderRecentCount(p, from) {
+function senderRecentCount(p, sender) {
   const cutoff = now() - 3600;
-  return (p.sends[from] || []).filter((t) => t > cutoff).length;
+  return (p.sends[senderKey(sender)] || []).filter((t) => t > cutoff).length;
 }
 function isBlockError(e) {
   const s = String((e && e.message) || e || "");
@@ -151,6 +157,8 @@ function recordSend(from) {
   p.sends[from] = (p.sends[from] || []).filter((t) => t > cutoff);
   p.sends[from].push(now());
   savePool(p);
+  // NOTE: callers pass senderKey(sender) as `from` so counts stay
+  // per-transport (see senderKey).
 }
 
 function heartbeat(phase) {
@@ -185,6 +193,11 @@ async function cycle() {
       console.log("[mailerd] hourly cap reached — remaining rows stay queued (no attempts burned)");
       break;
     }
+    // SHADOW-BAN SUPPRESSION (owner order 2026-10-27): a mail queued
+    // before the recipient's ban must NOT go out — suppress it here
+    // at send time (no attempt burned, never marked sent). The ban
+    // notice itself (kind shadow_ban_notice) is the one exception.
+    if (await checkAndSuppress(db, row)) continue;
     // EMAIL DISCIPLINE GUARD (owner order 2026-10-23, hard rule): reserved /
     // undeliverable recipient domain (RFC 2606) — refuse BEFORE any SMTP
     // attempt; no attempt counted, never retried (the row leaves 'queued'
@@ -224,13 +237,19 @@ async function cycle() {
     // 6h AUTH-block, whole auth group for AUTH) and the SAME row moves to
     // the next sender — one blocked address never stops platform mail.
     const pool = loadPool();
-    const ordered = [...config.senders].sort((a, b) => senderRecentCount(pool, a.from) - senderRecentCount(pool, b.from));
+    // Ordering: "primary"-flagged senders (ZeptoMail) always go first when
+    // healthy — the pool is a FALLBACK, not a co-sender. Within a tier,
+    // least-recently-used first. A primary sender's cap is the global cap
+    // (it is built for volume); pool senders keep the tight per-sender cap.
+    const tierOf = (s) => ((s.flags || "").includes("primary") ? 0 : 1);
+    const ordered = [...config.senders].sort((a, b) => tierOf(a) - tierOf(b) || senderRecentCount(pool, a) - senderRecentCount(pool, b));
     let delivered = false;
     let providerDeferred = false;
     let messageFailed = false;
     for (const sender of ordered) {
       if (senderParkedUntil(pool, sender) > now()) continue;
-      if (senderRecentCount(pool, sender.from) >= PER_SENDER_CAP) continue;
+      const senderCap = (sender.flags || "").includes("primary") ? HOURLY_CAP : PER_SENDER_CAP;
+      if (senderRecentCount(pool, sender) >= senderCap) continue;
       const message = buildMessage({
         from: sender.from, fromName: FROM_NAME_EXPORT,
         to: row.to_email, toName: row.to_name || "",
@@ -238,19 +257,22 @@ async function cycle() {
         inlineImages,
       });
       try {
-        await sendMail({ user: sender.authUser, pass: sender.pass, message, mailFrom: sender.from });
+        await sendMail({ user: sender.authUser, pass: sender.pass, message, mailFrom: sender.from, host: sender.host });
         await db.patch(`ex_outbox?id=eq.${row.id}`, { status: "sent", sent_at: now(), last_error: null });
         sentTotal++;
         sendBudget--;
-        recordSend(sender.from);
+        recordSend(senderKey(sender));
         console.log(`[mailerd] sent id=${row.id} kind=${row.kind} to=${row.to_email} via=${sender.from}`);
         delivered = true;
         break;
       } catch (e) {
-        if (isProviderError(e)) {
+        // "providerall" senders (the ZeptoMail primary): every transport
+        // error is a provider event for that sender, never a message
+        // failure — park it and fail the row over to the Zoho pool.
+        if (isProviderError(e) || (sender.flags || "").includes("providerall")) {
           const blocked = isBlockError(e);
           const until = parkSender(pool, sender, blocked ? BLOCK_COOLDOWN_SECS : THROTTLE_COOLDOWN_SECS, blocked ? "auth" : "from");
-          console.error(`[mailerd] Zoho ${blocked ? "SENDER BLOCK/AUTH" : "throttle 5.4.6"} via=${sender.from} on id=${row.id} — sender parked until ${until}, failing over`);
+          console.error(`[mailerd] provider refusal via=${sender.from} (${sender.host || "smtp.zoho.com"}) on id=${row.id}: ${String(e.message || e).slice(0, 120)} — sender parked until ${until}, failing over`);
           providerDeferred = true;
           continue;
         }
