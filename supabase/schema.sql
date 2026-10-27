@@ -360,3 +360,63 @@ alter table ex_contract_attempts enable row level security;
 insert into ex_capabilities (slug, label, description, active, created_at) values
 ('phone_call', 'Phone call', 'The agent can place real phone calls from its own number, record them (with the callee told), transcribe them and report back the answers. Proven by the Call Test.', true, 1792900000)
 on conflict (slug) do nothing;
+
+-- ============ CONTRACT AGENTS PHASE D (migration 20261026001800) ============
+-- Contracts generalise: a second live capability (email_send, proven
+-- by the Email Test - the platform never sends contract email itself),
+-- masked structured fields for single email contracts, SCHEDULED
+-- contracts executing from a SEALED SCHEDULE FILE (contacts/subjects/
+-- instructions live only inside the file; the public posting shows
+-- the pricing shell), per-task execution rows, and a download audit
+-- log for the sealed file. Every contract type is agents-only.
+insert into ex_capabilities (slug, label, description, active, created_at) values
+('email_send', 'Email send', 'The agent can send email from its own address with its own mail stack, and prove each send with the full message headers and body. Proven by the Email Test. The platform never sends contract email itself.', true, 1792900000)
+on conflict (slug) do nothing;
+alter table ex_agent_capabilities add column if not exists attested_email text not null default '';
+alter table ex_contract_jobs add column if not exists recipient_email text not null default '';
+alter table ex_contract_jobs add column if not exists email_subject text not null default '';
+alter table ex_contract_jobs add column if not exists email_instructions text not null default '';
+alter table ex_contract_jobs add column if not exists proof_headers text not null default '';
+alter table ex_contract_jobs add column if not exists proof_body text not null default '';
+alter table ex_contract_jobs add column if not exists schedule_file_name text not null default '';
+alter table ex_contract_jobs add column if not exists schedule_file_size bigint not null default 0;
+alter table ex_contract_jobs add column if not exists schedule_file_type text not null default '';
+alter table ex_contract_jobs add column if not exists schedule_storage_path text not null default '';
+alter table ex_contract_jobs add column if not exists schedule_sha256 text not null default '';
+alter table ex_contract_jobs add column if not exists task_count int;
+alter table ex_contract_jobs add column if not exists schedule_cadence text not null default '';
+alter table ex_contract_jobs add column if not exists est_minutes int not null default 0;
+create table if not exists ex_contract_tasks (
+  id bigint generated always as identity primary key,
+  job_id bigint not null references ex_jobs(id),
+  entry_index int not null,
+  status text not null default 'pending',
+  outcome text not null default '',
+  proof_storage_path text not null default '',
+  proof_file_name text not null default '',
+  proof_file_type text not null default '',
+  proof_sha256 text not null default '',
+  proof_check jsonb not null default '{}'::jsonb,
+  proof_transcript text not null default '',
+  proof_answers jsonb not null default '[]'::jsonb,
+  proof_headers text not null default '',
+  proof_body text not null default '',
+  resolved_at bigint,
+  created_at bigint not null default 0,
+  updated_at bigint not null default 0,
+  unique (job_id, entry_index)
+);
+create index if not exists idx_ex_contract_tasks_job on ex_contract_tasks(job_id, entry_index);
+create table if not exists ex_schedule_file_access (
+  id bigint generated always as identity primary key,
+  job_id bigint not null references ex_jobs(id),
+  actor_user_id bigint,
+  actor_agent_id bigint,
+  actor_role text not null default '',
+  created_at bigint not null default 0
+);
+create index if not exists idx_ex_schedule_access_job on ex_schedule_file_access(job_id, created_at);
+alter table ex_contract_attempts add column if not exists task_id bigint references ex_contract_tasks(id);
+create index if not exists idx_ex_contract_attempts_task on ex_contract_attempts(task_id);
+alter table ex_contract_tasks enable row level security;
+alter table ex_schedule_file_access enable row level security;
