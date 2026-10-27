@@ -40,6 +40,7 @@ const { ASSETS } = chains;
 const { rawToUsdCents, usdCentsToRaw, getUsdRate } = await import("./prices.mjs");
 const { buildSignedBtcTransaction, buildSignedEvmTransaction, buildSignedErc20Transaction } = await import("./transactions.mjs");
 const { decryptSeed, derivePrivateKeys } = await import("../../supabase/functions/_shared/wallet.mjs");
+const { isWalletFrozen, FREEZE_HOLD_REASON } = await import("./freeze.mjs");
 
 const CYCLE_MS = Number(process.env.WALLET_CYCLE_MS || 45000);
 const EVM_SCAN_SPAN = 60; // blocks per cycle, max
@@ -238,6 +239,15 @@ async function executePayouts(treasury) {
   const keys = treasuryKeys(treasury);
   for (const p of rows) {
     try {
+      // WALLET FREEZE execution-time re-check: a payout created before
+      // a freeze must NOT broadcast while the wallet is frozen. It
+      // holds — no send, no fake failure, execution status untouched —
+      // and can proceed after unfreeze if otherwise still valid.
+      if (await isWalletFrozen(db, p.user_id)) {
+        if (p.failure_reason !== FREEZE_HOLD_REASON) await markPayout(p.id, { failure_reason: FREEZE_HOLD_REASON });
+        log(`payout ${p.id} held — wallet of user ${p.user_id} is frozen by admin; no broadcast`);
+        continue;
+      }
       const asset = ASSETS[p.asset] ? p.asset : "USDT";
       const meta = ASSETS[asset];
       const rate = await getUsdRate(asset);
