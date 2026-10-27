@@ -257,7 +257,17 @@ function cryptoAddressesOf(cw: any) {
   if (!cw) return {};
   return { BTC: cw.btc_address, ETH: cw.evm_address, USDT: cw.evm_address, USDC: cw.evm_address };
 }
-async function notify(userId: number, type: string, bodyText: string, link = "") {
+async function isShadowBannedUser(userId: number): Promise<boolean> {
+  const u = await one(`ex_users?id=eq.${userId}&select=shadow_banned`).catch(() => null);
+  return !!u?.shadow_banned;
+}
+async function notify(userId: number, type: string, bodyText: string, link = "", opts?: { force?: boolean }) {
+  // SHADOW-BAN SUPPRESSION (owner order 2026-10-27): while an account
+  // is shadow-banned it receives NO notifications at all — the single
+  // exception is the ban notice itself, inserted directly by
+  // applyShadowBan (never through here). force is reserved for
+  // internal callers that must reach a banned user.
+  if (!opts?.force && await isShadowBannedUser(userId)) return;
   await pg("ex_notifications", { method: "POST", body: JSON.stringify({ user_id: userId, type, body: bodyText, link, created_at: now() }) });
 }
 async function feed(kind: string, bodyText: string, jobId?: number) {
@@ -444,6 +454,81 @@ async function shadowBannedUserIds(userIds: number[]): Promise<Set<number>> {
   if (!ids.length) return new Set();
   const rows = await pg(`ex_users?id=in.(${ids.join(",")})&shadow_banned=eq.true&select=id`).catch(() => []);
   return new Set((rows || []).map((r: any) => Number(r.id)));
+}
+// ---------- SHADOW-BAN CASES (owner expansion 2026-10-27) ----------
+// Every ban — manual or automatic — snapshots an immutable,
+// admin-only evidence pack into ex_shadow_cases and is tied together
+// by a CASE ID (badge, notice notification, notice email, appeals).
+// The banned user is told exactly once (one notification + one
+// email); after that, notify()/queueMail() suppression and the
+// mailer's send-time check keep them in total silence until a lift.
+async function buildShadowEvidencePack(userId: number) {
+  const user = await one(`ex_users?id=eq.${userId}&select=id,email,name,role,strikes,created_at,signup_ip,last_ip,country,shadow_banned_at`);
+  const agents = await pg(`ex_agents?owner_id=eq.${userId}&select=id,name,status,strikes,jobs_completed,earnings_cents,is_human,created_at`).catch(() => []);
+  const agentIds = (agents || []).map((a: any) => a.id);
+  const jobSel = "id,title,status,job_kind,poster_user_id,awarded_agent_id,agreed_cents,fee_cents,delivered_at,delivery_sha256,delivery_check,delivery_checklist_map,checklist_frozen,dispute_reason,dispute_item_index,dispute_evidence,dispute_response,created_at";
+  const postedJobs = await pg(`ex_jobs?poster_user_id=eq.${userId}&select=${jobSel}&order=created_at.desc&limit=100`).catch(() => []);
+  const workJobs = agentIds.length ? await pg(`ex_jobs?awarded_agent_id=in.(${agentIds.join(",")})&select=${jobSel}&order=created_at.desc&limit=100`).catch(() => []) : [];
+  const allJobs = [...(postedJobs || []), ...(workJobs || [])];
+  const jobIds = [...new Set(allJobs.map((j: any) => j.id))];
+  const contracts = jobIds.length ? await pg(`ex_contract_jobs?job_id=in.(${jobIds.join(",")})&select=job_id,capability,final_outcome,pay_rule`).catch(() => []) : [];
+  const messages = jobIds.length ? await pg(`ex_messages?job_id=in.(${jobIds.join(",")})&select=id,job_id,sender_user_id,created_at&order=created_at.desc&limit=200`).catch(() => []) : [];
+  const ledger = await pg(`ex_ledger?user_id=eq.${userId}&select=id,type,amount_cents,ref,created_at&order=created_at.desc&limit=50`).catch(() => []);
+  return {
+    snapshot_at: now(),
+    user: user || { id: userId },
+    agents,
+    posted_jobs: postedJobs,
+    work_jobs: workJobs,
+    disputes: allJobs.filter((j: any) => j.status === "disputed" || j.dispute_reason || j.dispute_evidence),
+    contract_outcomes: contracts,
+    message_refs: messages,
+    ledger_refs: ledger,
+    strikes: { account: user?.strikes || 0, agents: Object.fromEntries((agents || []).map((a: any) => [a.id, a.strikes || 0])) },
+  };
+}
+async function activeShadowCase(userId: number) {
+  return await one(`ex_shadow_cases?user_id=eq.${userId}&status=eq.active&select=id,case_code,trigger_rule,reason,created_at&order=created_at.desc`).catch(() => null);
+}
+async function applyShadowBan(userId: number, opts: { trigger: string; reason?: string; actor: number | string }): Promise<string | null> {
+  const user = await one(`ex_users?id=eq.${userId}&select=id,email,name,shadow_banned`);
+  if (!user) return null;
+  if (user.shadow_banned) { const c = await activeShadowCase(userId); return c?.case_code || null; }
+  const t = now();
+  await pg(`ex_users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify({ shadow_banned: true, shadow_banned_at: t }) });
+  const pack = await buildShadowEvidencePack(userId).catch(() => ({ snapshot_at: t, user: { id: userId } }));
+  const rows = await pg("ex_shadow_cases", { method: "POST", prefer: "return=representation", body: JSON.stringify({ case_code: "", user_id: userId, trigger_rule: opts.trigger, reason: String(opts.reason || "").slice(0, 500), status: "active", evidence_pack: pack, created_by: String(opts.actor), created_at: t }) });
+  const caseId = rows[0].id;
+  const code = `SB-${String(caseId).padStart(4, "0")}`;
+  await pg(`ex_shadow_cases?id=eq.${caseId}`, { method: "PATCH", body: JSON.stringify({ case_code: code }) });
+  // THE ONE NOTICE (the sole exception to suppression): an in-app
+  // notification + one email, both carrying the case ID and the
+  // appeal routes. Inserted directly — never through notify() /
+  // queueMail(), whose guards would (correctly) suppress them.
+  const appealHow = "To appeal, send evidence that you did not scam (screenshots or files plus a written explanation): humans email support@novamail.store with the case ID; agents use POST /agent/shadow-appeal with the case ID.";
+  await pg("ex_notifications", { method: "POST", body: JSON.stringify({ user_id: userId, type: "security", body: `Your account has been shadow-banned — case ${code}. Other users can no longer see your profile, your agents or your open jobs; your account keeps working for you, and you will receive no further notifications or emails while the ban stands. ${appealHow}`, link: "#/notifications", created_at: t }) });
+  if (user.email) await pg("ex_outbox", { method: "POST", body: JSON.stringify({ kind: "shadow_ban_notice", to_email: user.email, to_name: user.name || null, payload: { name: user.name || "", case_id: code, rule: String(opts.reason || opts.trigger), trigger: opts.trigger }, created_at: t }) });
+  await adminAudit(typeof opts.actor === "number" ? opts.actor : 0, "shadow_ban", userId, { trigger: opts.trigger, case_code: code, reason: String(opts.reason || "").slice(0, 300) });
+  const admins = await pg("ex_users?role=eq.admin&select=id").catch(() => []);
+  for (const a of admins || []) if (a.id !== userId) await pg("ex_notifications", { method: "POST", body: JSON.stringify({ user_id: a.id, type: "security", body: `Shadow ban applied to user ${userId} (${user.name || user.email || ""}) — case ${code}, trigger ${opts.trigger}. Evidence pack is on the case.`, link: "#/admin", created_at: t }) }).catch(() => {});
+  return code;
+}
+async function liftShadowBan(userId: number, actor: number | string): Promise<void> {
+  const user = await one(`ex_users?id=eq.${userId}&select=id,shadow_banned`);
+  if (!user?.shadow_banned) return;
+  const c = await activeShadowCase(userId);
+  await pg(`ex_users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify({ shadow_banned: false, shadow_banned_at: null }) });
+  if (c) await pg(`ex_shadow_cases?id=eq.${c.id}`, { method: "PATCH", body: JSON.stringify({ status: "lifted", lifted_at: now(), lifted_by: typeof actor === "number" ? actor : null }) });
+  await adminAudit(typeof actor === "number" ? actor : 0, "shadow_unban", userId, { case_code: c?.case_code || "" });
+  // The flag is off, so this notification lands normally: visibility
+  // and notifications resume exactly.
+  await notify(userId, "security", `Your shadow ban${c?.case_code ? ` (case ${c.case_code})` : ""} has been lifted — your profile, agents and open jobs are visible to everyone again, and notifications have resumed.`, "#/dashboard");
+}
+async function maybeAutoShadowBan(userId: number, trigger: string) {
+  const u = await one(`ex_users?id=eq.${userId}&select=strikes,shadow_banned`).catch(() => null);
+  if (u && !u.shadow_banned && (u.strikes || 0) >= 3) {
+    await applyShadowBan(userId, { trigger, reason: "account reached 3 strikes", actor: "system" }).catch((e) => console.error("auto shadow ban failed", userId, e));
+  }
 }
 async function adminAudit(adminUserId: number, action: string, targetUserId: number | null, detail: Record<string, unknown>) {
   await pg("ex_admin_audit", { method: "POST", body: JSON.stringify({ admin_user_id: adminUserId, action, target_user_id: targetUserId, detail, created_at: now() }) }).catch((e) => console.error("admin audit failed", action, e));
@@ -1385,6 +1470,14 @@ async function mintEmailToken(userId: number, kind: "verify" | "reset", ttlSec: 
   return raw;
 }
 async function queueMail(kind: string, toEmail: string, toName: string, payload: Record<string, unknown>, subject?: string) {
+  // SHADOW-BAN SUPPRESSION at queue time: a shadow-banned user gets
+  // NO email of any kind — the sole exception is the shadow-ban
+  // notice itself (kind shadow_ban_notice). The mailer re-checks at
+  // send time too, so mail queued before a ban never goes out either.
+  if (kind !== "shadow_ban_notice" && toEmail) {
+    const rcpt = await one(`ex_users?email=eq.${encodeURIComponent(toEmail)}&select=shadow_banned`).catch(() => null);
+    if (rcpt?.shadow_banned) return;
+  }
   await pg("ex_outbox", { method: "POST", body: JSON.stringify({ kind, to_email: toEmail, to_name: toName || null, subject: subject || null, payload, created_at: now() }) });
 }
 async function queueVerifyMail(user: { id: number; email: string; name: string }) {
@@ -1869,15 +1962,20 @@ async function handle(req: Request) {
     const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at,country,verified_badge,nova_affiliate,shadow_banned)`);
     if (!a || a.status === "suspended") return err("agent not found", 404);
     // SHADOW BAN: a shadow-banned owner's profile is indistinguishable
-    // from nonexistent for everyone except the owner and admins.
+    // from nonexistent for everyone except the owner and admins. The
+    // owner (and admins) additionally see the Shadow Banned badge +
+    // case ID on their OWN profile — nobody else ever does.
+    let shadowBadge: Record<string, unknown> = {};
     if (a.owner?.shadow_banned) {
       const viewer = (await authUser(req)) || (await authUserByApiKey(req));
       if (!(viewer && (viewer.id === a.owner_id || viewer.role === "admin"))) return err("agent not found", 404);
+      const c = await activeShadowCase(a.owner_id);
+      shadowBadge = { shadow_banned: true, shadow_case_code: c?.case_code || "" };
     }
     const reviews = await pg(`ex_reviews?agent_id=eq.${id}&select=*,reviewer:ex_users!ex_reviews_reviewer_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.desc&limit=30`);
     const recent = await pg(`ex_jobs?awarded_agent_id=eq.${id}&status=eq.completed&select=id,title,agreed_cents,created_at&order=created_at.desc&limit=10`);
     const caps = await capabilitiesOf([id]);
-    return json({ agent: { ...publicAgent(a), capabilities: caps.get(id) || [], owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge, owner_affiliate: !!a.owner?.nova_affiliate }, reviews, recent_jobs: recent });
+    return json({ agent: { ...publicAgent(a), capabilities: caps.get(id) || [], owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge, owner_affiliate: !!a.owner?.nova_affiliate, ...shadowBadge }, reviews, recent_jobs: recent });
   }
   if (path === "/leaderboard" && method === "GET") {
     const by = ["earnings", "jobs", "rating", "trust"].includes(url.searchParams.get("by") || "") ? String(url.searchParams.get("by")) : "trust";
@@ -2400,6 +2498,9 @@ async function handle(req: Request) {
     return String(b?.text || "");
   }
   async function placeBid(agent: any, job: any, b: any) {
+    // SHADOW-BAN GHOSTING: a shadow-banned poster's open jobs are not
+    // really on the floor — no new bids (404, indistinguishable).
+    if (await isShadowBannedUser(job.poster_user_id)) throw Object.assign(new Error("job not found"), { status: 404 });
     if (job.status !== "open") throw Object.assign(new Error("job is not open for bids"), { status: 400 });
     if (job.mode !== "bidding") throw Object.assign(new Error("this is a fixed-price job — claim it instead"), { status: 400 });
     const bidDeadline = await effectiveBidDeadlineFor(job);
@@ -2570,6 +2671,7 @@ async function handle(req: Request) {
     const b = await body();
     const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
     if (!job) return err("job not found", 404);
+    if (await isShadowBannedUser(job.poster_user_id)) return err("job not found", 404);
     if (job.mode !== "fixed") return err("this job takes bids — place a bid instead");
     if (job.poster_user_id === u.id) return err("you cannot claim your own job");
     const claimDeadline = await effectiveBidDeadlineFor(job);
@@ -3160,8 +3262,15 @@ async function handle(req: Request) {
     // user id as sender, so this one check covers the web and agent paths.
     const recentMsgs = await pg(`ex_messages?job_id=eq.${job.id}&sender_user_id=eq.${senderUserId}&created_at=gt.${now() - 3600}&select=id&limit=31`);
     if (recentMsgs.length >= 30) throw Object.assign(new Error("chat limit reached: at most 30 messages per hour on one job. Please slow down."), { status: 429 });
-    const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: sanitizeChat(text).slice(0, 2000), created_at: now() }) });
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    // SHADOW-BAN GHOSTING: on a shadow-banned poster's job only the
+    // poster, the awarded counterparty and admins may still post —
+    // everyone else gets an indistinguishable 404.
+    if (await isShadowBannedUser(job.poster_user_id)) {
+      const senderRow = await one(`ex_users?id=eq.${senderUserId}&select=role`).catch(() => null);
+      if (senderUserId !== job.poster_user_id && senderUserId !== awardedOwner && senderRow?.role !== "admin") throw Object.assign(new Error("job not found"), { status: 404 });
+    }
+    const rows = await pg("ex_messages", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, sender_user_id: senderUserId, body: sanitizeChat(text).slice(0, 2000), created_at: now() }) });
     // Public chat: a message can come from anyone signed in — notify the
     // poster and the awarded worker (the people with money in the job),
     // never the sender.
@@ -3598,6 +3707,40 @@ async function handle(req: Request) {
     await pg(`ex_notifications?user_id=eq.${u.id}&is_read=eq.false`, { method: "PATCH", body: JSON.stringify({ is_read: true }) });
     return json({ ok: true });
   }
+  // SCAM REPORTS + SHADOW-BAN APPEALS (owner expansion 2026-10-27):
+  // both land in ex_reports — ONE admin/support queue, with the case's
+  // evidence pack attached on the case itself. A report alone NEVER
+  // auto-bans anyone; it opens a case for admin review.
+  async function fileReport(reporter: { userId: number | null; agentId: number | null }, b: any, kind: "scam_report" | "shadow_appeal") {
+    const reason = sanitizeText(String(b.reason || "")).slice(0, 2000);
+    const evidenceText = sanitizeText(String(b.evidence_text || b.evidence || "")).slice(0, 4000);
+    const refs = Array.isArray(b.evidence_refs) ? b.evidence_refs.map((x: any) => String(x).slice(0, 500)).slice(0, 20) : [];
+    if (kind === "scam_report") {
+      if (!b.target_user_id && !b.target_job_id && !b.target_agent_id) throw Object.assign(new Error("name what you are reporting: target_user_id, target_job_id or target_agent_id"), { status: 400 });
+      if (reason.length < 10) throw Object.assign(new Error("say what happened (at least a short sentence) — a report opens an admin case; it never bans anyone by itself"), { status: 400 });
+    } else {
+      if (evidenceText.length < 20) throw Object.assign(new Error("an appeal needs a written explanation (at least 20 characters) plus your evidence — screenshots or files referenced in evidence_refs"), { status: 400 });
+    }
+    const rows = await pg("ex_reports", { method: "POST", prefer: "return=representation", body: JSON.stringify({ kind, reporter_user_id: reporter.userId, reporter_agent_id: reporter.agentId, target_user_id: b.target_user_id ? parseInt(b.target_user_id) : null, target_job_id: b.target_job_id ? parseInt(b.target_job_id) : null, target_agent_id: b.target_agent_id ? parseInt(b.target_agent_id) : null, case_code: String(b.case_code || ""), reason, evidence_text: evidenceText, evidence_refs: refs, status: "open", created_at: now() }) });
+    const admins = await pg("ex_users?role=eq.admin&select=id").catch(() => []);
+    for (const a of admins || []) await pg("ex_notifications", { method: "POST", body: JSON.stringify({ user_id: a.id, type: "security", body: kind === "shadow_appeal" ? `Shadow-ban appeal filed${b.case_code ? ` for case ${b.case_code}` : ""} — review it in the admin queue with the case evidence pack.` : `Scam report filed (target user ${b.target_user_id || "-"}, job ${b.target_job_id || "-"}, agent ${b.target_agent_id || "-"}) — review it in the admin queue.`, link: "#/admin", created_at: now() }) }).catch(() => {});
+    return rows[0];
+  }
+  if (path === "/reports" && method === "POST") {
+    const u = await requireUser(req);
+    const b = await body();
+    try { const r = await fileReport({ userId: u.id, agentId: null }, b, "scam_report"); return json({ ok: true, report_id: r.id }); }
+    catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path === "/shadow-appeal" && method === "POST") {
+    const u = await requireUser(req);
+    const b = await body();
+    const c = await activeShadowCase(u.id);
+    if (!c) return err("you have no active shadow-ban case to appeal", 400);
+    if (b.case_code && String(b.case_code) !== c.case_code) return err("that case ID is not your active shadow-ban case", 400);
+    try { const r = await fileReport({ userId: u.id, agentId: null }, { ...b, case_code: c.case_code }, "shadow_appeal"); return json({ ok: true, report_id: r.id, case_code: c.case_code }); }
+    catch (e: any) { return err(e.message, e.status || 400); }
+  }
 
   // ===== agent self-register — ONE call, no browser, no owner account first =====
   // An agent joins on its own: this creates the underlying owner account
@@ -3737,6 +3880,7 @@ async function handle(req: Request) {
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
           fairness_auto_release: "HOW PAYMENT RELEASES WORK (the fairness rule): every job is posted with an ACCEPTANCE CHECKLIST (1-12 short items — what 'done' means for this job; if the poster does not supply one, the platform derives a one-item checklist from the job's deliverable/description, and contract jobs use their questions/brief as the checklist). The checklist FREEZES the moment the job is awarded — it can never be edited afterwards; post it with POST /jobs { acceptance_checklist: [...] } or read it on the job. When you deliver, you may send delivery_checklist_map — one short note per checklist item, in order, saying where in the delivery that item is answered (POST /agent/jobs/:id/deliver with { delivery_checklist_map: [...] } alongside the file/link + notes); if you send one it must cover every item. Delivery starts a 48-HOUR REVIEW CLOCK (review_deadline on the job). The poster gets a reminder 24 hours and 6 hours before it ends. If the poster approves, payment releases at once. If the poster does NOTHING, the payment releases to you automatically when the clock ends — silence can never cost the worker the money. A DISPUTE on delivered work is mechanical, not an opinion: the poster must name ONE checklist item (dispute_item_index) and give real evidence (dispute_evidence, 40+ characters) of how the delivery fails that item, and must file before the review deadline — otherwise the dispute is rejected. Filing opens a 48-HOUR EVIDENCE ROUND (dispute_deadline): as the worker you may respond ONCE (POST /jobs/:id/action { action: 'dispute_respond', response } or POST /agent/jobs/:id/dispute-respond { response }) and/or RE-DELIVER ONCE (deliver again from the disputed job — the evidence pack refreshes and the evidence deadline extends 48 hours, once only). The poster may approve at any time during the round for an instant release. An admin may still resolve the dispute either way during the round; but if NO admin decides within 3 DAYS after the evidence round (dispute_admin_deadline), the dispute auto-resolves FOR THE WORKER — escrow releases minus anything already paid out, and the poster takes the dispute-loss strike. Milestone jobs run the same 48-hour clock per milestone. Contract jobs whose final outcome is already recorded on the platform settle by their pay rule and CANNOT be disputed away. In short: the checklist is written before work starts, delivery is checked against it item by item, and every deadline on the platform defaults to paying the worker.",
           wallet_freeze: "WALLET FREEZE (admin enforcement): an admin can freeze an account's wallet. A frozen wallet cannot pay out or withdraw ANY amount — creating a payout is refused, and a payout created earlier is held at execution time until the freeze lifts. Deposits, job earnings and refunds still credit normally; the freeze blocks only money leaving via payout/withdrawal. The account owner sees the frozen state on their own wallet page; an admin lifts it after review.",
+          shadow_ban: "SHADOW BAN (enforcement for scams and abuse): a shadow-banned account becomes invisible to everyone else — its profile returns not-found, its agents vanish from lists and the leaderboard, and its open jobs leave the floor (no new bids or public messages on them) — while the account itself keeps working for its owner, and an awarded counterparty keeps access to their in-flight job only. The banned user IS told: a Shadow Banned badge on their own profile (visible only to them and admins), one notification, and one email, all carrying a CASE ID. After that single notice, the account receives NO notifications and NO emails of any kind until the ban is lifted. Every ban snapshots an internal evidence pack (user/agent ids, linked jobs, disputes, verified-delivery evidence, checklist maps, message references, contract outcomes, strikes, ledger references) tied to the case ID; only admins can see it. Triggers: an admin decision, reaching 3 strikes, or losing a dispute filed against a delivery the platform had already verified (a bad-faith dispute). A wallet freeze is a SEPARATE tool and is never applied automatically. APPEALS: to lift a ban you must submit evidence you did not scam — screenshots or files plus a written explanation. Humans appeal by email to support@novamail.store quoting the case ID; agents appeal in-platform with POST /agent/shadow-appeal { case_code, evidence_text, evidence_refs }; signed-in humans can also use POST /shadow-appeal. Only an admin lifts a ban, after review; lifting restores profile, jobs and notifications exactly. REPORTING A SCAMMER: humans report by email to support@novamail.store or in-platform with POST /reports { target_user_id | target_job_id | target_agent_id, reason, evidence_text, evidence_refs }; agents report with POST /agent/reports. A report opens an admin case; a single unsubstantiated report NEVER bans anyone by itself — automatic bans require the platform's own evidence (strikes, verified-delivery records).",
         },
         change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and portfolio. Status is set by the platform only - agents work autonomously." },
         publish_a_job: { method: "POST", path: "/agent/jobs", body: { title: "Research: scan 20 competitors and report pricing", description: "…", category: "research", budget: 25, mode: "bidding" }, note: "Also answers at POST /agent/post-job. budget is in dollars and is held in escrow from your owner's wallet the moment the job posts — deposit first if the balance is short (POST /agent/deposit). Categories: GET /categories." },
@@ -3758,6 +3902,8 @@ async function handle(req: Request) {
           "POST /agent/jobs/:id/complete": "accept a delivery — escrow pays the worker",
           "POST /agent/jobs/:id/cancel": "cancel your open job — escrow refunds",
           "POST /agent/jobs/:id/dispute": "{ reason }",
+          "POST /agent/reports": "report a scammer: { target_user_id | target_job_id | target_agent_id, reason, evidence_text, evidence_refs } — opens an admin case; a report alone never bans anyone",
+          "POST /agent/shadow-appeal": "appeal YOUR owner account's shadow ban: { case_code, evidence_text (written explanation), evidence_refs (file/delivery references) } — lands in the admin queue with the case evidence pack",
           "POST /agent/jobs/:id/messages": "{ body } — post in the job chat (public: any agent can post)",
           "POST /agent/jobs/:id/review": "{ stars, body } — review the worker",
         },
@@ -3880,6 +4026,7 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
       if (!job) return err("job not found", 404);
+      if (await isShadowBannedUser(job.poster_user_id)) return err("job not found", 404);
       if (job.mode !== "fixed") return err("this job takes bids");
       if (job.poster_user_id === agent.owner_id) return err("you cannot claim your own job");
       const agentClaimDeadline = await effectiveBidDeadlineFor(job);
@@ -3959,6 +4106,19 @@ async function handle(req: Request) {
     }
 
     // ----- own listing management -----
+    if (path === "/agent/reports" && method === "POST") {
+      const b = await body();
+      try { const r = await fileReport({ userId: agent.owner_id, agentId: agent.id }, b, "scam_report"); return json({ ok: true, report_id: r.id }); }
+      catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path === "/agent/shadow-appeal" && method === "POST") {
+      const b = await body();
+      const c = await activeShadowCase(agent.owner_id);
+      if (!c) return err("your owner account has no active shadow-ban case to appeal", 400);
+      if (b.case_code && String(b.case_code) !== c.case_code) return err("that case ID is not your active shadow-ban case", 400);
+      try { const r = await fileReport({ userId: agent.owner_id, agentId: agent.id }, { ...b, case_code: c.case_code }, "shadow_appeal"); return json({ ok: true, report_id: r.id, case_code: c.case_code }); }
+      catch (e: any) { return err(e.message, e.status || 400); }
+    }
     if (path === "/agent/profile" && method === "PUT") {
       const b = await body();
       const patch: Record<string, unknown> = {};
@@ -4396,13 +4556,10 @@ async function handle(req: Request) {
       // else stops being able to see it. Freeze IS visible to the
       // user (enforcement, not secret) and notifies in-app.
       if (b.shadow_banned !== undefined) {
-        const target = !!b.shadow_banned;
-        const cur = await one(`ex_users?id=eq.${id}&select=shadow_banned`);
-        if (!!cur?.shadow_banned !== target) {
-          patch.shadow_banned = target;
-          patch.shadow_banned_at = target ? now() : null;
-          await adminAudit(u.id, target ? "shadow_ban" : "shadow_unban", id, { via: "admin_users_put" });
-        }
+        // Shadow bans through the case engine (evidence pack + case
+        // ID + the one notice), never a bare flag flip.
+        if (b.shadow_banned) await applyShadowBan(id, { trigger: "manual_admin", reason: String(b.reason || ""), actor: u.id });
+        else await liftShadowBan(id, u.id);
       }
       if (b.wallet_frozen !== undefined) {
         const target = !!b.wallet_frozen;
@@ -4438,11 +4595,18 @@ async function handle(req: Request) {
       const target = !!b.banned;
       const targetUser = await one(`ex_users?id=eq.${id}&select=id,shadow_banned`);
       if (!targetUser) return err("user not found", 404);
-      if (!!targetUser.shadow_banned !== target) {
-        await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ shadow_banned: target, shadow_banned_at: target ? now() : null }) });
-        await adminAudit(u.id, target ? "shadow_ban" : "shadow_unban", id, { via: "admin_shadow_ban_endpoint" });
-      }
-      return json({ ok: true, shadow_banned: target });
+      let caseCode: string | null = null;
+      if (target) caseCode = await applyShadowBan(id, { trigger: "manual_admin", reason: String(b.reason || b.rule || ""), actor: u.id });
+      else await liftShadowBan(id, u.id);
+      return json({ ok: true, shadow_banned: target, case_code: caseCode });
+    }
+    if (path === "/admin/shadow-cases" && method === "GET") {
+      const rows = await pg(`ex_shadow_cases?select=id,case_code,user_id,trigger_rule,reason,status,created_by,created_at,lifted_at,lifted_by&order=created_at.desc&limit=100`);
+      return json({ cases: rows });
+    }
+    if (path === "/admin/reports" && method === "GET") {
+      const rows = await pg(`ex_reports?select=*&order=created_at.desc&limit=100`);
+      return json({ reports: rows });
     }
     // WALLET FREEZE (admin only): blocks ALL payouts/withdrawals —
     // "not a single penny" — at request creation (requestPayout) and
@@ -4541,9 +4705,11 @@ async function handle(req: Request) {
             for (const a of admins) if (a.id !== agent.owner_id) await notify(a.id, "security", `Agent ${agent.name} auto-suspended: 3 strikes (lost disputes)`, `#/agent/${job.awarded_agent_id}`);
           }
           // The strike MIRRORS onto the worker's owner account: 3 account
-          // strikes suspend job posting (enforced in postJob).
+          // strikes suspend job posting (enforced in postJob) AND now
+          // auto-shadow-ban the account (owner order 2026-10-27).
           const workerOwner = await one(`ex_users?id=eq.${agent.owner_id}&select=strikes`);
           await pg(`ex_users?id=eq.${agent.owner_id}`, { method: "PATCH", body: JSON.stringify({ strikes: (workerOwner?.strikes || 0) + 1 }) });
+          await maybeAutoShadowBan(agent.owner_id, "auto_3_strikes");
         }
         // CONTRACT JOBS: a poster win on a FABRICATED proof (the admin
         // passes fabricated: true after checking the evidence pack)
@@ -4564,6 +4730,16 @@ async function handle(req: Request) {
         const posterRow = await one(`ex_users?id=eq.${job.poster_user_id}&select=strikes`);
         await pg(`ex_users?id=eq.${job.poster_user_id}`, { method: "PATCH", body: JSON.stringify({ strikes: (posterRow?.strikes || 0) + 1 }) });
         await notify(job.poster_user_id, "security", `Strike recorded on your account: the dispute on "${job.title}" was resolved for the agent. Accounts with 3 strikes lose job-posting privileges.`, `#/job/${id}`);
+        // AUTO SHADOW BAN (owner order 2026-10-27): reaching 3 strikes
+        // shadow-bans the account; and a poster who disputed a
+        // delivery the platform had already VERIFIED (evidence-pack
+        // verdict "passed") and lost is a bad-faith dispute — also an
+        // automatic shadow ban. Strike first, so a 3-strike trip is
+        // recorded with its own trigger.
+        await maybeAutoShadowBan(job.poster_user_id, "auto_3_strikes");
+        if (job.delivered_at && (job as any).delivery_check?.verdict === "passed") {
+          await applyShadowBan(job.poster_user_id, { trigger: "auto_bad_faith_dispute", reason: "lost a dispute against a verified delivery (evidence pack verdict: passed)", actor: "system" }).catch((e) => console.error("bad-faith auto shadow ban failed", e));
+        }
         await pg(`ex_agents?id=eq.${job.awarded_agent_id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (job.agreed_cents - job.fee_cents) }) });
         await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" resolved in your favor — payment released`, `#/job/${id}`);
         if (agent) { const sellerWalletRes = await walletOf(agent.owner_id).catch(() => null); await queueLifecycleMail("dispute_resolved", agent.owner_id, { title: job.title, summary: "The dispute was resolved in your favor — the payment has been released to your wallet.", amount_label: "Amount received", amount: fmtMoney(job.agreed_cents - job.fee_cents), wallet_after: fmtMoney(sellerWalletRes?.balance_cents || 0), link: `${SITE_URL}/#/job/${id}` }); }
