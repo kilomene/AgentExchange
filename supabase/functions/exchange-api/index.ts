@@ -1330,6 +1330,52 @@ async function assertNoSharedSignupIp(posterUserId: number, otherOwnerId: number
 // an account bans its IPs with it, and the sweeper suspends replacement
 // accounts that share a banned address. A wallet balance never protects
 // a banned account - suspension locks every route.
+
+// Edge/infrastructure ranges that appear in x-forwarded-for as HOPS, never
+// as the real client: AWS Global Accelerator (fronts the Supabase gateway)
+// + Cloudflare. Generated from the providers' own published IP ranges
+// (ip-ranges.amazonaws.com GLOBALACCELERATOR + cloudflare.com/ips) on
+// 2026-10-26. Stored as [network-as-int, prefix-bits] (v6 network as hex).
+const EDGE4: Array<[number, number]> = [[28486656,23],[28511744,23],[28523520,23],[234382336,24],[234382592,24],[234382848,24],[234383104,24],[234383360,24],[234383616,24],[234384128,24],[234384384,24],[234384640,24],[234384896,24],[234385152,24],[234385408,24],[234385664,24],[234385920,24],[234386176,24],[234386432,24],[234386688,24],[234386944,24],[234387200,24],[234387456,24],[234387712,24],[234387968,24],[234388224,24],[234388480,24],[234388736,24],[234388992,24],[234389248,24],[234389504,17],[234381312,24],[234381568,24],[234381824,24],[234382080,24],[264568832,23],[264571904,22],[264601600,17],[264572928,23],[264573440,23],[264569344,24],[264573952,22],[264574976,22],[264576000,23],[264569600,24],[264576512,23],[264577024,23],[264577536,23],[264578048,22],[264569856,22],[264585216,19],[264570880,22],[2683864320,24],[2792685568,16],[3231533056,23],[401506304,17],[409862144,21],[50463744,23],[50475008,24],[50475264,24],[50475520,24],[50475776,24],[50476032,24],[50476288,24],[50476544,24],[50476800,24],[50477056,24],[50477312,24],[50477568,24],[50477824,24],[50478080,24],[50478336,24],[50464768,21],[50528256,23],[50529792,23],[50530304,21],[52527104,17],[589456384,24],[589456640,24],[589456896,24],[589457152,24],[589457408,24],[589457664,24],[589457920,24],[589455360,24],[589455616,24],[589455872,24],[589456128,24],[591888384,17],[887029760,17],[921092096,21],[1073117184,21],[1119248384,20],[1258422272,17],[1289682944,17],[1289726208,24],[1565360128,19],[1666038784,24],[1666039040,24],[1666039296,24],[1666358272,22],[1666359296,24],[1666359552,24],[1666359808,24],[1666360064,24],[1666360320,24],[1666360576,24],[1666360832,24],[1666361088,24],[1666361344,24],[1666361600,24],[1666361856,24],[1666362112,24],[1666362368,24],[1666362624,24],[1666362880,24],[1666363136,24],[1666409472,24],[1666409728,24],[1666409984,24],[1666410240,24],[1666410496,24],[1666410752,24],[1666411008,24],[1666411264,24],[1666411520,24],[1666411776,24],[1666416640,17],[1666408448,24],[1666408704,24],[1666408960,24],[1666409216,24],[2918526976,20],[1729491968,22],[1729546240,22],[1730085888,22],[2372222976,18],[1822605312,18],[3193827328,20],[3161612288,20],[3320508416,22],[3324608512,17],[2728263680,15],[1745879040,13],[1746403328,14],[2889875456,13],[2197833728,22]];
+const EDGE6: Array<[string, number]> = [["26001f01480000000000000000000000",47],["26001f01480200000000000000000000",47],["26001f01480400000000000000000000",47],["26001f01480600000000000000000000",47],["26001f01480800000000000000000000",47],["26001f01480a00000000000000000000",47],["26001f01480c00000000000000000000",47],["26001f01480e00000000000000000000",47],["26001f01481000000000000000000000",47],["26001f01481200000000000000000000",47],["26001f01481400000000000000000000",47],["26001f01481600000000000000000000",47],["26001f01481800000000000000000000",47],["26001f01481a00000000000000000000",47],["26001f01482000000000000000000000",47],["26001f01483000000000000000000000",47],["26001f01484000000000000000000000",47],["26001f01484400000000000000000000",47],["26001f01485000000000000000000000",47],["26001f01486000000000000000000000",47],["26001f01487000000000000000000000",47],["26001f01487400000000000000000000",47],["26001f01488000000000000000000000",47],["26001f01489000000000000000000000",47],["26001f0148a000000000000000000000",47],["26001f0148b000000000000000000000",47],["26001f0148c000000000000000000000",47],["26001f0148d000000000000000000000",47],["26001f0148d200000000000000000000",47],["26001f0148e000000000000000000000",47],["26001f0148e200000000000000000000",47],["26001f0148f200000000000000000000",47],["26009000a10000000000000000000000",40],["26009000a20000000000000000000000",40],["26009000a30000000000000000000000",40],["26009000a40000000000000000000000",40],["26009000a50000000000000000000000",40],["26009000a60000000000000000000000",40],["26009000a70000000000000000000000",40],["26009000a80000000000000000000000",40],["26009000a90000000000000000000000",40],["26009000aa0000000000000000000000",40],["26009000ab0000000000000000000000",40],["26009000ac0000000000000000000000",40],["26009000ad0000000000000000000000",40],["26009000ae0000000000000000000000",40],["26009000af0000000000000000000000",40],["2400cb00000000000000000000000000",32],["26064700000000000000000000000000",32],["2803f800000000000000000000000000",32],["2405b500000000000000000000000000",32],["24058100000000000000000000000000",32],["2a0698c0000000000000000000000000",29],["2c0ff248000000000000000000000000",32]];
+function ip4Int(ip: string): number {
+  const p = ip.split(".").map((x) => parseInt(x, 10));
+  if (p.length !== 4 || p.some((n) => isNaN(n) || n < 0 || n > 255)) return -1;
+  return ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3];
+}
+function ip6Hex(ip: string): string {
+  let s = ip.toLowerCase();
+  const pct = s.indexOf("%"); if (pct >= 0) s = s.slice(0, pct);
+  const halves = s.split("::");
+  if (halves.length > 2) return "";
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  if (halves.length === 1 && left.length !== 8) return "";
+  const missing = 8 - left.length - right.length;
+  if (missing < 0) return "";
+  const parts = [...left, ...Array(Math.max(missing, 0)).fill("0"), ...right];
+  if (parts.length !== 8) return "";
+  return parts.map((h) => h.padStart(4, "0")).join("");
+}
+function isEdgeIp(ip: string): boolean {
+  if (ip.includes(":")) {
+    const hex = ip6Hex(ip);
+    if (!hex) return false;
+    const v = BigInt("0x" + hex);
+    for (const [base, bits] of EDGE6) {
+      const shift = BigInt(128 - bits);
+      if ((v >> shift) === (BigInt("0x" + base) >> shift)) return true;
+    }
+    return false;
+  }
+  const v = ip4Int(ip);
+  if (v < 0) return false;
+  for (const [base, bits] of EDGE4) {
+    const div = Math.pow(2, 32 - bits);
+    if (Math.floor(v / div) === Math.floor(base / div)) return true;
+  }
+  return false;
+}
 function clientIp(req: Request): string {
   // H1 fix (2026-10-26): this function is directly reachable at its
   // supabase.co URL, where cf-connecting-ip is merely a caller-set header
@@ -1350,6 +1396,21 @@ function clientIp(req: Request): string {
     if (proxied) return proxied;
   }
   const parts = (req.headers.get("x-forwarded-for") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  // CORRECTED 2026-10-26: the LAST x-forwarded-for entry on direct
+  // supabase.co traffic is an AWS Global Accelerator address (Supabase's
+  // gateway front), NOT the client - taking it verbatim made every direct
+  // API signup evaluate an AWS IP, which the geo check flags as hosting,
+  // so real users on real connections were refused as "VPN or proxy"
+  // (the owner hit exactly this registering from his phone). Walk the
+  // chain from the right, skipping private + known edge/infrastructure
+  // hops: everything right of the real client was appended by
+  // infrastructure after the client connected, and a caller cannot forge
+  // entries there, so the first non-edge entry from the right is the true
+  // client IP and caller-supplied entries further left are never trusted.
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    if (!isPrivateIp(p) && !isEdgeIp(p)) return p;
+  }
   return parts.length ? parts[parts.length - 1] : "";
 }
 function isPrivateIp(ip: string): boolean {
