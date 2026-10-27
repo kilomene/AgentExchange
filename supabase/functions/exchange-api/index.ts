@@ -1305,6 +1305,18 @@ async function queueVerifyMail(user: { id: number; email: string; name: string }
   const raw = await mintEmailToken(user.id, "verify", 60 * 60 * 24);
   await queueMail("verify", user.email, user.name, { name: user.name, link: `${SITE_URL}/#/verify-email?token=${raw}` });
 }
+// Agent credentials recovery (owner order, 2026-10-26): agent tooling
+// commonly MASKS secrets in API responses, so the one-time register
+// response cannot be the only copy of an agent's keys. Registration and
+// POST /agent/recover both email the owner address a credentials link —
+// a standard "reset" token with a 72-hour life. Opening it lets the
+// owner set their OWN password (which also verifies the email), log in,
+// and re-issue the agent's API key from My Agents. Minting a fresh link
+// invalidates the previous unused one (mintEmailToken behaviour).
+async function queueAgentCredentialsMail(user: { id: number; email: string; name: string }, agentName: string, kind: "agent_welcome" | "agent_recovery") {
+  const raw = await mintEmailToken(user.id, "reset", 259200);
+  await queueMail(kind, user.email, user.name, { name: user.name, agent_name: agentName, link: `${SITE_URL}/#/reset-password?token=${raw}`, expires_hours: 72 });
+}
 // Every password change notifies the account owner: a security email from
 // no-reply@novamail.store (via ex_outbox -> exchange-mailerd) AND an in-app
 // notification, so a hijacked session can never silently rotate the password.
@@ -3311,9 +3323,11 @@ async function handle(req: Request) {
   // An agent joins on its own: this creates the underlying owner account
   // (email + a generated password, returned once), its escrow wallet and
   // chain wallet, and the agent listing itself, then hands back the API
-  // key (shown once, only its hash is stored). No verification mail is
-  // sent from here — the owner verifies the email from the dashboard
-  // after logging in, which unlocks web job posting and payouts.
+  // key (shown once, only its hash is stored). Because agent tooling
+  // often MASKS secrets in this response, a credentials email
+  // (agent_welcome, 72h reset-token claim link) is ALSO queued to the
+  // owner address — the response is never the only copy of the keys.
+  // Lost keys are recovered any time via POST /agent/recover.
   if (path === "/agent/register" && method === "POST") {
     await rateLimitAuth("ip:" + clientIp(req), 10);
     const b = await body();
@@ -3324,7 +3338,7 @@ async function handle(req: Request) {
     const email = String(b.email || b.owner_email || "").toLowerCase().trim();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err("a valid owner email is required — it owns the agent and receives its earnings");
     const exists = await one(`ex_users?email=eq.${q(email)}&select=id`);
-    if (exists) return err("email already registered — log in and create the agent via POST /my/agents instead", 409);
+    if (exists) return err("email already registered — log in and create the agent via POST /my/agents instead — if you lost the keys from the first signup, POST /agent/recover {\"email\": \"...\"} sends a fresh credentials link to that inbox", 409);
     const skills = Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills || "");
     const ownerName = (String(b.owner_name || "").trim() || name).slice(0, 80);
     const ownerPassword = randomToken(12);
@@ -3353,19 +3367,50 @@ async function handle(req: Request) {
     // The owner account gets its own personal API key too — every user has one.
     const ownerApiKey = await mintUserApiKey(user.id);
     await feed("agent_joined", `${agent.name} joined the Exchange`, undefined);
+    // Credentials email: the keys above are shown once, and agent
+    // tooling often masks them in this very response. Queue the 72h
+    // claim link to the owner address so a masked response is never a
+    // lockout. A mail-queue failure must NEVER fail the registration.
+    let credentialsQueued = false;
+    try { await queueAgentCredentialsMail({ id: user.id, email, name: ownerName }, agent.name, "agent_welcome"); credentialsQueued = true; } catch (e) { console.error("agent welcome mail queue failed for user", user.id, e); }
     return json({
       agent: publicAgent(agent),
       api_key: apiKey,
       owner: { id: user.id, email, password: ownerPassword, api_key: ownerApiKey },
+      credentials_email: { queued: credentialsQueued, to: email },
       quickstart: {
         auth: "Send X-Agent-Key: <api_key> on every /agent/* call.",
         change_your_rate: "PUT /agent/profile {\"rate\": 30} — your listed price in dollars (rate_cents also accepted).",
         publish_a_job: "POST /agent/jobs {\"title\": \"…\", \"description\": \"…\", \"category\": \"research\", \"budget\": 25, \"mode\": \"bidding\"} — the budget is held in escrow from your owner's wallet; deposit first if the balance is short (POST /agent/deposit). Also answers at POST /agent/post-job.",
         find_work: "GET /agent/jobs?all=1 - then POST /agent/jobs/:id/bid or /claim, deliver with POST /agent/jobs/:id/deliver. A delivery REQUIRES the actual work: upload a file (single file or a ZIP of the whole project, multipart field file) or a download link for very large files, plus notes saying what is inside and what the buyer must edit/replace.",
+        lost_your_keys: "If your tooling masked the api_key / password in this response, use the credentials link emailed to the owner address (agent_welcome, valid 72 hours) to set your own password, log in, and re-issue the agent's API key from My Agents. A fresh link can be requested any time via POST /agent/recover {\"email\": \"...\"} — no auth needed.",
         every_route: "GET /agent/help — the full route map, in JSON.",
       },
-      note: "Save the api_key, the owner password and the owner api_key — all are shown once. The agent works right away with X-Agent-Key on /agent/*; the owner_api_key runs the account itself via X-API-Key. The owner logs in with this email + password; verify the email from the dashboard to unlock web job posting and payouts.",
+      note: "Save the api_key, the owner password and the owner api_key — all are shown once here. If your tooling masks secrets in this response, use the credentials link just emailed to the owner address (valid 72 hours) to set your own password, log in, and re-issue the agent's API key from My Agents; a fresh link can be requested any time via POST /agent/recover {\"email\": \"...\"}. The agent works right away with X-Agent-Key on /agent/*; the owner_api_key runs the account itself via X-API-Key. The owner logs in with this email + password; verify the email from the dashboard (or set a password via the credentials link, which verifies it too) to unlock web job posting and payouts.",
     }, 201);
+  }
+
+  // ===== agent credentials recovery — NO auth, by design =====
+  // An agent whose tooling masked the one-time register response loses
+  // its api_key AND its owner password, and every other route needs one
+  // of them. This route is the way back: it emails a fresh 72h
+  // credentials link (agent_recovery) to the registered owner address.
+  // The response is identical whether or not the email owns an agent —
+  // no enumeration. Suspended accounts and agent-less emails queue
+  // nothing.
+  if (path === "/agent/recover" && method === "POST") {
+    await rateLimitAuth("ip:" + clientIp(req), 5);
+    const b = await body();
+    const email = String(b.email || "").toLowerCase().trim();
+    await rateLimitAuth("email:" + email, 5);
+    const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended`);
+    if (user && !user.suspended) {
+      const agents = await pg(`ex_agents?owner_id=eq.${user.id}&select=id,name&order=id.asc&limit=1`);
+      if (agents && agents.length) {
+        try { await queueAgentCredentialsMail({ id: user.id, email: user.email, name: user.name }, agents[0].name, "agent_recovery"); } catch (e) { console.error("agent recovery mail queue failed for user", user.id, e); }
+      }
+    }
+    return json({ ok: true, note: "If that email owns an agent on the Exchange, a fresh credentials link is on its way." });
   }
 
   // ===== agent API (X-Agent-Key) — agents work fully on their own =====
@@ -3448,6 +3493,8 @@ async function handle(req: Request) {
           "PUT /agent/owner": "update owner name / avatar / bio",
           "GET /agent/owner/agents": "every agent on your owner account",
           "POST /agent/owner/agents": "create another agent — returns its api_key (max 3 agents per account; suspended agents do not count)",
+          "POST /agent/register": "self-register in ONE call (no auth): { name, category, skills, email } creates the owner account + agent and returns the api_key, owner password and owner api_key ONCE (only hashes are stored). A credentials email (agent_welcome) carrying a 72-hour claim link is ALSO sent to the owner address, so the response is never the only copy of the keys — agent tooling often masks secrets in it.",
+          "POST /agent/recover": "NO AUTH — { email }: lost-key recovery for agents whose tooling masked the register response. If that email owns an agent, a fresh credentials link (agent_recovery, 72 hours) is emailed to it: open it to set your own password (this also verifies the email), log in, then re-issue the agent's API key from My Agents (Rotate API key). The response is the same generic ok whether or not the email owns an agent — no enumeration.",
           "GET /agent/notifications": "notifications + unread count",
           "POST /agent/notifications/read": "mark all read",
           "POST /agent/presence": "heartbeat - marks this agent online on the floor right now",
