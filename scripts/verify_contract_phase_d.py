@@ -301,11 +301,15 @@ def main():
     assert not PAUSE.exists(), "PAUSE already present - a verification window is open elsewhere"
     base = snapshot()
     print("BASELINE:", json.dumps(base))
-    check("baseline matches the recorded platform state",
-          base["outbox_max"] == 231 and base["outbox_count"] == 200 and base["founder"] == (262000, 237900)
-          and base["user4"] == (200, 3290) and base["users"] == 8 and base["agents"] == 4 and base["jobs"] == 34
-          and base["stats"] == {"users": 8, "agents": 4, "open_jobs": 31, "jobs_completed": 2,
-                                "volume_cents": 5600, "guarantee_pool_cents": 0, "fee_pct": 10},
+    # The stable fields must match the recorded platform state. Founder
+    # wallet / job counts are snapshot-relative: a genuine founder job
+    # (id 236, posted by user 1 during the first Phase D window) moved
+    # them legitimately - the cleanup check below still demands the
+    # end state equal THIS start state byte-for-byte.
+    check("baseline stable fields match the recorded platform state",
+          base["outbox_max"] == 231 and base["outbox_count"] == 200
+          and base["user4"] == (200, 3290) and base["users"] == 8 and base["agents"] == 4
+          and base["stats"]["fee_pct"] == 10 and base["stats"]["guarantee_pool_cents"] == 0,
           json.dumps(base["stats"]))
     PAUSE.parent.mkdir(parents=True, exist_ok=True)
     PAUSE.write_text("verify_contract_phase_d window\n")
@@ -392,8 +396,17 @@ def run(base):
           cother.get("recipient_email") is None and not cother.get("email_subject"))
     r = api(f"/jobs/{jid_m}", PERSONAL_KEYS[poster_m], method="GET")
     cposter = (r.get("job") or {}).get("contract") or {}
-    check("masking: the poster sees recipient + subject",
-          cposter.get("recipient_email") == RECIP and cposter.get("email_subject") == SUBJ)
+    check("brief privacy (owner ruling): even the POSTER's detail view is sealed on an open job",
+          cposter.get("recipient_email") is None and not cposter.get("email_subject")
+          and not cposter.get("email_instructions") and cposter.get("contact_visible") is False,
+          json.dumps(cposter)[:200])
+    admin_key = (ROOT / ".admin-api-key").read_text().strip()
+    r = api(f"/jobs/{jid_m}", admin_key, method="GET")
+    cadmin = (r.get("job") or {}).get("contract") or {}
+    check("brief privacy (owner ruling): the ADMIN detail view is sealed on an open job too",
+          cadmin.get("recipient_email") is None and not cadmin.get("email_subject")
+          and not cadmin.get("email_instructions") and cadmin.get("contact_visible") is False,
+          json.dumps(cadmin)[:200])
     # human bid despite a seeded verified email row
     rest("ex_agent_capabilities", "POST", {
         "agent_id": human, "capability": "email_send", "status": "verified",
@@ -421,6 +434,33 @@ def run(base):
     check("separation: Email-Verified-only agent refused on the call contract (Call Test named)",
           "Call Test" in json.dumps(r), json.dumps(r)[:220])
 
+    # ---------- 4b. Brief privacy (owner ruling): sealed for ALL until award, then winner-only
+    for label, key in (("anonymous", None), ("poster", PERSONAL_KEYS[poster_c]), ("admin", admin_key)):
+        r = api(f"/jobs/{jid_c}", key, method="GET") if key else api(f"/jobs/{jid_c}", method="GET")
+        cv = (r.get("job") or {}).get("contract") or {}
+        check(f"brief privacy: {label} view of the OPEN call job has no phone and no questions",
+              cv.get("contact_phone") is None and (cv.get("questions") or []) == [] and cv.get("contact_visible") is False,
+              json.dumps(cv)[:200])
+    r = api(f"/agent/jobs/{jid_c}/bid", AGENT_KEYS[agent_c], {"amount": 18, "eta_hours": 2, "pitch": "Call verified and ready."})
+    bid_c = r.get("id")
+    r = api(f"/jobs/{jid_c}/award", PERSONAL_KEYS[poster_c], {"bid_id": bid_c})
+    check("brief privacy: call job award lands for the reveal checks",
+          (r.get("job") or {}).get("status") == "awarded", json.dumps(r)[:160])
+    r = api(f"/agent/jobs/{jid_c}", AGENT_KEYS[agent_c], method="GET")
+    cv = (r.get("job") or {}).get("contract") or {}
+    check("brief privacy: the AWARDED agent sees the phone + the questions",
+          cv.get("contact_phone") == "+15559870202" and len(cv.get("questions") or []) == 2
+          and cv.get("contact_visible") is True, json.dumps(cv)[:240])
+    r = api(f"/jobs/{jid_c}", PERSONAL_KEYS[owner_c], method="GET")
+    cv = (r.get("job") or {}).get("contract") or {}
+    check("brief privacy: the awarded agent's OWNER sees the brief on the web detail",
+          cv.get("contact_phone") == "+15559870202" and len(cv.get("questions") or []) == 2, json.dumps(cv)[:200])
+    for label, key in (("poster", PERSONAL_KEYS[poster_c]), ("admin", admin_key)):
+        r = api(f"/jobs/{jid_c}", key, method="GET")
+        cv = (r.get("job") or {}).get("contract") or {}
+        check(f"brief privacy: the {label} STAYS sealed even after award",
+              cv.get("contact_phone") is None and (cv.get("questions") or []) == [] and cv.get("contact_visible") is False)
+
     # ---------- 5. Single email contract end-to-end
     r = api(f"/agent/jobs/{jid_m}/bid", AGENT_KEYS[agent_e], {"amount": 20, "eta_hours": 2, "pitch": "Email verified and ready."})
     bid_m = r.get("id")
@@ -432,6 +472,10 @@ def run(base):
     check("email e2e: winner sees recipient + subject + instructions after award",
           cwin.get("recipient_email") == RECIP and cwin.get("email_subject") == SUBJ
           and "written quote" in (cwin.get("email_instructions") or ""), json.dumps(cwin)[:240])
+    r = api(f"/jobs/{jid_m}", PERSONAL_KEYS[owner_e], method="GET")
+    cwin2 = (r.get("job") or {}).get("contract") or {}
+    check("brief privacy: the awarded owner's WEB detail reveals recipient + subject",
+          cwin2.get("recipient_email") == RECIP and cwin2.get("email_subject") == SUBJ, json.dumps(cwin2)[:200])
     r = api(f"/agent/jobs/{jid_m}/contract/attempts", AGENT_KEYS[agent_e], {})
     att_m = (r.get("attempt") or {}).get("id")
     r = api(f"/agent/jobs/{jid_m}/contract/attempts/{att_m}/close", AGENT_KEYS[agent_e],
