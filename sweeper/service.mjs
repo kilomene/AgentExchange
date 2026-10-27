@@ -20,7 +20,16 @@
 //     exactly like a completion - escrow releases to the worker (only
 //     the unreleased remainder on milestone jobs), stats and the
 //     guarantee pool are credited, both sides are notified + emailed.
-//     At 7 days the poster first gets ONE in-app reminder.
+//     At 7 days the poster first gets ONE in-app reminder. CONTRACT
+//     jobs settle by their PAY RULE here (outcome / per-entry /
+//     per-minute math mirroring the backend's completeContractJob) -
+//     never the full agreed price.
+//  6. SCHEDULED CONTRACTS (Phase D): exempt from the +24h window
+//     refund and from deadline refunds - they run on the schedule
+//     clock. At schedule_end + 48h with the job still awarded, the
+//     run auto-settles: proved entries pay their outcome share of the
+//     agreed price, everything else refunds (full refund + cancelled
+//     when nothing was earned).
 // Zero dependencies; talks to PostgREST with the service key via curl
 // (which honors the host's egress proxy, like every other host service).
 import { execFile } from "node:child_process";
@@ -114,7 +123,17 @@ async function fundPool(feeCents) {
 async function deadlineRefunds() {
   const t = nowSec();
   const jobs = await get(`ex_jobs?status=eq.awarded&work_deadline=lt.${t}&work_deadline=not.is.null&select=*&limit=50`);
+  // SCHEDULED CONTRACTS (Phase D) are exempt: their work deadline is
+  // the bid's ETA, not the run's clock - the schedule-expiry duty
+  // settles them at schedule_end + 48h instead.
+  const contractIds = (jobs || []).filter((j) => j.job_kind === "contract").map((j) => j.id);
+  const scheduledIds = new Set();
+  if (contractIds.length) {
+    const cjs = await get(`ex_contract_jobs?job_id=in.(${contractIds.join(",")})&task_count=not.is.null&select=job_id`).catch(() => []);
+    for (const c of cjs || []) scheduledIds.add(c.job_id);
+  }
   for (const job of jobs || []) {
+   if (scheduledIds.has(job.id)) continue;
    try {
     const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { status: "cancelled", updated_at: t }, "return=representation");
     if (!claimed || !claimed.length) continue; // someone else handled it
@@ -222,6 +241,80 @@ async function posterReminder(job, t) {
   console.log(`reminder: job ${job.id} poster reminded (delivered 7+ days ago, still unapproved)`);
 }
 
+async function feePctSetting() {
+  const row = (await get("ex_settings?key=eq.fee_pct&select=value").catch(() => []))[0];
+  const v = parseInt(row?.value || "10", 10);
+  return Number.isFinite(v) ? v : 10;
+}
+
+// CONTRACT SETTLEMENT (Phase D): mirrors the backend's
+// completeContractJob money math exactly - outcome mode pays
+// pay_rule[outcome]% of the agreed price; SCHEDULED contracts split
+// the price into per-entry shares (equal, last entry absorbs the
+// rounding remainder) and pay each entry's outcome percentage of its
+// share; per-minute mode pays the answered minutes on the attempt log.
+// The fee is taken on the amount actually paid (the stored fee_cents
+// on a full-price settlement), the remainder refunds, the guarantee
+// pool is funded and the exact settlement lands in pay_breakdown.
+// The CALLER owns the job's status claim flip; this moves the money.
+async function settleContractJob(job, cj, t, origin) {
+  const agent = (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=id,name,owner_id`))[0];
+  if (!agent) throw new Error("awarded agent not found");
+  const workerOwner = agent.owner_id;
+  const rule = cj.pay_rule || {};
+  const agreed = Number(job.agreed_cents || 0);
+  const feePct = await feePctSetting();
+  const scheduled = cj.task_count !== null && cj.task_count !== undefined;
+  let due = 0, fee = 0, breakdown;
+  if (rule.mode === "per_minute") {
+    const attempts = await get(`ex_contract_attempts?job_id=eq.${job.id}&select=*&order=started_at.asc`);
+    const counted = [];
+    let billableSeconds = 0;
+    for (const a of attempts || []) {
+      if (!a.ended_at) continue;
+      if (a.outcome !== "answered_completed" && a.outcome !== "answered_partial") continue;
+      const elapsed = Number(a.ended_at) - Number(a.started_at);
+      const secs = Math.max(0, Math.min(Number(a.duration_sec || 0), elapsed + 30));
+      counted.push({ id: Number(a.id), outcome: a.outcome, seconds_counted: secs });
+      billableSeconds += secs;
+    }
+    const billableMinutes = Math.ceil(billableSeconds / 60);
+    const paidMinutes = Math.min(billableMinutes, Number(rule.max_paid_minutes || 0));
+    due = Math.min(paidMinutes * Number(rule.rate_cents_per_min || 0), agreed);
+    fee = due <= 0 ? 0 : (due >= agreed && agreed > 0 ? Number(job.fee_cents || 0) : Math.round((due * feePct) / 100));
+    breakdown = { mode: "per_minute", attempts: counted, billable_seconds: billableSeconds, billable_minutes: billableMinutes, paid_minutes: paidMinutes, rate_cents_per_min: Number(rule.rate_cents_per_min || 0), max_paid_minutes: Number(rule.max_paid_minutes || 0), worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due, auto_settled: origin, ...(scheduled ? { scheduled: true, task_count: Number(cj.task_count) } : {}) };
+  } else if (scheduled) {
+    const tasks = await get(`ex_contract_tasks?job_id=eq.${job.id}&select=*&order=entry_index.asc`);
+    const n = (tasks || []).length;
+    let assigned = 0;
+    const entries = (tasks || []).map((x, i) => {
+      const share = i === n - 1 ? agreed - assigned : Math.round(agreed / n);
+      assigned += share;
+      const epct = Math.max(0, Math.min(100, Number(rule[String(x.outcome || "")] ?? 0)));
+      const edue = Math.round((share * epct) / 100);
+      return { entry_index: Number(x.entry_index), status: x.status, outcome: x.outcome || "", share_cents: share, pct: epct, due_cents: edue };
+    });
+    due = entries.reduce((a, e) => a + e.due_cents, 0);
+    fee = due <= 0 ? 0 : (due >= agreed && agreed > 0 ? Number(job.fee_cents || 0) : Math.round((due * feePct) / 100));
+    breakdown = { mode: "outcome", scheduled: true, auto_settled: origin, task_count: n, entries, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due };
+    for (const x of tasks || []) {
+      if (x.status !== "proved" && x.status !== "failed") await patch(`ex_contract_tasks?id=eq.${x.id}`, { status: "failed", resolved_at: t, updated_at: t }).catch(() => {});
+    }
+  } else {
+    const outcome = cj.final_outcome || "";
+    const pct = Math.max(0, Math.min(100, Number(rule[outcome] ?? 0)));
+    due = Math.round((agreed * pct) / 100);
+    fee = due <= 0 ? 0 : (pct === 100 ? Number(job.fee_cents || 0) : Math.round((due * feePct) / 100));
+    breakdown = { mode: "outcome", outcome, pct, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due, auto_settled: origin };
+  }
+  if (due > 0) await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: workerOwner, p_price: due, p_fee: fee, p_ref: `job:${job.id}`, p_now: t });
+  const refund = agreed - due;
+  if (refund > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refund, p_ref: `job:${job.id}`, p_note: `Contract auto-settlement (${origin}): ${due} of the ${agreed} held was earned under the pay rule - the remainder returns to the poster`, p_now: t });
+  await patch(`ex_contract_jobs?job_id=eq.${job.id}`, { pay_breakdown: breakdown });
+  await fundPool(fee).catch((e) => console.error(`contract settle: pool fund failed for job ${job.id}:`, e.message));
+  return { due, fee, breakdown, agent, workerOwner };
+}
+
 // AUTO-RELEASE (14 days): settle one delivered job exactly like a
 // completion. The status flip delivered -> completed is the claim; any
 // money failure after it reverts the flip so the next cycle retries
@@ -236,6 +329,33 @@ async function autoReleaseJob(job, t) {
   const isMs = !!(milestones && milestones.length);
   const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { status: "completed", updated_at: t }, "return=representation");
   if (!claimed || !claimed.length) return; // someone else handled it
+  // CONTRACT JOBS settle by their PAY RULE (Phase D) - outcome,
+  // per-entry or per-minute math - never the flat full-price release
+  // the standard path below performs.
+  if (job.job_kind === "contract") {
+    const cj = (await get(`ex_contract_jobs?job_id=eq.${job.id}&select=*`))[0];
+    if (cj) {
+      try {
+        const s = await settleContractJob(job, cj, t, "delivered_auto_release");
+        const freshAgent = (await get(`ex_agents?id=eq.${agent.id}&select=jobs_completed,earnings_cents`))[0];
+        if (freshAgent) await patch(`ex_agents?id=eq.${agent.id}`, { jobs_completed: (freshAgent.jobs_completed || 0) + 1, earnings_cents: (freshAgent.earnings_cents || 0) + (s.due - s.fee) });
+        const net = s.due - s.fee;
+        const sellerWallet = await walletOf(workerOwner).catch(() => null);
+        const posterWallet = await walletOf(job.poster_user_id).catch(() => null);
+        await notify(job.poster_user_id, "payment", `"${job.title}" auto-completed - the delivery sat unapproved for 14 days, so the contract settled by its pay rule: ${money(s.due)} was due, ${money(net)} paid to the worker after the fee, ${money((job.agreed_cents || 0) - s.due)} refunded to you`, `#/job/${job.id}`);
+        await notify(workerOwner, "payment", `"${job.title}" auto-completed after the 14-day window - the contract settled by its pay rule and ${money(net)} landed in your wallet`, `#/job/${job.id}`);
+        const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
+        const owner = (await get(`ex_users?id=eq.${workerOwner}&select=id,email,name`))[0];
+        if (owner && s.due > 0) await queueMail("payment_received", owner, { name: owner.name || "", title: job.title, amount: money(net), wallet_before: money((sellerWallet?.balance_cents || 0) - net), wallet_after: money(sellerWallet?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("auto-release worker mail failed", e.message));
+        if (poster) await queueMail("payment_sent", poster, { name: poster.name || "", title: job.title, agent_name: agent.name || "The worker", amount: money(s.due), wallet_balance: money(posterWallet?.balance_cents || 0), escrow_held: money(posterWallet?.held_cents || 0), wallet_total: money((posterWallet?.balance_cents || 0) + (posterWallet?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("auto-release poster mail failed", e.message));
+        console.log(`auto-release: contract job ${job.id} settled by pay rule after 14 days unapproved, ${money(net)} released to worker owner ${workerOwner}`);
+      } catch (e) {
+        await patch(`ex_jobs?id=eq.${job.id}`, { status: "delivered", updated_at: t }).catch(() => {});
+        console.error(`auto-release FAILED for contract job ${job.id} (status reverted to delivered, will retry):`, e.message);
+      }
+      return;
+    }
+  }
   try {
     if (!isMs) {
       await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: workerOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
@@ -327,7 +447,8 @@ async function contractWindowOpening() {
       if (!claimed || !claimed.length) continue;
       const agent = (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id,webhook_url`))[0];
       if (agent) {
-        await notify(agent.owner_id, "award", `Call window opening soon: "${job.title}" - the call window opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz}). Open an attempt inside the window before dialling.`, `#/job/${job.id}`);
+        const capWord = cj.capability === "email_send" ? "Send" : "Call";
+        await notify(agent.owner_id, "award", `${capWord} window opening soon: "${job.title}" - the window opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz}). Open an attempt inside the window before ${cj.capability === "email_send" ? "sending" : "dialling"}.`, `#/job/${job.id}`);
         if (agent.webhook_url) {
           try {
             await fetch(agent.webhook_url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "contract_attempt_window_opening", job_id: job.id, title: job.title, window_start: cj.window_start, window_end: cj.window_end, window_tz: cj.window_tz }), signal: AbortSignal.timeout(5000) });
@@ -343,9 +464,13 @@ async function contractWindowOpening() {
 
 async function contractWindowRefunds() {
   const t = nowSec();
-  const rows = await get(`ex_contract_jobs?window_end=lt.${t - 24 * 3600}&select=job_id&limit=50`).catch(() => []);
+  const rows = await get(`ex_contract_jobs?window_end=lt.${t - 24 * 3600}&select=job_id,task_count&limit=50`).catch(() => []);
   for (const cj of rows || []) {
     try {
+      // SCHEDULED CONTRACTS (Phase D) are EXEMPT from the +24h refund:
+      // they run on the schedule clock and settle per entry via
+      // contractScheduleExpiry at schedule_end + 48h.
+      if (cj.task_count !== null && cj.task_count !== undefined) continue;
       const job = (await get(`ex_jobs?id=eq.${cj.job_id}&status=eq.awarded&select=*`))[0];
       if (!job) continue;
       const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { status: "cancelled", updated_at: t }, "return=representation");
@@ -375,11 +500,71 @@ async function contractWindowRefunds() {
   }
 }
 
+// SCHEDULED CONTRACT EXPIRY (Phase D): a scheduled contract still
+// 'awarded' 48 hours after its schedule window ended auto-settles -
+// proved entries pay their outcome share of the agreed price through
+// the same settlement path as a completion, unproved entries resolve
+// as failed and their shares refund. The claim flip (awarded ->
+// completed) comes first; a money failure reverts it for the next
+// cycle. When nothing was earned the job ends CANCELLED instead (the
+// settlement already refunded the full escrow).
+async function contractScheduleExpiry() {
+  const t = nowSec();
+  const rows = await get(`ex_contract_jobs?task_count=not.is.null&window_end=lt.${t - 48 * 3600}&select=*&limit=50`).catch(() => []);
+  for (const cj of rows || []) {
+    try {
+      const job = (await get(`ex_jobs?id=eq.${cj.job_id}&status=eq.awarded&select=*`))[0];
+      if (!job) continue;
+      const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { status: "completed", updated_at: t }, "return=representation");
+      if (!claimed || !claimed.length) continue;
+      let s;
+      try {
+        s = await settleContractJob(job, cj, t, "schedule_expired");
+      } catch (e) {
+        await patch(`ex_jobs?id=eq.${job.id}`, { status: "awarded", updated_at: t }).catch(() => {});
+        console.error(`schedule-expiry settle FAILED for job ${job.id} (status reverted, will retry):`, e.message);
+        continue;
+      }
+      const { due, fee, agent, workerOwner } = s;
+      const net = due - fee;
+      if (due <= 0) {
+        await patch(`ex_jobs?id=eq.${job.id}&status=eq.completed`, { status: "cancelled", updated_at: t }).catch(() => {});
+      } else {
+        const freshAgent = (await get(`ex_agents?id=eq.${agent.id}&select=jobs_completed,earnings_cents`))[0];
+        if (freshAgent) await patch(`ex_agents?id=eq.${agent.id}`, { jobs_completed: (freshAgent.jobs_completed || 0) + 1, earnings_cents: (freshAgent.earnings_cents || 0) + net });
+      }
+      await notify(job.poster_user_id, "payment", due > 0
+        ? `"${job.title}" settled automatically - the schedule window ended 48 hours ago. Proved entries earned ${money(due)} under the pay rule; ${money((job.agreed_cents || 0) - due)} of the escrow refunded to your wallet`
+        : `"${job.title}" was cancelled automatically - the schedule window ended 48 hours ago with no proved entries, and your escrow (${money(job.agreed_cents)}) was refunded in full`, `#/job/${job.id}`);
+      const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
+      if (agent) {
+        await notify(workerOwner, "payment", due > 0
+          ? `"${job.title}" settled automatically after the schedule window - proved entries earned ${money(net)} for ${agent.name}, now in your wallet`
+          : `"${job.title}" was cancelled automatically - the schedule window ended with no proved entries, and the escrow refunded to the poster`, `#/job/${job.id}`);
+        const owner = (await get(`ex_users?id=eq.${workerOwner}&select=id,email,name`))[0];
+        if (due > 0) {
+          const sellerWallet = await walletOf(workerOwner).catch(() => null);
+          const posterWallet = await walletOf(job.poster_user_id).catch(() => null);
+          if (owner) await queueMail("payment_received", owner, { name: owner.name || "", title: job.title, amount: money(net), wallet_before: money((sellerWallet?.balance_cents || 0) - net), wallet_after: money(sellerWallet?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("schedule-expiry worker mail failed", e.message));
+          if (poster) await queueMail("payment_sent", poster, { name: poster.name || "", title: job.title, agent_name: agent.name || "The worker", amount: money(due), wallet_balance: money(posterWallet?.balance_cents || 0), escrow_held: money(posterWallet?.held_cents || 0), wallet_total: money((posterWallet?.balance_cents || 0) + (posterWallet?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("schedule-expiry poster mail failed", e.message));
+        } else {
+          if (poster) await queueMail("job_cancelled", poster, { name: poster.name || "", title: job.title, link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("schedule-expiry poster mail failed", e.message));
+          if (owner) await queueMail("job_cancelled", owner, { name: owner.name || "", title: job.title, link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("schedule-expiry worker mail failed", e.message));
+        }
+      }
+      console.log(`contract: scheduled job ${job.id} auto-settled (schedule_end + 48h), due ${money(due)}, refunded ${money((job.agreed_cents || 0) - due)}`);
+    } catch (e) {
+      console.error(`contractScheduleExpiry: job ${cj.job_id} failed:`, e.message);
+    }
+  }
+}
+
 async function cycle() {
   try { await deadlineRefunds(); } catch (e) { console.error("deadlineRefunds:", e.message); }
   try { await deliveredAutoRelease(); } catch (e) { console.error("deliveredAutoRelease:", e.message); }
   try { await contractWindowOpening(); } catch (e) { console.error("contractWindowOpening:", e.message); }
   try { await contractWindowRefunds(); } catch (e) { console.error("contractWindowRefunds:", e.message); }
+  try { await contractScheduleExpiry(); } catch (e) { console.error("contractScheduleExpiry:", e.message); }
   try { await deadListings(); } catch (e) { console.error("deadListings:", e.message); }
   try { await altScan(); } catch (e) { console.error("altScan:", e.message); }
   try { await del(`ex_rate_counters?window_start=lt.${nowSec() - 86400}`); } catch { /* housekeeping only */ }
