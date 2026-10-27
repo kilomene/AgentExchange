@@ -456,12 +456,22 @@ function publicJobView(j: any, canSeeDelivery: boolean) {
 // live capabilities are phone_call and email_send. The agent places real
 // calls / sends real emails itself, with its own stack; the platform
 // NEVER places, routes or proxies calls and NEVER sends contract email
-// - it has no telephony and no contract mailer of its own. The "Call
-// Test" / "Email Test" below are therefore PLATFORM-ISSUED CHALLENGES
-// (a rotating phrase/token + two set questions) that the agent answers
-// by submitting a proof pack, auto-graded server-side - exactly the
-// trials pattern. They are honestly labelled challenges everywhere; no
-// platform phone line or sending service is claimed to exist. Payment
+// - it operates no telephony and no contract mailer of its own. The
+// "Email Test" below is therefore a PLATFORM-ISSUED CHALLENGE (a
+// rotating token + two set questions) that the agent answers by
+// submitting a proof pack, auto-graded server-side - exactly the
+// trials pattern. THE CALL TEST IS A RING TEST (owner orders,
+// 2026-10-26): the agent dials the designated Nova test number
+// +1 (956) 553-7205 (CALL_TEST_NUMBER below) from its attested
+// number; if the number rings, the agent hangs up by itself and
+// submits a call report (dialed / from / outcome / rang_at /
+// duration), graded automatically (dialed == test number, caller ==
+// attested, outcome == rang). The platform does NOT operate
+// telephony on that number: it does not answer or auto-record calls
+// placed to it, and it cannot hear the ring - grading is on the
+// submitted call report, tied to the started test and the attested
+// number. No sending service is claimed to exist for the Email
+// Test. Payment
 // for a contract job follows the job's pay rule: mode "outcome" pays
 // pay_rule[outcome] percent of the agreed price (per schedule entry on
 // scheduled contracts); mode "per_minute" (Phase C, calls only) pays
@@ -487,6 +497,13 @@ const fullPayOutcomeFor = (slug: string) => slug === "email_send" ? "sent_comple
 const testNameFor = (slug: string) => slug === "email_send" ? "Email Test" : "Call Test";
 const verifiedLabelFor = (slug: string) => slug === "email_send" ? "Email Verified" : "Call Verified";
 const CONTRACT_PASS_SCORE = 70;
+// NOVA CALL TEST NUMBER (owner order, 2026-10-26): the single source of
+// truth for the Call Test destination. An agent taking the Call Test
+// must call THIS number from its attested number. The platform does not
+// operate telephony on it (no answering, no auto-recording) - grading
+// is from the submitted proof pack only.
+const CALL_TEST_NUMBER = "+19565537205";
+const CALL_TEST_NUMBER_DISPLAY = "+1 (956) 553-7205";
 const CONTRACT_CAPABILITY_TTL = 90 * 86400;
 const CONTRACT_MATCH_WINDOW_SEC = 15 * 60; // Phase C priority window
 const CONTRACT_MATCH_TOP_N = 5;
@@ -786,7 +803,7 @@ async function assertContractGate(agent: any, job: any) {
   if (!row || row.status !== "verified" || !row.expires_at || Number(row.expires_at) <= now()) {
     const attestHint = slug === "email_send" ? "attest your sending email address" : "attest your caller number";
     const sealedHint = slug === "email_send" ? "Unproven agents cannot bid on contract jobs, and never see the recipient." : "Unproven agents cannot bid on contract jobs, and never see the contact number.";
-    throw Object.assign(new Error(`contract gate: this job needs a verified ${slug} capability - pass the ${testNameFor(slug)} first (${attestHint}, take the platform-issued challenge, submit the proof pack: GET /agent/capabilities). ${sealedHint}`), { status: 400 });
+    throw Object.assign(new Error(`contract gate: this job needs a verified ${slug} capability - pass the ${testNameFor(slug)} first (${attestHint}, take the platform-issued challenge, submit the test result: GET /agent/capabilities). ${sealedHint}`), { status: 400 });
   }
   // SEALED SCHEDULE FILE: a scheduled contract cannot be worked until
   // the poster has attached its schedule file - the entries live in
@@ -876,10 +893,6 @@ function challengePhrase(): string {
   const pick = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
   return `${pick(CHALLENGE_WORDS_A)} ${pick(CHALLENGE_WORDS_B)} ${pick(CHALLENGE_WORDS_C)}`;
 }
-const CALL_TEST_QUESTIONS = [
-  "State your agent name exactly as it is listed on the Exchange.",
-  "In one sentence, what is a contract call job on the Exchange?",
-];
 const EMAIL_TEST_QUESTIONS = [
   "State your agent name exactly as it is listed on the Exchange.",
   "In one sentence, what is a contract email job on the Exchange?",
@@ -910,12 +923,22 @@ async function startCallTest(agent: any, slug: string) {
   }
   if (!row?.attested_phone) throw Object.assign(new Error("attest your caller number first - proofs are only accepted from the number you register"), { status: 400 });
   await pg(`ex_capability_tests?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&status=eq.started`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) });
-  const phrase = challengePhrase();
-  const rows = await pg("ex_capability_tests", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, phrase, questions: CALL_TEST_QUESTIONS, status: "started", created_at: t, expires_at: t + 3600 }) });
+  // THE CALL TEST IS A RING TEST (owner clarification, 2026-10-26
+  // 18:41 PDT): the agent dials the Nova test number from its attested
+  // number; if the number RINGS, the agent hangs up by itself - no
+  // answer is waited for, no conversation is held, nothing is spoken.
+  // The ring itself is the proof of reachability + a working calling
+  // stack. The agent then submits a call report and grading checks the
+  // report (dialed == test number, caller == attested, outcome ==
+  // rang). The phrase column carries an internal ring-test reference
+  // only - it is never spoken and never graded.
+  const phrase = `ring-test-${100000 + Math.floor(Math.random() * 900000)}`;
+  const rows = await pg("ex_capability_tests", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, phrase, questions: [], status: "started", created_at: t, expires_at: t + 3600 }) });
   return {
     test_id: rows[0].id, capability: slug, attested_phone: row.attested_phone,
-    challenge_phrase: phrase, questions: CALL_TEST_QUESTIONS, expires_at: t + 3600, pass_score: CONTRACT_PASS_SCORE,
-    instructions: "This is a platform-issued challenge - the Exchange has no phone line of its own and never claims to. Using YOUR OWN calling stack, place a real test call from your attested number (to any number you control), open with the AI-assistant + recording disclosure, say the challenge phrase out loud, and answer both questions on the call. Then submit the proof pack here: the recording file, the full transcript (it must contain the challenge phrase and the disclosure line), and your two answers. Grading is automatic: phrase 35, disclosure 25, answers 20, real audio 20 - pass at 70.",
+    test_number: CALL_TEST_NUMBER, call_test_number: CALL_TEST_NUMBER, test_number_display: CALL_TEST_NUMBER_DISPLAY,
+    test_type: "ring", expires_at: t + 3600, pass_score: CONTRACT_PASS_SCORE,
+    instructions: `This is the Call Test - a RING TEST. Using YOUR OWN calling stack, dial the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}) FROM your attested number. If the number RINGS, hang up (cut the call) by yourself - do NOT wait for an answer and do NOT hold a conversation; the ring itself proves the number is reachable and that your stack can place a real call. Then submit the call report for this test (POST /agent/capabilities/tests/:testId/submit, JSON): { dialed_number: "${CALL_TEST_NUMBER}", from_number: your attested number, outcome: "rang", rang_at: the ring timestamp (epoch seconds), duration_sec: how long it rang before you cut }. Grading is automatic and simple: pass requires dialed_number == the Nova test number, from_number == your attested number, and outcome == "rang". The platform does not operate telephony and cannot hear the ring itself - grading is on your submitted call report, tied to this test and your attested number. Pass and you are Call Verified for 90 days: you may then BID on call contracts, WAIT for the job poster's approval (the award), and only after award place the real call to the job's contact and deliver the job's proof pack (recording + transcript + answers).`,
   };
 }
 async function submitCallTest(agent: any, testId: number, input: DeliveryInput) {
@@ -931,33 +954,45 @@ async function submitCallTest(agent: any, testId: number, input: DeliveryInput) 
   if (test.capability === "email_send") return await submitEmailTest(agent, test, input);
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(test.capability)}&select=*`);
   if (!row?.attested_phone) throw Object.assign(new Error("no attested caller number on file for this agent"), { status: 400 });
-  const transcript = String(input.fields.transcript || "").trim();
-  if (transcript.length < 20) throw Object.assign(new Error("the proof pack needs the full call transcript (field: transcript)"), { status: 400 });
-  let answers: any[] = [];
-  const answersRaw = String(input.fields.answers || "").trim();
-  if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list of strings, one per test question"), { status: 400 }); } }
-  if (!Array.isArray(answers)) throw Object.assign(new Error("answers must be a JSON list of strings, one per test question"), { status: 400 });
-  if (!input.file) throw Object.assign(new Error("the proof pack needs the call recording (multipart field: file) - a real audio file from the test call"), { status: 400 });
-  if (!isAudioFile(input.file)) throw Object.assign(new Error("the proof recording must be an audio file (mp3, wav, ogg, webm, m4a, opus or flac)"), { status: 400 });
-  const stored = await storeDeliveryFile(0, input.file, `contract/tests/agent-${agent.id}`);
-  const lower = transcript.toLowerCase();
-  const audioCheck = (stored.check?.checks || []).find((x: any) => x.name === "audio signature");
+  // THE RING-TEST CALL REPORT (owner clarification, 2026-10-26 18:41
+  // PDT): the Call Test submission is a call report, NOT a proof pack -
+  // no recording, no transcript, no phrase, no answers. Fields (JSON or
+  // form): dialed_number, from_number, outcome, rang_at, duration_sec.
+  // Anti-abuse: the report is bound to THIS started test row and to the
+  // attested number on file - a report naming any other destination or
+  // any other caller fails, as does any outcome other than "rang".
+  // HONESTY: the platform cannot hear the ring; grading is on the
+  // submitted report, exactly as the copy states.
+  const f = input.fields || {};
+  const dialedRaw = String(f.dialed_number || f.dialed || f.to_number || "").trim();
+  const fromRaw = String(f.from_number || f.from || f.caller_number || "").trim();
+  const outcome = String(f.outcome || "").trim().toLowerCase();
+  if (!dialedRaw || !fromRaw || !outcome) throw Object.assign(new Error("the Call Test submission is a call report: { dialed_number, from_number, outcome, rang_at, duration_sec } - no recording or transcript is needed for the test"), { status: 400 });
+  const digitsOf = (x: string) => String(x || "").replace(/\D/g, "");
+  const dialedDigits = digitsOf(dialedRaw);
+  const dialedOk = dialedDigits === digitsOf(CALL_TEST_NUMBER) || dialedDigits === digitsOf(CALL_TEST_NUMBER).slice(1);
+  const fromOk = digitsOf(fromRaw) === digitsOf(row.attested_phone) || digitsOf(fromRaw) === digitsOf(row.attested_phone).replace(/^1/, "");
+  const rangOk = outcome === "rang" || outcome === "ringing" || outcome === "ring_detected";
+  let rangAt = Number(f.rang_at || f.rangAt || f.timestamp || 0);
+  if (!Number.isFinite(rangAt) || rangAt <= 0) { const parsed = Date.parse(String(f.rang_at || "")); rangAt = Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 0; }
+  const durationSec = Math.max(0, Math.min(3600, Number(f.duration_sec || f.duration || 0) || 0));
+  const callReport = { dialed_number: dialedRaw, from_number: fromRaw, outcome, rang_at: rangAt || null, duration_sec: durationSec, test_id: test.id, attested_phone: row.attested_phone, submitted_via: "call_report" };
   const report: { label: string; ok: boolean; points: number; earned: number }[] = [];
   const grade = (label: string, ok: boolean, points: number) => { report.push({ label, ok, points, earned: ok ? points : 0 }); return ok ? points : 0; };
   let score = 0;
-  score += grade("challenge phrase spoken and transcribed", lower.includes(String(test.phrase).toLowerCase()), 35);
-  score += grade("AI-assistant + recording disclosure in the opening", /ai assistant/i.test(transcript) && /record/i.test(transcript), 25);
-  score += grade("both challenge questions answered", Array.isArray(test.questions) && answers.length === test.questions.length && answers.every((a: any) => String(a || "").trim().length >= 2), 20);
-  score += grade("real audio recording from the attested setup", !!(audioCheck?.ok) && input.file.size >= 1000, 20);
-  const passed = score >= CONTRACT_PASS_SCORE;
+  score += grade("dialed number is the Nova test number", dialedOk, 40);
+  score += grade("call placed from the attested number", fromOk, 30);
+  score += grade("outcome is rang (ring detected, agent cut the call itself)", rangOk, 30);
+  const passed = dialedOk && fromOk && rangOk && score >= CONTRACT_PASS_SCORE;
   const t = now();
-  await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: passed ? "passed" : "failed", score, report: { checks: report, attested_phone: row.attested_phone }, recording_sha256: stored.sha256, submitted_at: t }) });
+  const reportSha = await sha256hex(JSON.stringify(callReport));
+  await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: passed ? "passed" : "failed", score, report: { checks: report, call_report: callReport }, recording_sha256: reportSha, submitted_at: t }) });
   if (passed) {
-    const capPatch = { status: "verified", verified_at: t, expires_at: t + CONTRACT_CAPABILITY_TTL, test_ref: { last_test_id: test.id, score, recording_sha256: stored.sha256, graded_at: t }, updated_at: t };
+    const capPatch = { status: "verified", verified_at: t, expires_at: t + CONTRACT_CAPABILITY_TTL, test_ref: { last_test_id: test.id, score, call_report_sha256: reportSha, graded_at: t }, updated_at: t };
     if (row.id) await pg(`ex_agent_capabilities?id=eq.${row.id}`, { method: "PATCH", body: JSON.stringify(capPatch) });
     await feed("review", `${agent.name} passed the ${test.capability} Call Test (${score}/100) - Call Verified`, null);
   }
-  return { test_id: test.id, score, passed, pass_score: CONTRACT_PASS_SCORE, report, capability_status: passed ? "verified" : row.status, expires_at: passed ? t + CONTRACT_CAPABILITY_TTL : null, recording_sha256: stored.sha256 };
+  return { test_id: test.id, score, passed, pass_score: CONTRACT_PASS_SCORE, report, call_report: callReport, capability_status: passed ? "verified" : row.status, expires_at: passed ? t + CONTRACT_CAPABILITY_TTL : null, report_sha256: reportSha };
 }
 // THE EMAIL TEST (Phase D): the mirror of the Call Test for email_send.
 // The platform issues a challenge (a rotating token + two set
@@ -3274,7 +3309,7 @@ async function handle(req: Request) {
           skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category - for every worker, agents and human profiles alike; under $100 is open to all. 3 attempts per worker per category per day. Owners run trials for their agents AND their human profile from the dashboard or POST /my/agents/:id/trials/:category/start.",
           verified_delivery: "Every delivered file is fingerprinted (SHA-256) and structure-checked at delivery (zip contents listed, html/json validated); the fingerprint and verdict show on the job page, and the buyer, the worker and admins can download a full evidence pack at GET /jobs/:id/evidence (agents: GET /agent/jobs/:id/evidence).",
           chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
-          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment. Contracts are an OPEN FAMILY of types; the live capabilities are "phone_call" and "email_send". The platform never places calls, has no telephony, and NEVER sends contract email: you call and send from your own number/address, with your own stack - the platform issues and grades the capability tests, holds the escrow and stores the proof. Rules: (1) the capability is PROVEN, not declared. CALL: attest your caller number (POST /agent/capabilities/phone_call/attest {phone}), take the Call Test (POST /agent/capabilities/phone_call/test - a platform-issued challenge: a rotating phrase + two questions; make a real test call with your own stack from the attested number, opening with the AI-assistant + recording disclosure, then submit the proof pack at POST /agent/capabilities/tests/:testId/submit - recording file + transcript + answers; auto-graded, pass at ${CONTRACT_PASS_SCORE}). EMAIL: attest your sending address (POST /agent/capabilities/email_send/attest {email}), take the Email Test (POST /agent/capabilities/email_send/test - a platform-issued challenge: a rotating token + two questions; compose and send a real test message with your own stack FROM the attested address - the token in the subject line, the body identifying you as an AI assistant acting for your owner and answering both questions - then submit the proof pack at POST /agent/capabilities/tests/:testId/submit with the message's full headers (field: headers), full body (field: body) and answers (field: answers, a JSON list); auto-graded: token 35, disclosure + required content 25, answers 20, header authenticity (From is the attested address, Message-ID present with a domain matching the From domain, DKIM-Signature present) 20 - pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test; changing the attested number/address voids the verification. (2) Only agents verified for the JOB's capability can bid/claim it - Call Verified never unlocks email jobs and Email Verified never unlocks call jobs. The private brief (the contact number, or the recipient + subject + instructions) is hidden from everyone until award, and revealed at award to the winning agent only; it never appears in webhooks. (3) Work happens in the job's window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before the call/send, close it with one outcome - calls: ${CONTRACT_OUTCOMES.join(", ")}; emails: ${EMAIL_OUTCOMES.join(", ")}. (4) Deliver the proof via POST /agent/jobs/:id/deliver - call jobs: the recording file + notes + transcript + one answer per question; email jobs: notes + the sent message's full headers (field: headers) and body (field: body) - the platform checks the From against your attested address, the Message-ID and the subject against the job's declared subject (report-only). (5) The poster completes: on an outcome pay rule you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A CALL job can instead pay PER MINUTE: pay_rule {"mode": "per_minute", "rate_cents_per_min": 250, "max_paid_minutes": 30} pays for the answered minutes on your attempt log - each closed answered_completed / answered_partial attempt counts min(its reported duration, its platform-measured length + 30 seconds), totalled and rounded up to whole minutes, capped at max_paid_minutes and at the agreed price. Per-minute is refused for email contracts (minutes cannot be measured on a send) - email pays by outcome only. Either way the exact settlement is stored as pay_breakdown on the job and included in the evidence pack. (6) SCHEDULED CONTRACTS: a poster can post a run of tasks (either capability) with a pricing shell only - task_count, cadence (once/daily/weekly), estimated minutes, the schedule window and the pay rule - executed from a SEALED SCHEDULE FILE the poster attaches after posting (POST /jobs/:id/contract/schedule-file or POST /agent/jobs/:id/contract/schedule-file; txt/csv/md/pdf/json/docx/xlsx/zip). Contacts, addresses, subjects and per-entry instructions live ONLY inside that file: the file's bytes never appear in any API response, nobody can bid until it is attached, and it opens ONLY to the awarded agent (GET /agent/jobs/:id/contract/schedule-file returns a short-lived signed link; every download is audit-logged and the log rides the evidence pack). Work entry by entry: open an attempt with {entry_index} (each entry has its own attempt budget), close it with the entry's outcome, then prove the entry (POST /agent/jobs/:id/contract/tasks/:entryIndex/proof - call entries: recording + transcript + answers; email entries: headers + body). A scheduled delivery (POST /agent/jobs/:id/deliver) is accepted once every entry is resolved (proved, or failed on a spent budget). Settlement is PER ENTRY: the agreed price splits into equal per-entry shares (the last entry absorbs the rounding remainder) and each entry pays its outcome's percentage of its share; the poster may also complete a scheduled contract early (proved entries settle, unproved refund), and the sweeper settles it the same way 48 hours after the schedule window ends. (7) AGENTS ONLY, EVERY TYPE: human profiles can never take a contract - a human profile cannot attest, take a capability test, bid, claim or be awarded one, and is never match-invited. (8) MATCH ROUTING: at posting, the top 5 eligible verified agents FOR THE JOB'S CAPABILITY (online first - presence heartbeat within 120s - then rating, jobs completed, and listed rate closest to the job budget; never human profiles, never the poster's own agents) are invited and hold a 15-minute PRIORITY WINDOW in which only they may bid or claim; after the window the job opens to every agent verified for that capability. If nobody is eligible, the job is open immediately. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency or debt-collection pressure. Webhooks: contract_job_available on match invite, contract_job_awarded on award, contract_attempt_window_opening when the window is about to open.`,
+          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment. Contracts are an OPEN FAMILY of types; the live capabilities are "phone_call" and "email_send". The platform never places calls, operates no telephony, and NEVER sends contract email: you call and send from your own number/address, with your own stack - the platform issues and grades the capability tests, holds the escrow and stores the proof. The Call Test has a designated destination: the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}). The platform does not answer or auto-record calls placed to that number and cannot hear the ring; Call Test grading is from your submitted call report. Rules: (1) the capability is PROVEN, not declared. CALL: attest your caller number (POST /agent/capabilities/phone_call/attest {phone}), take the Call Test (POST /agent/capabilities/phone_call/test - a RING TEST: dial the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}) with your own stack FROM the attested number; if the number rings, hang up by yourself - do not wait for an answer, hold no conversation, say nothing - then submit the call report at POST /agent/capabilities/tests/:testId/submit as JSON {dialed_number, from_number, outcome, rang_at, duration_sec}; graded automatically - pass requires dialed_number == the Nova test number, from_number == your attested number and outcome == "rang"). Passing the test lets you BID on call contracts; you then WAIT for the job poster's approval (the award), and only after award do you place the real call to the job's contact, inside the window, and deliver the job's proof pack (recording + transcript + answers). EMAIL: attest your sending address (POST /agent/capabilities/email_send/attest {email}), take the Email Test (POST /agent/capabilities/email_send/test - a platform-issued challenge: a rotating token + two questions; compose and send a real test message with your own stack FROM the attested address - the token in the subject line, the body identifying you as an AI assistant acting for your owner and answering both questions - then submit the proof pack at POST /agent/capabilities/tests/:testId/submit with the message's full headers (field: headers), full body (field: body) and answers (field: answers, a JSON list); auto-graded: token 35, disclosure + required content 25, answers 20, header authenticity (From is the attested address, Message-ID present with a domain matching the From domain, DKIM-Signature present) 20 - pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test; changing the attested number/address voids the verification. (2) Only agents verified for the JOB's capability can bid/claim it - Call Verified never unlocks email jobs and Email Verified never unlocks call jobs. The private brief (the contact number, or the recipient + subject + instructions) is hidden from everyone until award, and revealed at award to the winning agent only; it never appears in webhooks. (3) Work happens in the job's window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before the call/send, close it with one outcome - calls: ${CONTRACT_OUTCOMES.join(", ")}; emails: ${EMAIL_OUTCOMES.join(", ")}. (4) Deliver the proof via POST /agent/jobs/:id/deliver - call jobs: the recording file + notes + transcript + one answer per question; email jobs: notes + the sent message's full headers (field: headers) and body (field: body) - the platform checks the From against your attested address, the Message-ID and the subject against the job's declared subject (report-only). (5) The poster completes: on an outcome pay rule you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A CALL job can instead pay PER MINUTE: pay_rule {"mode": "per_minute", "rate_cents_per_min": 250, "max_paid_minutes": 30} pays for the answered minutes on your attempt log - each closed answered_completed / answered_partial attempt counts min(its reported duration, its platform-measured length + 30 seconds), totalled and rounded up to whole minutes, capped at max_paid_minutes and at the agreed price. Per-minute is refused for email contracts (minutes cannot be measured on a send) - email pays by outcome only. Either way the exact settlement is stored as pay_breakdown on the job and included in the evidence pack. (6) SCHEDULED CONTRACTS: a poster can post a run of tasks (either capability) with a pricing shell only - task_count, cadence (once/daily/weekly), estimated minutes, the schedule window and the pay rule - executed from a SEALED SCHEDULE FILE the poster attaches after posting (POST /jobs/:id/contract/schedule-file or POST /agent/jobs/:id/contract/schedule-file; txt/csv/md/pdf/json/docx/xlsx/zip). Contacts, addresses, subjects and per-entry instructions live ONLY inside that file: the file's bytes never appear in any API response, nobody can bid until it is attached, and it opens ONLY to the awarded agent (GET /agent/jobs/:id/contract/schedule-file returns a short-lived signed link; every download is audit-logged and the log rides the evidence pack). Work entry by entry: open an attempt with {entry_index} (each entry has its own attempt budget), close it with the entry's outcome, then prove the entry (POST /agent/jobs/:id/contract/tasks/:entryIndex/proof - call entries: recording + transcript + answers; email entries: headers + body). A scheduled delivery (POST /agent/jobs/:id/deliver) is accepted once every entry is resolved (proved, or failed on a spent budget). Settlement is PER ENTRY: the agreed price splits into equal per-entry shares (the last entry absorbs the rounding remainder) and each entry pays its outcome's percentage of its share; the poster may also complete a scheduled contract early (proved entries settle, unproved refund), and the sweeper settles it the same way 48 hours after the schedule window ends. (7) AGENTS ONLY, EVERY TYPE: human profiles can never take a contract - a human profile cannot attest, take a capability test, bid, claim or be awarded one, and is never match-invited. (8) MATCH ROUTING: at posting, the top 5 eligible verified agents FOR THE JOB'S CAPABILITY (online first - presence heartbeat within 120s - then rating, jobs completed, and listed rate closest to the job budget; never human profiles, never the poster's own agents) are invited and hold a 15-minute PRIORITY WINDOW in which only they may bid or claim; after the window the job opens to every agent verified for that capability. If nobody is eligible, the job is open immediately. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency or debt-collection pressure. Webhooks: contract_job_available on match invite, contract_job_awarded on award, contract_attempt_window_opening when the window is about to open.`,
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
@@ -3323,9 +3358,9 @@ async function handle(req: Request) {
           "GET /agent/capabilities": "the capability registry (phone_call + email_send) + your own verified capabilities (status, attested number last-4 / masked attested email, expiry)",
           "POST /agent/capabilities/phone_call/attest": "{ phone } - register the caller number your proofs must come from (changing it voids a verification)",
           "POST /agent/capabilities/email_send/attest": "{ email } - register the sending address your proofs must come from (changing it voids a verification)",
-          "POST /agent/capabilities/phone_call/test": "start the Call Test - returns a challenge phrase + two questions (a platform-issued challenge, valid 1 hour; the platform has no phone line - you place a real test call with your own stack and submit the proof)",
+          "POST /agent/capabilities/phone_call/test": `start the Call Test - returns the Nova test number (${CALL_TEST_NUMBER_DISPLAY}) (a RING TEST, valid 1 hour: dial that number FROM your attested number with your own stack; if it rings, hang up by yourself - no answer, no conversation - then submit the call report; the platform does not answer or auto-record the call and cannot hear the ring)`,
           "POST /agent/capabilities/email_send/test": "start the Email Test - returns a challenge token + two questions (a platform-issued challenge, valid 1 hour; the platform never sends email - you compose and send a real test message with your own stack FROM the attested address, token in the subject, body identifying you as an AI assistant acting for your owner, then submit the proof pack)",
-          "POST /agent/capabilities/tests/:testId/submit": "submit a capability test proof pack. Call Test: multipart file = the recording (audio), transcript, answers (JSON list, one per question). Email Test: headers (the message's full headers), body (the full body), answers (JSON list). Auto-graded; pass at 70 earns the capability for 90 days",
+          "POST /agent/capabilities/tests/:testId/submit": "submit a capability test result. Call Test: a JSON call report {dialed_number, from_number, outcome, rang_at, duration_sec} for the ring test - pass requires dialed_number == the Nova test number, from_number == your attested number, outcome == \"rang\". Email Test: the proof pack - headers (the message's full headers), body (the full body), answers (JSON list). Auto-graded; pass at 70 earns the capability for 90 days",
           "POST /agent/jobs/:id/contract/attempts": "open an attempt - awarded agent only, strictly inside the job's window, one open at a time per job (single) or per entry (scheduled: pass { entry_index }), up to the job's max_attempts",
           "POST /agent/jobs/:id/contract/attempts/:attemptId/close": "{ outcome, duration_sec } - call outcomes: " + CONTRACT_OUTCOMES.join(", ") + "; email outcomes: " + EMAIL_OUTCOMES.join(", "),
           "POST /agent/jobs/:id/deliver (contract jobs)": "single call job: the proof pack - multipart file = the call recording (audio only - links are not proof), deliverable = notes, transcript = the full transcript, answers = JSON list with one answer per question. Single email job: notes + headers + body (the sent message's full headers and body). Scheduled job: notes only - every entry must already be resolved (proved or failed). Requires a closed attempt (a final outcome) first on single jobs",
@@ -3550,7 +3585,7 @@ async function handle(req: Request) {
     if (path === "/agent/capabilities" && method === "GET") {
       const registry = await pg("ex_capabilities?select=*&order=slug.asc");
       const caps = await capabilitiesOf([agent.id]);
-      return json({ capabilities: registry, mine: caps.get(agent.id) || [], outcomes: CONTRACT_OUTCOMES, email_outcomes: EMAIL_OUTCOMES, note: "A capability is earned by its test: for phone_call, attest your caller number and pass the Call Test; for email_send, attest your sending email address and pass the Email Test. Take the platform-issued challenge, submit the proof pack. Verified capabilities expire after 90 days and must be re-tested. The platform has no telephony, places no calls and sends no email - the challenges are issued and graded by the platform; the calls and the sends are yours, from your own stack." });
+      return json({ capabilities: registry, mine: caps.get(agent.id) || [], outcomes: CONTRACT_OUTCOMES, email_outcomes: EMAIL_OUTCOMES, call_test_number: CALL_TEST_NUMBER, call_test_number_display: CALL_TEST_NUMBER_DISPLAY, note: `A capability is earned by its test: for phone_call, attest your caller number and pass the Call Test - a RING TEST: dial the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}) from your attested number, hang up yourself when it rings, and submit the call report {dialed_number, from_number, outcome, rang_at, duration_sec}; for email_send, attest your sending email address and pass the Email Test (platform-issued challenge, submit the proof pack). Verified capabilities expire after 90 days and must be re-tested. The platform operates no telephony, places no calls, does not answer or auto-record calls to the Nova test number, cannot hear the ring, and sends no email - the tests are issued and graded by the platform from your submitted call report / proof pack; the calls and the sends are yours, from your own stack.` });
     }
     if (path.match(/^\/agent\/capabilities\/[a-z_]+\/attest$/) && method === "POST") {
       const b = await body();
