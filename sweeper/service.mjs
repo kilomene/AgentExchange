@@ -423,6 +423,34 @@ async function deliveredAutoRelease() {
   }
 }
 
+// WINDOW CLARITY (owner order 2026-10-26): mirror of the backend's
+// helpers - a window instant rendered BOTH as ISO UTC and in the
+// job's own timezone with its UTC offset explicit, so no agent ever
+// has to convert from its local clock.
+function swTzOffsetLabel(epochSec, tz) {
+  try {
+    const part = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "longOffset" })
+      .formatToParts(new Date(epochSec * 1000)).find((p) => p.type === "timeZoneName")?.value || "";
+    const m = part.match(/^GMT(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/);
+    if (!m) return "UTC";
+    if (!m[1]) return "UTC+0";
+    const mins = m[3] && m[3] !== "00" ? `:${m[3]}` : "";
+    return `UTC${m[1]}${Number(m[2])}${mins}`;
+  } catch { return "UTC"; }
+}
+function swWindowLocal(epochSec, tz) {
+  let stz = tz || "UTC";
+  try { new Intl.DateTimeFormat("en-US", { timeZone: stz }); } catch { stz = "UTC"; }
+  const text = new Intl.DateTimeFormat("en-US", { timeZone: stz, year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(epochSec * 1000));
+  return `${text} (${swTzOffsetLabel(epochSec, stz)})`;
+}
+function swWindowInstant(epochSec, tz) {
+  let stz = tz || "UTC";
+  try { new Intl.DateTimeFormat("en-US", { timeZone: stz }); } catch { stz = "UTC"; }
+  const text = new Intl.DateTimeFormat("en-US", { timeZone: stz, year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(epochSec * 1000));
+  return `${new Date(epochSec * 1000).toISOString().replace(/\.\d{3}Z$/, "Z")} (${text}, ${swTzOffsetLabel(epochSec, stz)})`;
+}
+
 // CONTRACT JOBS (2026-10-26): two time-based duties.
 //  a) WINDOW OPENING: when an awarded contract job's call window opens
 //     within the next 60 minutes, the winning agent's owner is notified
@@ -448,10 +476,10 @@ async function contractWindowOpening() {
       const agent = (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=name,owner_id,webhook_url`))[0];
       if (agent) {
         const capWord = cj.capability === "email_send" ? "Send" : "Call";
-        await notify(agent.owner_id, "award", `${capWord} window opening soon: "${job.title}" - the window opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz}). Open an attempt inside the window before ${cj.capability === "email_send" ? "sending" : "dialling"}.`, `#/job/${job.id}`);
+        await notify(agent.owner_id, "award", `${capWord} window opening soon: "${job.title}" - the window opens ${swWindowInstant(Number(cj.window_start), cj.window_tz)} and closes ${swWindowInstant(Number(cj.window_end), cj.window_tz)}. Act on the UTC instant, never your local clock. Open an attempt inside the window before ${cj.capability === "email_send" ? "sending" : "dialling"}.`, `#/job/${job.id}`);
         if (agent.webhook_url) {
           try {
-            await fetch(agent.webhook_url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "contract_attempt_window_opening", job_id: job.id, title: job.title, window_start: cj.window_start, window_end: cj.window_end, window_tz: cj.window_tz }), signal: AbortSignal.timeout(5000) });
+            await fetch(agent.webhook_url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "contract_attempt_window_opening", job_id: job.id, title: job.title, window_start: cj.window_start, window_end: cj.window_end, window_tz: cj.window_tz, window_start_utc: new Date(Number(cj.window_start) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"), window_end_utc: new Date(Number(cj.window_end) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"), window_start_local: swWindowLocal(Number(cj.window_start), cj.window_tz), window_end_local: swWindowLocal(Number(cj.window_end), cj.window_tz) }), signal: AbortSignal.timeout(5000) });
           } catch { /* best effort, like the backend's fireWebhook */ }
         }
       }
