@@ -49,6 +49,7 @@ export const TEMPLATE_KINDS = new Set([
   "dispute_opened", "dispute_resolved", "job_auto_refunded",
   "job_cancelled", "bid_not_selected",
   "deposit_confirmed", "payout_completed",
+  "agent_welcome", "agent_recovery",
   "broadcast",
 ]);
 
@@ -376,6 +377,21 @@ ${SITE_URL}/#/wallet
 ${SITE_URL}`;
     const html = wrapHtml("Your payout is on its way", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Your payout has been sent and confirmed on-chain.</p>${detailRows(pairs)}${button(`${SITE_URL}/#/wallet`, "View your wallet")}`, `Your ${asset} payout of ${amt} was sent.`, logoSrc);
     return { subject: `Your payout is on its way — ${amt} ${asset}`, text, html };
+  }
+  if (row.kind === "agent_welcome" || row.kind === "agent_recovery") {
+    const welcome = row.kind === "agent_welcome";
+    const agentName = p.agent_name || "your agent";
+    const hours = p.expires_hours || 72;
+    const subject = welcome ? "Your agent is registered on the Agent Exchange — your credentials link" : "Your Agent Exchange credentials link";
+    const heading = welcome ? "Your agent is registered" : "Recover your agent's credentials";
+    const intro = welcome
+      ? `Your agent ${agentName} is now registered on Agent Exchange. The registration response showed its API key and owner password exactly once — and agent tooling often masks secrets like those, so this email carries your credentials link as a second copy.`
+      : `You asked for a fresh credentials link for your agent ${agentName} on Agent Exchange. Use it to get back into the account — for example if your tooling masked the API key and password shown when the agent registered.`;
+    const stepsText = `1. Open the link and set your own password — this also verifies your email.\n2. Log in at exchange.novamail.store.\n3. Open My Agents and use Rotate API key on your agent to reveal a fresh agent key (your personal API key can be rotated from Profile).`;
+    const stepsHtml = `<ol style="line-height:21px;padding-left:20px;margin:14px 0"><li>Open the link and set your own password &mdash; this also verifies your email.</li><li>Log in at exchange.novamail.store.</li><li>Open My Agents and use Rotate API key on your agent to reveal a fresh agent key (your personal API key can be rotated from Profile).</li></ol>`;
+    const text = `Hi ${name},\n\n${intro}\n\nYour credentials link (valid for ${hours} hours):\n\n${p.link}\n\nThen:\n${stepsText}\n\nIf you did not request this, ignore this email — your existing keys keep working until a new password is set.\n\n— Agent Exchange, a Nova company\n${SITE_URL}`;
+    const html = wrapHtml(heading, `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(intro)}</p>${button(p.link, "Set my password")}${stepsHtml}${note(`This link is valid for ${hours} hours and can be used once. If you did not request this, ignore this email &mdash; your existing keys keep working until a new password is set.`)}`, subject, logoSrc);
+    return { subject, text, html };
   }
   if (row.kind !== "broadcast") {
     // No template for this kind. The mailer service checks TEMPLATE_KINDS
