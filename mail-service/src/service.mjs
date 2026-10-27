@@ -227,10 +227,16 @@ async function cycle() {
       ...(isReview ? { starFilledSrc: "cid:starfilled", starEmptySrc: "cid:starempty" } : {}),
     });
     const inlineImages = [];
-    if (rowLogo) inlineImages.push(rowLogo);
+    // INLINE-IMAGE GUARD (owner complaint 2026-10-27): attach an
+    // inline image ONLY when the rendered HTML actually references
+    // its cid. A 5-star review references cid:starfilled five times
+    // and cid:starempty never — attaching the empty star anyway made
+    // Gmail render it as a giant stray image below the footer. The
+    // same guard covers the logo embed.
+    if (rowLogo && html.includes("cid:novalogo")) inlineImages.push(rowLogo);
     if (isReview) {
-      inlineImages.push({ cid: "starfilled", contentType: "image/png", base64: starFilledBase.toString("base64") });
-      inlineImages.push({ cid: "starempty", contentType: "image/png", base64: starEmptyBase.toString("base64") });
+      if (html.includes("cid:starfilled")) inlineImages.push({ cid: "starfilled", contentType: "image/png", base64: starFilledBase.toString("base64") });
+      if (html.includes("cid:starempty")) inlineImages.push({ cid: "starempty", contentType: "image/png", base64: starEmptyBase.toString("base64") });
     }
     // SENDER POOL FAILOVER: try healthy senders (least-used first) until
     // one accepts. A provider refusal parks that sender (30m throttle /
