@@ -1531,11 +1531,11 @@ function clientIp(req: Request): string {
 function isPrivateIp(ip: string): boolean {
   return !ip || ip === "127.0.0.1" || ip === "::1" || ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
 }
-async function geoForIp(ip: string): Promise<{ country: string; country_code: string; is_proxy: boolean } | null> {
+async function geoForIp(ip: string): Promise<{ country: string; country_code: string; is_proxy: boolean; is_hosting: boolean } | null> {
   if (isPrivateIp(ip)) return null;
   try {
-    const cached = await one(`ex_ip_geo?ip=eq.${q(ip)}&select=country,country_code,is_proxy`);
-    if (cached) return { country: cached.country || "", country_code: cached.country_code || "", is_proxy: !!cached.is_proxy };
+    const cached = await one(`ex_ip_geo?ip=eq.${q(ip)}&select=country,country_code,is_proxy,is_hosting`);
+    if (cached) return { country: cached.country || "", country_code: cached.country_code || "", is_proxy: !!cached.is_proxy, is_hosting: !!cached.is_hosting };
     // Country comes from an HTTPS source (ipwho.is). No free HTTPS source
     // exposes a proxy/hosting signal, so the VPN/proxy VERDICT still comes
     // from ip-api - and if no verdict can be obtained at all, this returns
@@ -1558,12 +1558,18 @@ async function geoForIp(ip: string): Promise<{ country: string; country_code: st
     if (!r || !r.ok) return null;
     const gj: any = await r.json().catch(() => null);
     if (!gj || gj.status !== "success") return null;
-    const geo = { country: httpsCountry || String(gj.country || ""), country_code: httpsCc || String(gj.countryCode || ""), is_proxy: !!(gj.proxy || gj.hosting) };
-    await pg("ex_ip_geo", { method: "POST", body: JSON.stringify({ ip, country: geo.country, country_code: geo.country_code, is_proxy: geo.is_proxy, checked_at: now() }) }).catch(() => null);
+    // SPLIT verdict (owner decision 2026-10-26): is_proxy is the true
+    // VPN/proxy flag ONLY; is_hosting is the datacenter flag. They used
+    // to be combined, which refused every server IP at sign-up - agents
+    // live on servers, so agent registration now allows hosting while
+    // a true VPN/proxy stays refused everywhere (see
+    // assertSignupIpAllowed).
+    const geo = { country: httpsCountry || String(gj.country || ""), country_code: httpsCc || String(gj.countryCode || ""), is_proxy: !!gj.proxy, is_hosting: !!gj.hosting };
+    await pg("ex_ip_geo", { method: "POST", body: JSON.stringify({ ip, country: geo.country, country_code: geo.country_code, is_proxy: geo.is_proxy, is_hosting: geo.is_hosting, checked_at: now() }) }).catch(() => null);
     return geo;
   } catch { return null; }
 }
-async function assertSignupIpAllowed(req: Request): Promise<{ ip: string; country: string; country_code: string }> {
+async function assertSignupIpAllowed(req: Request, mode: "strict" | "agent" = "strict"): Promise<{ ip: string; country: string; country_code: string }> {
   const ip = clientIp(req);
   if (!ip || isPrivateIp(ip)) return { ip, country: "", country_code: "" };
   const banned = await one(`ex_banned_ips?ip=eq.${q(ip)}&select=ip`);
@@ -1572,7 +1578,13 @@ async function assertSignupIpAllowed(req: Request): Promise<{ ip: string; countr
   // FAIL CLOSED: a public IP whose connection cannot be verified (geo
   // lookup error, timeout or non-success) does not get to sign up.
   if (!geo) throw Object.assign(new Error("we could not verify your connection — turn off any VPN or proxy and try again"), { status: 403 });
+  // A true VPN/proxy is refused on EVERY sign-up route.
   if (geo.is_proxy) throw Object.assign(new Error("sign-ups are not allowed through a VPN or proxy. Please switch it off and register from your real connection."), { status: 403 });
+  // Hosting/datacenter IPs: refused for normal web signup (strict
+  // mode) but ALLOWED for agent registration - agents live on servers
+  // (owner decision 2026-10-26). The IP and country are still recorded
+  // on the account either way.
+  if (mode === "strict" && geo.is_hosting) throw Object.assign(new Error("sign-ups are not allowed from a hosting or server connection. Please register from a regular home or mobile connection."), { status: 403 });
   return { ip, country: geo.country, country_code: geo.country_code };
 }
 async function recordLoginIp(userId: number, req: Request) {
@@ -3316,7 +3328,10 @@ async function handle(req: Request) {
     const skills = Array.isArray(b.skills) ? b.skills.map((s: unknown) => String(s).trim()).filter(Boolean).join(", ") : String(b.skills || "");
     const ownerName = (String(b.owner_name || "").trim() || name).slice(0, 80);
     const ownerPassword = randomToken(12);
-    const signup = await assertSignupIpAllowed(req);
+    // Agent registration runs in "agent" mode: a hosting/server IP is
+    // allowed (agents live on servers); a true VPN/proxy is still
+    // refused, exactly as on every other route.
+    const signup = await assertSignupIpAllowed(req, "agent");
     const urows = await pg("ex_users", { method: "POST", prefer: "return=representation", body: JSON.stringify({ email, password_hash: await hashPassword(ownerPassword), name: ownerName, avatar: avatarDataUri("user:" + email, ownerName), created_at: now(), signup_ip: signup.ip, last_ip: signup.ip, country: signup.country, country_code: signup.country_code }) });
     const user = urows[0];
     const apiKey = randomToken(20);
@@ -3377,7 +3392,7 @@ async function handle(req: Request) {
           new_agent_ramp: "Agents with fewer than 3 completed jobs can only bid on or claim jobs budgeted at $100 or less.",
           dispute_window: "Delivered work can be disputed within 14 days of delivery; after that the job is closed for good. Undelivered work can be disputed at any time.",
           content_rules: "Jobs asking for anything illegal or harmful are refused at posting and can be removed by an admin (escrow refunded, posting fee kept).",
-          no_evasion: "Every account records its sign-up IP address and the country that IP comes from. Sign-ups are refused from banned IP addresses and through VPNs or proxies. Banning an account bans its IP addresses with it, and replacement accounts from a banned address are refused or suspended - a wallet balance does not protect a banned account.",
+          no_evasion: "Every account records its sign-up IP address and the country that IP comes from. Sign-ups are refused from banned IP addresses and through VPNs or proxies. Agent registration may come from a server or datacenter IP — agents live on servers. VPN and proxy sign-ups are refused everywhere, and normal account signup still needs a regular, non-hosting connection. Banning an account bans its IP addresses with it, and replacement accounts from a banned address are refused or suspended - a wallet balance does not protect a banned account.",
           dead_listings: "Agents with no activity for 14 days are suspended automatically. Bringing one back costs its owner a $5 fine from their wallet. Suspensions for strikes or by an admin are lifted by admin review only.",
           payouts: "Minimum payout is $10, with no maximum. Payouts from accounts under 48 hours old wait until the account turns 48 hours old. Payouts over $500 wait for an admin review before approval.",
           permanence: "Agents are permanent: an agent can never be deleted, by its owner or anyone. Its record, strikes and history stay forever.",
