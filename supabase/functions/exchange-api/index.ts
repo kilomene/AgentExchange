@@ -657,6 +657,27 @@ async function validateContractPayload(b: any) {
 async function contractJobRow(jobId: number) {
   return await one(`ex_contract_jobs?job_id=eq.${jobId}&select=*`);
 }
+// BID DEADLINE vs CONTRACT WINDOW (owner report 2026-10-27): a contract
+// job's bid_deadline was set purely from deadline_hours at posting, so it
+// could pass hours before the contract's own work window even opened -
+// the API then refused every bid with "bidding has closed for this job"
+// while the job itself still showed open (job 236: deadline 05:05 UTC vs
+// a work window running to 23:42 UTC). Rule: for CONTRACT jobs the
+// effective bidding deadline is never earlier than the contract window's
+// end. Bidding stays open while the job is open and its window has not
+// ended; standard jobs keep their stored deadline exactly.
+function effectiveBidDeadline(job: any, cj?: any): number | null {
+  const stored = job?.bid_deadline ? Number(job.bid_deadline) : 0;
+  if (job?.job_kind !== "contract") return stored || null;
+  const wEnd = cj?.window_end ? Number(cj.window_end) : 0;
+  const eff = Math.max(stored, wEnd);
+  return eff || null;
+}
+async function effectiveBidDeadlineFor(job: any): Promise<number | null> {
+  if (job?.job_kind !== "contract") return job?.bid_deadline ? Number(job.bid_deadline) : null;
+  const cj = await contractJobRow(job.id).catch(() => null);
+  return effectiveBidDeadline(job, cj);
+}
 async function contractAttemptsOf(jobId: number) {
   return await pg(`ex_contract_attempts?job_id=eq.${jobId}&select=id,agent_id,task_id,started_at,ended_at,outcome,duration_sec&order=started_at.asc`);
 }
@@ -1821,7 +1842,7 @@ async function handle(req: Request) {
       if (capFilter && (j.job_kind !== "contract" || cjMap.get(j.id)?.capability !== capFilter)) continue;
       const bidRows = await pg(`ex_bids?job_id=eq.${j.id}&select=amount_cents&status=eq.active`);
       const view: any = { ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null };
-      if (j.job_kind === "contract") view.contract = contractView(cjMap.get(j.id), false);
+      if (j.job_kind === "contract") { view.contract = contractView(cjMap.get(j.id), false); view.bid_deadline = effectiveBidDeadline(j, cjMap.get(j.id)); }
       out.push(view);
     }
     return json({ jobs: out });
@@ -1848,6 +1869,7 @@ async function handle(req: Request) {
       const cj = await contractJobRow(id);
       const canSeeBrief = !!viewer && !!awardedOwner && viewer.id === awardedOwner;
       (jobView as any).contract = contractView(cj, canSeeBrief, canSeeDelivery, canSeeDelivery);
+      (jobView as any).bid_deadline = effectiveBidDeadline(j, cj);
       (jobView as any).attempts = await contractAttemptsOf(id);
       if (cj && cj.task_count !== null && cj.task_count !== undefined) {
         // SCHEDULED CONTRACTS: the entry shells (status + outcome) are
@@ -2135,11 +2157,19 @@ async function handle(req: Request) {
       }
       throw e;
     }
+    // CONTRACT BID DEADLINE (owner report 2026-10-27): a contract job's
+    // stored bid_deadline is never earlier than its work window's end -
+    // otherwise bidding closes while the job is still open and waiting
+    // for its window (see effectiveBidDeadline).
+    const requestedDeadline = b.deadline_hours ? t + Math.max(1, parseInt(b.deadline_hours)) * 3600 : 0;
+    const storedBidDeadline = contractSpec
+      ? (Math.max(requestedDeadline, Number(contractSpec.window_end || 0)) || null)
+      : (requestedDeadline || null);
     try {
       const rows = await pg("ex_jobs", { method: "POST", prefer: "return=representation", body: JSON.stringify({
         poster_user_id: posterUserId, poster_agent_id: posterAgentId, title: sanitizeText(title).slice(0, 160),
         description: sanitizeText(String(b.description || "")).slice(0, 6000), category: cat.slug, budget_cents: budget,
-        mode, status: "open", job_kind: contractSpec ? "contract" : "standard", bid_deadline: b.deadline_hours ? t + Math.max(1, parseInt(b.deadline_hours)) * 3600 : null,
+        mode, status: "open", job_kind: contractSpec ? "contract" : "standard", bid_deadline: storedBidDeadline,
         created_at: t, updated_at: t,
       }) });
       const job = rows[0];
@@ -2266,7 +2296,8 @@ async function handle(req: Request) {
   async function placeBid(agent: any, job: any, b: any) {
     if (job.status !== "open") throw Object.assign(new Error("job is not open for bids"), { status: 400 });
     if (job.mode !== "bidding") throw Object.assign(new Error("this is a fixed-price job — claim it instead"), { status: 400 });
-    if (job.bid_deadline && now() > Number(job.bid_deadline)) throw Object.assign(new Error("bidding has closed for this job"), { status: 400 });
+    const bidDeadline = await effectiveBidDeadlineFor(job);
+    if (bidDeadline && now() > bidDeadline) throw Object.assign(new Error("bidding has closed for this job"), { status: 400 });
     if (job.poster_user_id === agent.owner_id) throw Object.assign(new Error("you cannot bid on your own job"), { status: 400 });
     await assertNoSharedSignupIp(job.poster_user_id, agent.owner_id);
     // NEW-AGENT RAMP (owner's rule, 2026-10-26): until an agent has
@@ -2432,7 +2463,8 @@ async function handle(req: Request) {
     if (!job) return err("job not found", 404);
     if (job.mode !== "fixed") return err("this job takes bids — place a bid instead");
     if (job.poster_user_id === u.id) return err("you cannot claim your own job");
-    if (job.bid_deadline && now() > Number(job.bid_deadline)) return err("bidding has closed for this job");
+    const claimDeadline = await effectiveBidDeadlineFor(job);
+    if (claimDeadline && now() > claimDeadline) return err("bidding has closed for this job");
     const agent = await one(`ex_agents?id=eq.${parseInt(b.agent_id)}&owner_id=eq.${u.id}&status=eq.active&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
     if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
@@ -3549,6 +3581,7 @@ async function handle(req: Request) {
         // the contact is NEVER on the floor - not even for verified agents.
         if (j.job_kind === "contract") {
           view.contract = contractView(cjMap.get(j.id), false);
+          view.bid_deadline = effectiveBidDeadline(j, cjMap.get(j.id));
           // MATCH ROUTING (Phase C): tell this agent it is invited, and
           // float invited jobs inside their priority window to the top.
           const inv: any[] = Array.isArray(cjMap.get(j.id)?.match_invited) ? cjMap.get(j.id).match_invited : [];
@@ -3595,7 +3628,8 @@ async function handle(req: Request) {
       if (!job) return err("job not found", 404);
       if (job.mode !== "fixed") return err("this job takes bids");
       if (job.poster_user_id === agent.owner_id) return err("you cannot claim your own job");
-      if (job.bid_deadline && now() > Number(job.bid_deadline)) return err("bidding has closed for this job");
+      const agentClaimDeadline = await effectiveBidDeadlineFor(job);
+      if (agentClaimDeadline && now() > agentClaimDeadline) return err("bidding has closed for this job");
       if ((agent.jobs_completed || 0) < 3 && job.budget_cents > 10000) return err("new-agent limit: agents with fewer than 3 completed jobs can only claim jobs budgeted at $100 or less. Complete 3 jobs to unlock bigger budgets.");
       try { await assertTrialGate(agent, job); await assertContractGate(agent, job); } catch (e: any) { return err(e.message, e.status || 400); }
       const bidRows = await pg("ex_bids", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, bidder_user_id: agent.owner_id, amount_cents: job.budget_cents, eta_hours: 24, pitch: "Claimed at fixed price (API)", status: "active", created_at: now() }) });
@@ -3961,6 +3995,7 @@ async function handle(req: Request) {
         // poster's own other agents.
         const cj = await contractJobRow(jobId);
         const canSeeBrief = j.awarded_agent_id === agent.id;
+        (jobView as any).bid_deadline = effectiveBidDeadline(j, cj);
         const cView: any = contractView(cj, canSeeBrief, isParty, isParty);
         // MATCH ROUTING (Phase C): the viewing agent learns that IT is
         // invited - it never learns who else is.
