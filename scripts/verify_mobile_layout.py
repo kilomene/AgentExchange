@@ -47,6 +47,23 @@ HARNESS = """<!DOCTYPE html>
         <div class="flex frow"><div class="grow"><label>Rate per answered minute (USD)</label><input id="c-pm-rate" type="number" step="0.01" min="0.10" value="2.50"></div>
         <div class="grow"><label>Max paid minutes (1–600)</label><input id="c-pm-max" type="number" min="1" max="600" value="30"></div></div>
       </div>
+      <div id="contract-email-fields">
+        <label>Recipient email (hidden until award)</label><input id="c-recipient" type="email" placeholder="person@example.com">
+        <label>Subject line (hidden until award)</label><input id="c-subject" placeholder="The exact subject line to send">
+        <label>Message instructions (hidden until award)</label><textarea id="c-instructions" rows="3"></textarea>
+      </div>
+      <div id="c-paycustom-email">
+        <div class="flex frow"><div class="grow"><label>Sent &amp; completed %</label><input id="c-epay-sent_completed" type="number" min="0" max="100" value="100"></div>
+        <div class="grow"><label>Sent, partial %</label><input id="c-epay-sent_partial" type="number" min="0" max="100" value="50"></div>
+        <div class="grow"><label>Bounced %</label><input id="c-epay-failed_bounced" type="number" min="0" max="100" value="0"></div>
+        <div class="grow"><label>Failed %</label><input id="c-epay-failed_other" type="number" min="0" max="100" value="0"></div></div>
+      </div>
+      <div id="contract-sched-fields">
+        <div class="flex frow"><div class="grow"><label>Sealed schedule file</label><input id="c-sched-file" type="file" accept=".txt,.csv,.md,.pdf,.json,.docx,.xlsx,.zip"></div>
+        <div class="grow"><label>Number of tasks in the file</label><input id="c-tasks" type="number" min="1" max="500" value="7"></div>
+        <div class="grow"><label>Cadence</label><select id="c-cadence"><option value="once">One run of tasks</option><option value="daily">Daily</option><option value="weekly">Weekly</option></select></div>
+        <div class="grow"><label>Estimated total minutes</label><input id="c-est" type="number" min="0" value="35"></div></div>
+      </div>
       <label>Your attestation (required)</label><textarea id="c-attest" rows="2"></textarea>
     </div>
     <label class="mt">Milestones (optional)</label>
@@ -72,7 +89,23 @@ HARNESS = """<!DOCTYPE html>
         <label>Transcript of the test call</label><textarea id="ct-tr-1" rows="3"></textarea>
         <label>Answer 1</label><input id="ct-a1-1"><label>Answer 2</label><input id="ct-a2-1">
       </div>
+      <div class="flex mt" style="flex-wrap:wrap;gap:8px"><input id="cap-email-1" type="email" placeholder="Sending address, e.g. agent@example.com" value="" style="min-width:220px"><button class="btn sm">Attest address</button><button class="btn sm green">Start the Email Test</button></div>
+      <div class="mt" style="border-top:1px solid var(--line);padding-top:10px"><b>Email Test challenge</b>
+        <label>Full headers</label><textarea id="et-headers-1" rows="4"></textarea>
+        <label>Message body</label><textarea id="et-body-1" rows="3"></textarea>
+        <label>Answer 1</label><input id="et-a1-1"><label>Answer 2</label><input id="et-a2-1">
+      </div>
     </div></div>
+  </div>
+
+  <div class="panel"><h4>Task entries — one per entry in the sealed file</h4>
+    <div class="notif" style="align-items:flex-start"><div class="grow"><b>Entry #2</b> <span class="pill">attempted</span>
+      <div class="flex mt" style="flex-wrap:wrap;gap:8px"><select id="tk-outcome-2"><option value="sent_completed">sent completed</option></select><input id="tk-dur-2" type="number" min="0" placeholder="call seconds" style="max-width:130px"><button class="btn sm green">Close attempt #3</button></div>
+      <label>Sent-message headers</label><textarea id="tk-headers-2" rows="3"></textarea>
+      <label>Sent-message body</label><textarea id="tk-body-2" rows="2"></textarea>
+      <button class="btn sm green">Submit proof for entry #2</button>
+    </div></div>
+    <div class="flex mt" style="flex-wrap:wrap;gap:8px"><input type="file" id="sched-file"><button class="btn sm">Upload / replace the sealed file</button></div>
   </div>
 </main>
 </body></html>
@@ -80,7 +113,11 @@ HARNESS = """<!DOCTYPE html>
 
 FIELDS = ["j-budget", "j-mode", "j-deadline", "c-name", "c-phone", "c-wstart",
           "c-wend", "c-tz", "c-attempts", "c-pm-rate", "c-pm-max",
-          "bid-amt", "bid-eta", "att-outcome", "att-dur", "cap-phone-1"]
+          "c-recipient", "c-subject", "c-epay-sent_completed", "c-epay-failed_other",
+          "c-sched-file", "c-tasks", "c-cadence", "c-est",
+          "bid-amt", "bid-eta", "att-outcome", "att-dur", "cap-phone-1",
+          "cap-email-1", "et-headers-1", "et-body-1", "tk-outcome-2",
+          "tk-dur-2", "tk-headers-2", "sched-file"]
 
 MEASURE = """(ids) => {
   const out = { innerWidth: window.innerWidth,
@@ -127,6 +164,14 @@ def main():
         pm = {k: m["fields"][k]["top"] for k in ("c-pm-rate", "c-pm-max")}
         if len(set(pm.values())) != 2:
             fails.append(f"390: per-minute row NOT stacked: {pm}")
+        sc = {k: m["fields"][k]["top"] for k in ("c-sched-file", "c-tasks", "c-cadence", "c-est")}
+        if len(set(sc.values())) != 4:
+            fails.append(f"390: scheduled row NOT stacked into 4 lines: {sc}")
+        else:
+            print("390: scheduled row stacks to 4 full-width lines")
+        ep = {k: m["fields"][k]["top"] for k in ("c-epay-sent_completed", "c-epay-failed_other")}
+        if len(set(ep.values())) != 2:
+            fails.append(f"390: email pay row NOT stacked: {ep}")
         pg.close()
         # ---- desktop: 1280px — must remain the multi-column layout
         pg = b.new_page(viewport={"width": 1280, "height": 900})
@@ -145,7 +190,9 @@ def main():
 
         for name, keys in (("window", ("c-wstart", "c-wend", "c-tz", "c-attempts")),
                            ("budget", ("j-budget", "j-mode", "j-deadline")),
-                           ("per-minute", ("c-pm-rate", "c-pm-max"))):
+                           ("per-minute", ("c-pm-rate", "c-pm-max")),
+                           ("scheduled", ("c-sched-file", "c-tasks", "c-cadence", "c-est")),
+                           ("email-pay", ("c-epay-sent_completed", "c-epay-failed_other"))):
             if not one_row(keys):
                 fails.append(f"1280: {name} row NOT one desktop row")
             else:
