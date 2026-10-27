@@ -42,6 +42,7 @@ HARNESS = """<!DOCTYPE html>
       <div class="grow"><label>Call window ends</label><input id="c-wend" type="datetime-local"></div>
       <div class="grow"><label>Timezone</label><input id="c-tz" value="UTC"></div>
       <div class="grow"><label>Max attempts (1–5)</label><input id="c-attempts" type="number" min="1" max="5" value="3"></div></div>
+      <p class="small mut" id="c-winpreview">Agents will see this window as: <b>Nov 5, 2026, 10:00 AM EST (UTC-5) → Nov 5, 2026, 12:00 PM EST (UTC-5)</b> · in UTC: <b>2026-11-05T15:00:00Z → 2026-11-05T17:00:00Z</b>. The start/end are read from your device's clock and stored as those UTC instants — check this line shows the wall-clock times you intend in America/New_York.</p>
       <label>How the winner is paid</label><select id="c-paypreset"><option value="perminute">Pay per minute — pay for answered call time</option></select>
       <div id="c-payminute">
         <div class="flex frow"><div class="grow"><label>Rate per answered minute (USD)</label><input id="c-pm-rate" type="number" step="0.01" min="0.10" value="2.50"></div>
@@ -77,6 +78,8 @@ HARNESS = """<!DOCTYPE html>
     <div class="flex frow"><div class="grow"><label>Your price (USD)</label><input id="bid-amt" type="number" step="0.01" min="0.5"></div>
     <div class="grow"><label>ETA (hours)</label><input id="bid-eta" type="number" min="1" value="24"></div></div>
     <div class="deliv-box"><h4>Contract call — the brief</h4>
+      <p class="mt small" id="win-sample">Call window — in the job's timezone (America/New_York): <b>Nov 5, 2026, 10:00 AM EST (UTC-5) → Nov 5, 2026, 12:00 PM EST (UTC-5)</b><br><span class="mut">In UTC: <b>2026-11-05T15:00:00Z → 2026-11-05T17:00:00Z</b> · <b>opens in 9d 4h</b> — act on the UTC instant, never your own local clock.</span><br>Up to <b>3</b> attempts · only a <b>Call Verified</b> agent can take this job.</p>
+      <div class="small mut" id="win-card">🕐 Nov 5, 2026, 10:00 AM EST (UTC-5) → Nov 5, 2026, 12:00 PM EST (UTC-5)<br>2026-11-05T15:00:00Z → 2026-11-05T17:00:00Z UTC · <b>opens in 9d 4h</b></div>
       <div class="flex mt" style="flex-wrap:wrap;gap:8px"><select id="att-outcome"><option value="answered_completed">answered completed</option></select><input id="att-dur" type="number" min="0" placeholder="call seconds" style="max-width:130px"><button class="btn sm green" id="att-close">Close attempt #7</button></div>
     </div>
   </div>
@@ -115,6 +118,7 @@ FIELDS = ["j-budget", "j-mode", "j-deadline", "c-name", "c-phone", "c-wstart",
           "c-wend", "c-tz", "c-attempts", "c-pm-rate", "c-pm-max",
           "c-recipient", "c-subject", "c-epay-sent_completed", "c-epay-failed_other",
           "c-sched-file", "c-tasks", "c-cadence", "c-est",
+          "c-winpreview", "win-sample", "win-card",
           "bid-amt", "bid-eta", "att-outcome", "att-dur", "cap-phone-1",
           "cap-email-1", "et-headers-1", "et-body-1", "tk-outcome-2",
           "ct-outcome-1", "ct-dur-1", "ct-rang-1",
