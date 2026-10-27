@@ -84,10 +84,10 @@ HARNESS = """<!DOCTYPE html>
   <div class="panel" style="margin-bottom:16px"><h3>Contract capabilities</h3>
     <div class="notif" style="align-items:flex-start"><div class="grow"><b>Agent One</b> <span class="pill">not verified</span>
       <div class="flex mt" style="flex-wrap:wrap;gap:8px"><input id="cap-phone-1" placeholder="Caller number, e.g. +1 555 123 4567" value="" style="min-width:220px"><button class="btn sm">Attest number</button><button class="btn sm green">Start the Call Test</button></div>
-      <div class="mt" style="border-top:1px solid var(--line);padding-top:10px"><b>Call Test challenge</b>
-        <div class="flex mt" style="flex-wrap:wrap;gap:8px"><input type="file" id="ct-file-1" accept="audio/*"></div>
-        <label>Transcript of the test call</label><textarea id="ct-tr-1" rows="3"></textarea>
-        <label>Answer 1</label><input id="ct-a1-1"><label>Answer 2</label><input id="ct-a2-1">
+      <div class="mt" style="border-top:1px solid var(--line);padding-top:10px"><b>Call Test — ring test</b>
+        <div class="flex frow mt"><div class="grow"><label>Outcome</label><select id="ct-outcome-1"><option value="rang">rang</option></select></div>
+        <div class="grow"><label>Seconds it rang (approx.)</label><input id="ct-dur-1" type="number" min="0" max="3600" value="5"></div>
+        <div class="grow"><label>Ring time (epoch seconds — blank = now)</label><input id="ct-rang-1" placeholder="e.g. 1793100000"></div></div>
       </div>
       <div class="flex mt" style="flex-wrap:wrap;gap:8px"><input id="cap-email-1" type="email" placeholder="Sending address, e.g. agent@example.com" value="" style="min-width:220px"><button class="btn sm">Attest address</button><button class="btn sm green">Start the Email Test</button></div>
       <div class="mt" style="border-top:1px solid var(--line);padding-top:10px"><b>Email Test challenge</b>
@@ -117,6 +117,7 @@ FIELDS = ["j-budget", "j-mode", "j-deadline", "c-name", "c-phone", "c-wstart",
           "c-sched-file", "c-tasks", "c-cadence", "c-est",
           "bid-amt", "bid-eta", "att-outcome", "att-dur", "cap-phone-1",
           "cap-email-1", "et-headers-1", "et-body-1", "tk-outcome-2",
+          "ct-outcome-1", "ct-dur-1", "ct-rang-1",
           "tk-dur-2", "tk-headers-2", "sched-file"]
 
 MEASURE = """(ids) => {
@@ -172,6 +173,11 @@ def main():
         ep = {k: m["fields"][k]["top"] for k in ("c-epay-sent_completed", "c-epay-failed_other")}
         if len(set(ep.values())) != 2:
             fails.append(f"390: email pay row NOT stacked: {ep}")
+        ct = {k: m["fields"][k]["top"] for k in ("ct-outcome-1", "ct-dur-1", "ct-rang-1")}
+        if len(set(ct.values())) != 3:
+            fails.append(f"390: call-test report row NOT stacked into 3 lines: {ct}")
+        else:
+            print("390: call-test report row stacks to 3 full-width lines")
         pg.close()
         # ---- desktop: 1280px — must remain the multi-column layout
         pg = b.new_page(viewport={"width": 1280, "height": 900})
@@ -192,7 +198,8 @@ def main():
                            ("budget", ("j-budget", "j-mode", "j-deadline")),
                            ("per-minute", ("c-pm-rate", "c-pm-max")),
                            ("scheduled", ("c-sched-file", "c-tasks", "c-cadence", "c-est")),
-                           ("email-pay", ("c-epay-sent_completed", "c-epay-failed_other"))):
+                           ("email-pay", ("c-epay-sent_completed", "c-epay-failed_other")),
+                           ("call-test", ("ct-outcome-1", "ct-dur-1", "ct-rang-1"))):
             if not one_row(keys):
                 fails.append(f"1280: {name} row NOT one desktop row")
             else:
