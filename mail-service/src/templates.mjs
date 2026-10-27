@@ -44,7 +44,7 @@ const moneyStr = (cents) => "$" + (Number(cents || 0) / 100).toLocaleString("en-
 // row: a kind with no template stays queued, unsent and unburned.
 export const TEMPLATE_KINDS = new Set([
   "verify", "reset", "password_changed",
-  "job_posted", "bid_received", "job_awarded", "job_delivered",
+  "job_posted", "bid_received", "job_awarded", "job_delivered", "review_reminder",
   "payment_received", "payment_sent", "review_received",
   "dispute_opened", "dispute_resolved", "job_auto_refunded",
   "job_cancelled", "bid_not_selected",
@@ -183,22 +183,42 @@ ${SITE_URL}`;
   }
   if (row.kind === "job_delivered") {
     const pairs = [["Job", p.title || ""], ["Delivered by", p.agent_name || ""]];
+    if (p.review_deadline_text) pairs.push(["Review by", p.review_deadline_text]);
     const notesBit = p.notes ? `\nDelivery notes: ${p.notes}\n` : "";
     const notesHtml = p.notes ? `<p style="line-height:21px;color:#5c5c68;font-size:13px">Delivery notes: ${esc(p.notes)}</p>` : "";
+    const autoBit = p.review_deadline_text ? `\nYou have 48 hours to review. If you do nothing, the payment releases to the worker automatically at the deadline — to dispute, name a specific checklist item on the job page before then.\n` : "";
+    const autoHtml = p.review_deadline_text ? `<p style="line-height:21px"><strong>48-hour review window:</strong> if you do nothing, the payment releases to the worker automatically at the deadline. To dispute, name a specific checklist item on the job page before then.</p>` : "";
     const text = `Hi ${name},
 
 ${p.agent_name || "The worker"} has delivered your job.
 ${notesBit}
 ${detailText(pairs)}
-
+${autoBit}
 Download and check the complete files first — then release the payment from the job page:
 
 ${p.link}
 
 — Agent Exchange, a Nova company
 ${SITE_URL}`;
-    const html = wrapHtml("Your job was delivered", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.agent_name || "The worker")} has delivered your job.</p>${detailRows(pairs)}${notesHtml}<p style="line-height:21px">Download and check the complete files first — then release the payment from the job page.</p>${button(p.link, "Review the delivery")}`, `"${p.title || ""}" has been delivered by ${p.agent_name || "the worker"}.`, logoSrc);
+    const html = wrapHtml("Your job was delivered", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">${esc(p.agent_name || "The worker")} has delivered your job.</p>${detailRows(pairs)}${notesHtml}${autoHtml}<p style="line-height:21px">Download and check the complete files first — then release the payment from the job page.</p>${button(p.link, "Review the delivery")}`, `"${p.title || ""}" has been delivered by ${p.agent_name || "the worker"}.`, logoSrc);
     return { subject: `"${p.title}" has been delivered — review and release payment`, text, html };
+  }
+  if (row.kind === "review_reminder") {
+    const pairs = [["Job", p.title || ""], ["Time left", `${p.hours_left || ""} hours`]];
+    const text = `Hi ${name},
+
+Your delivered job is still waiting for your review.
+
+${detailText(pairs)}
+
+Approve it, or dispute a specific checklist item, before the window ends — when it ends, the payment releases to the worker automatically.
+
+${p.link}
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Review window ending soon", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Your delivered job is still waiting for your review.</p>${detailRows(pairs)}<p style="line-height:21px">Approve it, or dispute a specific checklist item, before the window ends — when it ends, the payment releases to the worker automatically.</p>${button(p.link, "Review the delivery")}`, `"${p.title || ""}" auto-releases in about ${p.hours_left || ""} hours unless you act.`, logoSrc);
+    return { subject: `"${p.title}" — about ${p.hours_left || ""} hours left to review before payment auto-releases`, text, html };
   }
   if (row.kind === "payment_received") {
     const pairs = [["Job", p.title || ""], ["Amount received", p.amount || ""], ["Wallet before", p.wallet_before || ""], ["Wallet now", p.wallet_after || ""]];
