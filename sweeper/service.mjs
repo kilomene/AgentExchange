@@ -100,10 +100,44 @@ const rpc = (fn, args) => curl("POST", `${REST}/rpc/${fn}`, args);
 const del = (path) => curl("DELETE", `${REST}/${path}`);
 
 async function notify(userId, type, body, link = "") {
+  // SHADOW-BAN SUPPRESSION (owner order 2026-10-27): a shadow-banned
+  // user receives NO notifications — the ban notice is inserted
+  // directly by applyShadowBanSweeper, never through here.
+  const u = await get(`ex_users?id=eq.${userId}&select=shadow_banned`).catch(() => null);
+  if (u && u[0] && u[0].shadow_banned) return;
   await post("ex_notifications", { user_id: userId, type, body, link, created_at: nowSec() });
 }
 async function queueMail(kind, user, payload) {
+  if (kind !== "shadow_ban_notice" && user && user.id) {
+    const u = await get(`ex_users?id=eq.${user.id}&select=shadow_banned`).catch(() => null);
+    if (u && u[0] && u[0].shadow_banned) return;
+  }
   await post("ex_outbox", { kind, to_email: user.email, to_name: user.name || null, subject: null, payload, created_at: nowSec() });
+}
+// AUTO SHADOW BAN, sweeper mirror of the API's applyShadowBan: flag +
+// case row with evidence pack + the ONE notice (notification and
+// email inserted directly, bypassing the suppression guards above).
+// Used when a dispute-default strike takes an account to 3 strikes.
+async function applyShadowBanSweeper(userId, trigger, reason) {
+  const rows = await get(`ex_users?id=eq.${userId}&select=id,email,name,strikes,shadow_banned`).catch(() => null);
+  const user = rows && rows[0];
+  if (!user || user.shadow_banned) return null;
+  const t = nowSec();
+  await patch(`ex_users?id=eq.${userId}`, { shadow_banned: true, shadow_banned_at: t });
+  const agents = await get(`ex_agents?owner_id=eq.${userId}&select=id,name,status,strikes,jobs_completed,earnings_cents`).catch(() => []);
+  const postedJobs = await get(`ex_jobs?poster_user_id=eq.${userId}&select=id,title,status,agreed_cents,delivered_at,delivery_sha256,delivery_check,delivery_checklist_map,dispute_reason,dispute_item_index,dispute_evidence,created_at&order=created_at.desc&limit=100`).catch(() => []);
+  const ledger = await get(`ex_ledger?user_id=eq.${userId}&select=id,type,amount_cents,ref,created_at&order=created_at.desc&limit=50`).catch(() => []);
+  const pack = { snapshot_at: t, user: { id: user.id, email: user.email, name: user.name, strikes: user.strikes }, agents, posted_jobs: postedJobs, ledger_refs: ledger, strikes: { account: user.strikes || 0 }, snapshot_by: "sweeper" };
+  const created = await post("ex_shadow_cases", { case_code: "", user_id: userId, trigger_rule: trigger, reason: String(reason || "").slice(0, 500), status: "active", evidence_pack: pack, created_by: "system", created_at: t }, "return=representation");
+  const caseId = created[0].id;
+  const code = `SB-${String(caseId).padStart(4, "0")}`;
+  await patch(`ex_shadow_cases?id=eq.${caseId}`, { case_code: code });
+  const appealHow = "To appeal, send evidence that you did not scam (screenshots or files plus a written explanation): humans email support@novamail.store with the case ID; agents use POST /agent/shadow-appeal with the case ID.";
+  await post("ex_notifications", { user_id: userId, type: "security", body: `Your account has been shadow-banned — case ${code}. Other users can no longer see your profile, your agents or your open jobs; your account keeps working for you, and you will receive no further notifications or emails while the ban stands. ${appealHow}`, link: "#/notifications", created_at: t });
+  if (user.email) await post("ex_outbox", { kind: "shadow_ban_notice", to_email: user.email, to_name: user.name || null, subject: null, payload: { name: user.name || "", case_id: code, rule: String(reason || trigger), trigger }, created_at: t });
+  await post("ex_admin_audit", { admin_user_id: 0, action: "shadow_ban", target_user_id: userId, detail: { trigger, case_code: code, via: "sweeper_auto" }, created_at: t }).catch(() => {});
+  console.log(`[sweeper] auto shadow ban applied to user ${userId} — case ${code} (${trigger})`);
+  return code;
 }
 async function walletOf(userId) {
   const rows = await get(`ex_wallets?user_id=eq.${userId}&select=balance_cents,held_cents`);
@@ -557,6 +591,11 @@ async function disputeDefaultResolve() {
       if (remainder > 0) await fundPool(feeRemainder).catch((e) => console.error(`dispute-default: pool fund failed for job ${job.id}:`, e.message));
       const posterRow = (await get(`ex_users?id=eq.${job.poster_user_id}&select=strikes`))[0];
       await patch(`ex_users?id=eq.${job.poster_user_id}`, { strikes: (posterRow?.strikes || 0) + 1 });
+      // AUTO SHADOW BAN: if that strike took the poster to 3, the
+      // account shadow-bans now (same case/pack/notice flow). The
+      // dispute notifications below are then suppressed for the
+      // poster by the guards — after the one ban notice, silence.
+      if (((posterRow?.strikes || 0) + 1) >= 3) await applyShadowBanSweeper(job.poster_user_id, "auto_3_strikes", "account reached 3 strikes").catch((e) => console.error("[sweeper] auto shadow ban failed:", e.message));
       const freshAgent = (await get(`ex_agents?id=eq.${agent.id}&select=jobs_completed,earnings_cents`))[0];
       if (freshAgent) await patch(`ex_agents?id=eq.${agent.id}`, { jobs_completed: (freshAgent.jobs_completed || 0) + 1, earnings_cents: (freshAgent.earnings_cents || 0) + (agreed - Number(job.fee_cents || 0)) });
       const reason = "No admin decision was made within 3 days after the dispute evidence round, so the verified delivery is presumed good and the payment released to the worker automatically (the fairness default).";
