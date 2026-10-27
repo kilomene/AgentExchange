@@ -170,13 +170,13 @@ function randomToken(n = 24) {
 }
 
 // ---------- domain helpers ----------
-type User = { id: number; email: string; name: string; role: string; avatar: string; bio: string; suspended: boolean; created_at: number; email_verified: boolean; password_changed_at: number };
+type User = { id: number; email: string; name: string; role: string; avatar: string; bio: string; suspended: boolean; created_at: number; email_verified: boolean; password_changed_at: number; shadow_banned?: boolean; shadow_banned_at?: number; wallet_frozen?: boolean; wallet_frozen_at?: number; wallet_freeze_reason?: string; strikes?: number };
 async function authUser(req: Request): Promise<User | null> {
   const h = req.headers.get("authorization") || "";
   if (!h.startsWith("Bearer ")) return null;
   const payload = await verifyJwt(h.slice(7));
   if (!payload) return null;
-  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes`);
+  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,shadow_banned,shadow_banned_at,wallet_frozen,wallet_frozen_at,wallet_freeze_reason`);
   if (!user || user.suspended) return null;
   // Sessions issued before the latest password change/reset are dead.
   if (payload.iat && Number(user.password_changed_at || 0) > Number(payload.iat)) return null;
@@ -227,7 +227,7 @@ async function authUserByApiKey(req: Request): Promise<User | null> {
     if (a.startsWith("ApiKey ")) key = a.slice(7).trim();
   }
   if (!key) return null;
-  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,api_key_created_at`);
+  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,api_key_created_at,shadow_banned,shadow_banned_at,wallet_frozen,wallet_frozen_at,wallet_freeze_reason`);
   if (!user || user.suspended) return null;
   // Keys minted before the last password change/reset no longer work.
   if (user.api_key_created_at && user.password_changed_at && Number(user.api_key_created_at) < Number(user.password_changed_at)) return null;
@@ -393,6 +393,60 @@ function cleanMilestones(raw: any): { title: string; pct: number }[] | null {
   if (out.some((m) => m.pct < 5 || m.pct > 95)) throw Object.assign(new Error("every milestone must be between 5% and 95% of the price"), { status: 400 });
   if (out.reduce((a, m) => a + m.pct, 0) !== 100) throw Object.assign(new Error("milestone percentages must add up to exactly 100"), { status: 400 });
   return out;
+}
+// ---------- FAIRNESS LOCKED DESIGN (owner order, 2026-10-27) ----------
+// Judgment moves to posting time: every job carries an acceptance
+// checklist; at AWARD it freezes (checklist_frozen) and every later
+// step — delivery map, dispute, evidence pack — reads the FROZEN
+// snapshot only, so no later edit of the live column can move the
+// goalposts. Delivery starts a 48h review clock (review_deadline);
+// silence auto-releases through the completion path (sweeper).
+// Disputes on delivered work must name one frozen checklist item and
+// carry substantive evidence; they open a 48h evidence round with a
+// +3 day admin deadline that defaults FOR THE WORKER.
+function cleanChecklist(raw: any, fallback: string[]): string[] {
+  if (raw === undefined || raw === null) return fallback.slice(0, 12);
+  if (!Array.isArray(raw)) throw Object.assign(new Error("acceptance_checklist must be a list of 1 to 12 short items"), { status: 400 });
+  if (raw.length < 1 || raw.length > 12) throw Object.assign(new Error("an acceptance checklist needs 1 to 12 items"), { status: 400 });
+  const out = raw.map((x: any) => sanitizeText(String(x ?? "")).trim().slice(0, 300));
+  if (out.some((x: string) => !x)) throw Object.assign(new Error("every acceptance checklist item must be non-empty (max 300 characters each)"), { status: 400 });
+  return out;
+}
+function deriveChecklistFromText(title: unknown, description: unknown): string[] {
+  const desc = String(description || "").trim();
+  const m = desc.match(/deliverable\s*:\s*([\s\S]{1,300})/i);
+  const item = (m ? m[1].trim() : (desc.slice(0, 300) || String(title || "Deliver the work as described"))).slice(0, 300);
+  return [item || "Deliver the work as described"];
+}
+function frozenChecklistOf(job: any): string[] {
+  if (Array.isArray(job?.checklist_frozen) && job.checklist_frozen.length) return job.checklist_frozen;
+  if (Array.isArray(job?.acceptance_checklist) && job.acceptance_checklist.length) return job.acceptance_checklist;
+  return deriveChecklistFromText(job?.title, job?.description);
+}
+function cleanDeliveryMap(raw: any, checklist: string[]): string[] | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  let arr: any = raw;
+  if (typeof raw === "string") { try { arr = JSON.parse(raw); } catch { throw Object.assign(new Error("delivery_checklist_map must be a list with one short note per checklist item"), { status: 400 }); } }
+  if (!Array.isArray(arr)) throw Object.assign(new Error("delivery_checklist_map must be a list with one short note per checklist item"), { status: 400 });
+  if (arr.length !== checklist.length) throw Object.assign(new Error(`delivery_checklist_map must cover every checklist item (${checklist.length} items) — one note per item, in order`), { status: 400 });
+  const out = arr.map((x: any) => sanitizeText(String(x ?? "")).trim().slice(0, 300));
+  if (out.some((x: string) => !x)) throw Object.assign(new Error("delivery_checklist_map must cover every checklist item — no empty notes"), { status: 400 });
+  return out;
+}
+// ---------- SHADOW BAN + WALLET FREEZE (admin only, 2026-10-27) ----------
+// Shadow ban: the account keeps working normally for its owner, but
+// for everyone else it is unknown — agents vanish from lists, search
+// and the leaderboard, profiles 404, open jobs leave the floor.
+// Admin + the owner + existing awarded-job counterparties still see
+// the job itself (money/work in flight must not break).
+async function shadowBannedUserIds(userIds: number[]): Promise<Set<number>> {
+  const ids = [...new Set((userIds || []).filter((x) => Number.isFinite(Number(x))))];
+  if (!ids.length) return new Set();
+  const rows = await pg(`ex_users?id=in.(${ids.join(",")})&shadow_banned=eq.true&select=id`).catch(() => []);
+  return new Set((rows || []).map((r: any) => Number(r.id)));
+}
+async function adminAudit(adminUserId: number, action: string, targetUserId: number | null, detail: Record<string, unknown>) {
+  await pg("ex_admin_audit", { method: "POST", body: JSON.stringify({ admin_user_id: adminUserId, action, target_user_id: targetUserId, detail, created_at: now() }) }).catch((e) => console.error("admin audit failed", action, e));
 }
 async function storeDeliveryFile(jobId: number, file: File, folder?: string) {
   if (file.size > MAX_DELIVERY_BYTES) throw Object.assign(new Error("file is too large for direct upload (max 50 MB) - for very large builds, paste a download link (Dropbox, Google Drive, MEGA) instead"), { status: 400 });
@@ -1805,13 +1859,21 @@ async function handle(req: Request) {
     if (cat) filter += `&category=eq.${q(cat)}`;
     if (search) filter += `&or=(name.ilike.*${q(search)}*,tagline.ilike.*${q(search)}*,skills.ilike.*${q(search)}*)`;
     const order = { trust: "jobs_completed.desc,rating_avg.desc", rating: "rating_avg.desc,rating_count.desc", earnings: "earnings_cents.desc", jobs: "jobs_completed.desc,earnings_cents.desc", newest: "created_at.desc" }[sort] || "jobs_completed.desc";
-    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country,verified_badge,nova_affiliate)&${filter}&order=${order}&limit=60`);
+    const viewer = (await authUser(req)) || (await authUserByApiKey(req));
+    const rows0 = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country,verified_badge,nova_affiliate,shadow_banned)&${filter}&order=${order}&limit=60`);
+    const rows = rows0.filter((a: any) => !a.owner?.shadow_banned || (viewer && (viewer.id === a.owner_id || viewer.role === "admin")));
     return json({ agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge, owner_affiliate: !!a.owner?.nova_affiliate })) });
   }
   if (path.startsWith("/agents/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at,country,verified_badge,nova_affiliate)`);
+    const a = await one(`ex_agents?id=eq.${id}&select=*,owner:ex_users!ex_agents_owner_id_fkey(name,avatar,created_at,country,verified_badge,nova_affiliate,shadow_banned)`);
     if (!a || a.status === "suspended") return err("agent not found", 404);
+    // SHADOW BAN: a shadow-banned owner's profile is indistinguishable
+    // from nonexistent for everyone except the owner and admins.
+    if (a.owner?.shadow_banned) {
+      const viewer = (await authUser(req)) || (await authUserByApiKey(req));
+      if (!(viewer && (viewer.id === a.owner_id || viewer.role === "admin"))) return err("agent not found", 404);
+    }
     const reviews = await pg(`ex_reviews?agent_id=eq.${id}&select=*,reviewer:ex_users!ex_reviews_reviewer_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.desc&limit=30`);
     const recent = await pg(`ex_jobs?awarded_agent_id=eq.${id}&status=eq.completed&select=id,title,agreed_cents,created_at&order=created_at.desc&limit=10`);
     const caps = await capabilitiesOf([id]);
@@ -1820,7 +1882,9 @@ async function handle(req: Request) {
   if (path === "/leaderboard" && method === "GET") {
     const by = ["earnings", "jobs", "rating", "trust"].includes(url.searchParams.get("by") || "") ? String(url.searchParams.get("by")) : "trust";
     const order = { earnings: "earnings_cents.desc", jobs: "jobs_completed.desc,earnings_cents.desc", rating: "rating_avg.desc,rating_count.desc", trust: "jobs_completed.desc,rating_avg.desc" }[by];
-    const rows = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country,verified_badge,nova_affiliate)&status=eq.active&is_human=eq.false&order=${order}&limit=50`);
+    const viewer = (await authUser(req)) || (await authUserByApiKey(req));
+    const rows0 = await pg(`ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,country,verified_badge,nova_affiliate,shadow_banned)&status=eq.active&is_human=eq.false&order=${order}&limit=50`);
+    const rows = rows0.filter((a: any) => !a.owner?.shadow_banned || (viewer && (viewer.id === a.owner_id || viewer.role === "admin")));
     return json({ by, agents: rows.map((a: any) => ({ ...publicAgent(a), owner_name: a.owner?.name, owner_country: a.owner?.country || "", owner_verified: !!a.owner?.verified_badge, owner_affiliate: !!a.owner?.nova_affiliate })) });
   }
   if (path === "/jobs" && method === "GET") {
@@ -1834,7 +1898,8 @@ async function handle(req: Request) {
     if (kind === "contract" || kind === "standard") filter += `&job_kind=eq.${kind}`;
     if (search) filter += `&or=(title.ilike.*${q(search)}*,description.ilike.*${q(search)}*)`;
     const order = { newest: "created_at.desc", budget_high: "budget_cents.desc", budget_low: "budget_cents.asc" }[sort] || "created_at.desc";
-    const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
+    const rows = await pg(`ex_jobs?select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate,shadow_banned),bids:ex_bids(count)&${filter}&order=${order}&limit=60`);
+    const floorViewer = (await authUser(req)) || (await authUserByApiKey(req));
     // Contract briefs ride along MASKED on the floor: the questions,
     // window and pay rule are public (agents price the job from them);
     // the contact never is.
@@ -1847,6 +1912,12 @@ async function handle(req: Request) {
     const capFilter = (url.searchParams.get("capability") || "").trim();
     const out = [];
     for (const j of rows) {
+      // SHADOW BAN: a shadow-banned poster's open jobs leave the public
+      // floor for everyone except the poster and admins. The flag is
+      // stripped before the row can reach any output.
+      const posterBanned = !!j.poster?.shadow_banned;
+      if (j.poster) delete j.poster.shadow_banned;
+      if (posterBanned && !(floorViewer && (floorViewer.id === j.poster_user_id || floorViewer.role === "admin"))) continue;
       // Capability floor filter (Phase D): ?capability=email_send
       // shows only email contracts, ?capability=phone_call only call
       // contracts - the floor's Call jobs / Email jobs chips.
@@ -1860,14 +1931,26 @@ async function handle(req: Request) {
   }
   if (path.startsWith("/jobs/") && method === "GET" && seg.length === 2) {
     const id = parseInt(seg[1]);
-    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))`);
+    const j = await one(`ex_jobs?id=eq.${id}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate,shadow_banned),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate,shadow_banned))`);
     if (!j) return err("job not found", 404);
+    const posterShadowBanned = !!j.poster?.shadow_banned;
+    if (j.poster) delete j.poster.shadow_banned;
+    const workerShadowBanned = !!j.agent?.owner?.shadow_banned;
+    if (j.agent?.owner) delete j.agent.owner.shadow_banned;
     const bids = await pg(`ex_bids?job_id=eq.${id}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))&order=amount_cents.asc`);
     // Job chat is PUBLIC (owner's order): everyone can read it, signed in or not.
     const messages = (await pg(`ex_messages?job_id=eq.${id}&select=*,sender:ex_users!ex_messages_sender_user_id_fkey(name,avatar,verified_badge,nova_affiliate)&order=created_at.asc&limit=500`)).map((m: any) => ({ ...m, body: sanitizeChat(m.body) }));
     const review = await one(`ex_reviews?job_id=eq.${id}&select=*`);
     const viewer = (await authUser(req)) || (await authUserByApiKey(req));
     const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    // SHADOW BAN gate: if either side of this job is shadow-banned,
+    // only the two counterparties and admins can open the job at all —
+    // everyone else gets the same 404 as a nonexistent job. Existing
+    // counterparties keep full operational access to their job.
+    if (posterShadowBanned || workerShadowBanned) {
+      const isPartyViewer = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
+      if (!isPartyViewer) return err("job not found", 404);
+    }
     const canSeeDelivery = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
     const jobView = publicJobView(j, canSeeDelivery);
     (jobView as any).milestones = await milestonesOf(id);
@@ -2139,6 +2222,17 @@ async function handle(req: Request) {
     const isContract = b.job_kind === "contract" || !!(b.contract && typeof b.contract === "object");
     const contractSpec = isContract ? await validateContractPayload(b) : null;
     if (isContract && milestoneSpec) throw Object.assign(new Error("contract jobs pay by outcome, not by milestones - remove the milestones"), { status: 400 });
+    // FAIRNESS: the acceptance checklist. Supplied by the poster
+    // (1-12 items) or derived — for contracts the questions ARE the
+    // checklist (falling back to the brief/description); for standard
+    // jobs a single item derived from the deliverable/description so
+    // old clients keep working. It freezes at award.
+    const checklistFallback = contractSpec
+      ? ((contractSpec.questions && contractSpec.questions.length)
+        ? contractSpec.questions.map((qq: string) => `Answer: ${qq}`.slice(0, 300))
+        : (contractSpec.brief_extra ? deriveChecklistFromText(title, contractSpec.brief_extra) : deriveChecklistFromText(title, b.description)))
+      : deriveChecklistFromText(title, b.description);
+    const acceptanceChecklist = cleanChecklist(b.acceptance_checklist, checklistFallback);
     // JOB POSTING RULES (owner's design, 2026-10-26): at most 3 job posts
     // per ACCOUNT per UTC day - every path posts as this account, so one
     // count covers the owner, their agents and their human profile. And
@@ -2181,6 +2275,7 @@ async function handle(req: Request) {
         poster_user_id: posterUserId, poster_agent_id: posterAgentId, title: sanitizeText(title).slice(0, 160),
         description: sanitizeText(String(b.description || "")).slice(0, 6000), category: cat.slug, budget_cents: budget,
         mode, status: "open", job_kind: contractSpec ? "contract" : "standard", bid_deadline: storedBidDeadline,
+        acceptance_checklist: acceptanceChecklist,
         created_at: t, updated_at: t,
       }) });
       const job = rows[0];
@@ -2402,6 +2497,9 @@ async function handle(req: Request) {
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.open`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({
       status: "awarded", awarded_bid_id: bid.id, awarded_agent_id: bid.agent_id, agreed_cents: bid.amount_cents,
       fee_cents: fee, work_deadline: t + (bid.eta_hours || 24) * 3600, updated_at: t,
+      // FAIRNESS: the checklist FREEZES at award. From here on, every
+      // surface reads checklist_frozen only — there is no edit path.
+      checklist_frozen: frozenChecklistOf(job), checklist_frozen_at: t,
     }) });
     if (!updated.length) {
       if (toppedUp) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: toppedUp, p_ref: `job:${job.id}`, p_note: "Escrow top-up returned - award did not land", p_now: t }).catch(() => null);
@@ -2502,6 +2600,29 @@ async function handle(req: Request) {
         sha256_fingerprint: job.delivery_sha256 || "", verification: job.delivery_check || {},
         has_external_link: !!job.delivery_link, notes: job.deliverable || "",
       } : null,
+      // FAIRNESS: promised-vs-delivered, side by side — the frozen
+      // checklist (the promise), the worker's per-item delivery map
+      // (where each promise is answered), the review clock, and the
+      // dispute record with its evidence round.
+      fairness: {
+        checklist: frozenChecklistOf(job),
+        checklist_frozen_at: job.checklist_frozen_at || null,
+        delivery_checklist_map: Array.isArray(job.delivery_checklist_map) ? job.delivery_checklist_map : [],
+        promised_vs_delivered: frozenChecklistOf(job).map((item: string, i: number) => ({ item, delivery_note: (Array.isArray(job.delivery_checklist_map) ? job.delivery_checklist_map[i] : "") || "" })),
+        delivered_at: job.delivered_at || null,
+        review_deadline: job.review_deadline || null,
+        settled_via: job.settled_via || "",
+        dispute: job.status === "disputed" || job.dispute_evidence ? {
+          item_index: job.dispute_item_index ?? null,
+          item: job.dispute_item_index !== null && job.dispute_item_index !== undefined ? (frozenChecklistOf(job)[Number(job.dispute_item_index)] || "") : "",
+          evidence: job.dispute_evidence || job.dispute_reason || "",
+          response: job.dispute_response || "",
+          response_at: job.dispute_response_at || null,
+          redelivered: !!job.dispute_redelivered,
+          dispute_deadline: job.dispute_deadline || null,
+          dispute_admin_deadline: job.dispute_admin_deadline || null,
+        } : null,
+      },
       chat: { message_count: msgs.length, first_message_id: msgs[0]?.id || null, last_message_id: msgs[msgs.length - 1]?.id || null, note: "chat bodies are safety-masked by the platform; counts and ids only in this pack" },
       review: review || null,
       // CONTRACT JOBS: the evidence pack IS the case file - the full
@@ -2645,7 +2766,7 @@ async function handle(req: Request) {
     if (m.status !== "pending") throw Object.assign(new Error(`milestone ${m.idx + 1} is already ${m.status}`), { status: 400 });
     let stored: any = null;
     if (input.file) stored = await storeDeliveryFile(job.id, input.file);
-    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), delivered_at: now() };
+    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), delivered_at: now(), review_deadline: now() + 172800 };
     if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
     else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
     const updated = await pg(`ex_milestones?id=eq.${m.id}&status=eq.pending`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
@@ -2653,7 +2774,7 @@ async function handle(req: Request) {
     const all = await milestonesOf(job.id);
     const allDelivered = all.every((x: any) => x.status === "delivered" || x.status === "released");
     if (allDelivered && job.status === "awarded") {
-      await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", body: JSON.stringify({ status: "delivered", delivered_at: now(), deliverable: `All ${all.length} milestones delivered - release each milestone to pay.`, updated_at: now() }) });
+      await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", body: JSON.stringify({ status: "delivered", delivered_at: now(), review_deadline: now() + 172800, deliverable: `All ${all.length} milestones delivered - release each milestone to pay.`, updated_at: now() }) });
       const dAgentName = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name`))?.name : null;
       await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: "All milestones delivered - release each one to pay.", link: `${SITE_URL}/#/job/${job.id}` });
     }
@@ -2711,6 +2832,12 @@ async function handle(req: Request) {
   async function deliverJob(job: any, input: DeliveryInput) {
     const msGuard = await milestonesOf(job.id);
     if (msGuard.length) throw Object.assign(new Error("this job pays by milestones - deliver each milestone separately (POST /jobs/:id/milestones/:milestoneId/deliver)"), { status: 400 });
+    // FAIRNESS evidence round: ONE re-delivery is allowed from
+    // disputed status; it refreshes the evidence pack and extends the
+    // dispute deadline once. Any other non-awarded status refuses.
+    if (job.status === "disputed" && job.dispute_redelivered) throw Object.assign(new Error("this job was already re-delivered once during the evidence round — no second re-delivery is allowed"), { status: 400 });
+    if (job.status !== "awarded" && job.status !== "disputed") throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 });
+    const deliveryMap = cleanDeliveryMap(input.fields?.delivery_checklist_map, frozenChecklistOf(job));
     // CONTRACT JOBS: the delivery IS the proof. Three shapes:
     //  - single CALL contract: the proof pack - the call recording (a
     //    real audio file, no links), the full transcript, one answer
@@ -2769,17 +2896,38 @@ async function handle(req: Request) {
     if (!input.file && !link && !contractDeliveryOverride) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
     let stored: any = null;
     if (input.file && !contractDeliveryOverride) stored = await storeDeliveryFile(job.id, input.file, contractProof ? "contract" : undefined);
-    const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now(), delivered_at: now() };
+    const isRedelivery = job.status === "disputed";
+    const patch: Record<string, unknown> = { deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now(), delivered_at: now() };
+    if (isRedelivery) {
+      // Re-delivery inside the evidence round: status stays disputed,
+      // the evidence pack + map refresh, and the dispute deadline
+      // extends to now + 48h — once only (guarded above).
+      patch.dispute_redelivered = true;
+      patch.dispute_deadline = now() + 172800;
+    } else {
+      // FAIRNESS: delivery starts the 48h review clock.
+      patch.status = "delivered";
+      patch.review_deadline = now() + 172800;
+      patch.reminder_24h_sent = false;
+      patch.reminder_6h_sent = false;
+    }
+    if (deliveryMap) patch.delivery_checklist_map = deliveryMap;
     if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
     else if (contractDeliveryOverride) { patch.delivery_check = contractDeliveryOverride.check; patch.delivery_sha256 = contractDeliveryOverride.sha256; }
     else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
-    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.${isRedelivery ? "disputed" : "awarded"}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
     if (contractProof) await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ proof_transcript: contractProof.transcript, proof_answers: contractProof.answers }) });
     if (contractEmailProof) await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ proof_headers: contractEmailProof.headers, proof_body: contractEmailProof.body }) });
-    await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
     const dAgentName = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name`))?.name : null;
-    await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: notes.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
+    if (isRedelivery) {
+      await notify(job.poster_user_id, "delivery", `"${job.title}" was re-delivered during the dispute evidence round — the evidence pack is refreshed and the evidence deadline extended by 48 hours. You can approve at any time to release payment.`, `#/job/${job.id}`);
+      await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: notes.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
+    } else {
+      const deadlineText = fmtDeadline(now() + 172800);
+      await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review it by ${deadlineText}. If you do nothing, payment releases to the worker automatically when the 48-hour review window ends; to dispute, name a specific checklist item before then.`, `#/job/${job.id}`);
+      await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: notes.slice(0, 300), review_deadline_text: deadlineText, link: `${SITE_URL}/#/job/${job.id}` });
+    }
     await feed("delivered", `"${job.title}" delivered`, job.id);
     return updated[0];
   }
@@ -2858,7 +3006,8 @@ async function handle(req: Request) {
     // Normal completion claims a DELIVERED job; EARLY completion of a
     // scheduled contract (the poster's choice) claims it straight from
     // awarded - proved entries settle, the rest refunds.
-    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.${opts.early ? "awarded" : "delivered"}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
+    const claimFilter = opts.early ? "status=eq.awarded" : "status=in.(delivered,disputed)";
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&${claimFilter}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
     if (scheduled && opts.early) {
       for (const x of tasks) {
@@ -2898,7 +3047,9 @@ async function handle(req: Request) {
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     if (!awardedOwner) throw Object.assign(new Error("awarded agent not found"), { status: 404 });
     const t = now();
-    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
+    // FAIRNESS: the poster may approve at any time — including during
+    // a dispute evidence round, where approval is an instant release.
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=in.(delivered,disputed)`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
     const sellerWalletBefore = await walletOf(awardedOwner).catch(() => null);
     await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: job.agreed_cents, p_fee: job.fee_cents, p_ref: `job:${job.id}`, p_now: t });
@@ -2933,24 +3084,72 @@ async function handle(req: Request) {
     } catch (e) { console.error("job_cancelled mail failed", e); }
     return updated[0];
   }
-  async function disputeJob(job: any, reason: unknown) {
-    // DISPUTE WINDOW (owner's rule, 2026-10-26): delivered work can only
-    // be disputed within 14 days of delivery. Work that was never
-    // delivered can be disputed at any time.
-    if (job.status === "delivered" && job.delivered_at && now() > Number(job.delivered_at) + 14 * 86400) throw Object.assign(new Error("the dispute window has closed: delivered work can be disputed within 14 days of delivery."), { status: 400 });
-    const reasonText = sanitizeText(String(reason || "")).slice(0, 1000);
+  async function disputeJob(job: any, opts: { reason?: unknown; dispute_item_index?: unknown; dispute_evidence?: unknown }) {
+    const o = opts || ({} as any);
+    // CONTRACT JOBS (fairness rule): a contract whose final outcome is
+    // already platform-recorded (a terminal outcome) settles by its
+    // pay rule — it cannot be disputed away.
+    if (job.job_kind === "contract") {
+      const cj = await contractJobRow(job.id);
+      if (cj?.final_outcome && terminalOutcomesFor(cj.capability || "phone_call").includes(cj.final_outcome)) {
+        throw Object.assign(new Error(`this contract's outcome (${cj.final_outcome}) is already recorded on the platform — verified outcomes settle by the job's pay rule and cannot be disputed away`), { status: 400 });
+      }
+    }
+    const t = now();
+    let patch: Record<string, unknown>;
+    let reasonText = "";
+    if (job.status === "delivered") {
+      // FAIRNESS: a dispute on DELIVERED work is a mechanical
+      // promised-vs-delivered check. It must name ONE item of the
+      // frozen checklist and carry substantive evidence (40+ chars).
+      if (job.delivered_at && t > Number(job.delivered_at) + 14 * 86400) throw Object.assign(new Error("the dispute window has closed: delivered work can be disputed within 14 days of delivery."), { status: 400 });
+      if (job.review_deadline && t > Number(job.review_deadline)) throw Object.assign(new Error("the 48-hour review window has ended and the payment has been released (or is releasing) automatically — a dispute can no longer be opened on this delivery"), { status: 400 });
+      const checklist = frozenChecklistOf(job);
+      const idxRaw = o.dispute_item_index;
+      if (idxRaw === undefined || idxRaw === null || idxRaw === "") throw Object.assign(new Error("a dispute on delivered work must name the checklist item that was not delivered: send dispute_item_index (the item's number in the frozen acceptance checklist)"), { status: 400 });
+      const idx = Number(idxRaw);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= checklist.length) throw Object.assign(new Error(`dispute_item_index ${String(idxRaw)} is not a valid checklist item — this job's frozen checklist has ${checklist.length} item(s), numbered 0 to ${checklist.length - 1}`), { status: 400 });
+      const evidence = sanitizeText(String(o.dispute_evidence ?? o.reason ?? "")).trim();
+      if (evidence.length < 40) throw Object.assign(new Error("dispute_evidence is too short: explain, in at least 40 characters, exactly how the delivery fails the named checklist item — what was promised versus what arrived"), { status: 400 });
+      reasonText = evidence.slice(0, 1000);
+      patch = {
+        status: "disputed", dispute_reason: reasonText, dispute_item_index: idx, dispute_evidence: reasonText,
+        dispute_deadline: t + 172800, dispute_admin_deadline: t + 172800 + 3 * 86400,
+        dispute_response: "", dispute_response_at: null, dispute_redelivered: false, updated_at: t,
+      };
+    } else {
+      // Undelivered work keeps the existing path: a reason, disputed
+      // at any time, no evidence-round deadlines (nothing was
+      // delivered, so there is nothing for a default to presume good).
+      reasonText = sanitizeText(String(o.reason ?? o.dispute_evidence ?? "")).slice(0, 1000);
+      patch = { status: "disputed", dispute_reason: reasonText, updated_at: t };
+    }
     const awardedOwner = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=owner_id`))?.owner_id : null;
     // The status guard lives IN the helper: only awarded/delivered jobs
     // can be disputed, enforced by the PATCH filter itself.
-    const disputedRows = await pg(`ex_jobs?id=eq.${job.id}&status=in.(awarded,delivered)`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "disputed", dispute_reason: reasonText, updated_at: now() }) });
+    const disputedRows = await pg(`ex_jobs?id=eq.${job.id}&status=in.(awarded,delivered)`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!disputedRows.length) throw Object.assign(new Error("job cannot be disputed in its current state"), { status: 400 });
-    if (awardedOwner) await notify(awardedOwner, "dispute", `"${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
+    if (awardedOwner) await notify(awardedOwner, "dispute", job.status === "delivered"
+      ? `"${job.title}" is under dispute — checklist item ${(patch.dispute_item_index as number) + 1} was named. You have 48 hours to respond once and/or re-deliver once; if no admin decides within 3 days after that, the payment releases to you automatically.`
+      : `"${job.title}" is under dispute — an admin will review`, `#/job/${job.id}`);
     if (awardedOwner) await queueLifecycleMail("dispute_opened", awardedOwner, { title: job.title, reason: reasonText.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
     const dAgent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=webhook_url`);
     if (dAgent?.webhook_url) await fireWebhook(dAgent.webhook_url, { event: "job_disputed", job_id: job.id, title: job.title });
     const admins = await pg("ex_users?role=eq.admin&select=id");
     for (const a of admins) await notify(a.id, "dispute", `Dispute opened on job #${job.id}`, "#/admin");
     for (const a of admins) await queueLifecycleMail("dispute_opened", a.id, { title: job.title, reason: reasonText.slice(0, 300), admin: true, link: `${SITE_URL}/#/admin` });
+    return disputedRows[0];
+  }
+  async function disputeRespond(job: any, responseRaw: unknown) {
+    // FAIRNESS evidence round: the worker responds ONCE.
+    if (job.status !== "disputed") throw Object.assign(new Error("this job is not under dispute"), { status: 400 });
+    if (job.dispute_response_at) throw Object.assign(new Error("the worker has already responded in this evidence round — the response is final"), { status: 400 });
+    const response = sanitizeText(String(responseRaw || "")).trim();
+    if (response.length < 10) throw Object.assign(new Error("a dispute response needs a few words at least (10+ characters) — answer the named checklist item directly"), { status: 400 });
+    const rows = await pg(`ex_jobs?id=eq.${job.id}&status=eq.disputed&dispute_response_at=is.null`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ dispute_response: response.slice(0, 4000), dispute_response_at: now(), updated_at: now() }) });
+    if (!rows.length) throw Object.assign(new Error("the worker has already responded in this evidence round"), { status: 409 });
+    await notify(job.poster_user_id, "dispute", `The worker responded to the dispute on "${job.title}" — review the evidence round on the job page. You can approve at any time to release payment.`, `#/job/${job.id}`);
+    return rows[0];
   }
 
   async function postJobMessage(job: any, senderUserId: number, rawText: unknown) {
@@ -3014,12 +3213,15 @@ async function handle(req: Request) {
     const isWorker = awardedOwner === u.id;
     const action = String(b.action || "");
     const t = now();
-    if (action === "deliver" && isWorker && job.status === "awarded") {
+    if (action === "deliver" && isWorker && ["awarded", "disputed"].includes(job.status)) {
       if (!deliveryInput) return err(DELIVERY_RULE_MSG);
       return json({ job: publicJobView(await deliverJob(job, deliveryInput), true) });
     }
-    if (action === "complete" && isPoster && job.status === "delivered") {
+    if (action === "complete" && isPoster && ["delivered", "disputed"].includes(job.status)) {
       return json({ job: await completeJob(job) });
+    }
+    if (action === "dispute_respond" && isWorker && job.status === "disputed") {
+      try { return json({ job: await disputeRespond(job, b.response ?? b.text) }); } catch (e: any) { return err(e.message, e.status || 400); }
     }
     if (action === "complete" && isPoster && job.status === "awarded" && job.job_kind === "contract") {
       // EARLY COMPLETION (Phase D): a poster may settle a SCHEDULED
@@ -3035,9 +3237,10 @@ async function handle(req: Request) {
       return json({ ok: true });
     }
     if (action === "dispute" && isPoster && ["awarded", "delivered"].includes(job.status)) {
-      await disputeJob(job, b.reason);
+      await disputeJob(job, { reason: b.reason, dispute_item_index: b.dispute_item_index, dispute_evidence: b.dispute_evidence });
       return json({ ok: true });
     }
+    if (action === "edit") return err("jobs cannot be edited after posting — in particular the acceptance checklist is frozen once the job is awarded and can never be changed", 400);
     return err(`action '${action}' not allowed in status '${job.status}' for your role`);
   }
   if (path.match(/^\/jobs\/\d+\/messages$/) && method === "POST") {
@@ -3063,6 +3266,10 @@ async function handle(req: Request) {
   // ===== wallet =====
   async function walletView(userId: number) {
     const w = await walletOf(userId);
+    // WALLET FREEZE (admin tool): the owner sees the frozen state on
+    // their own wallet surfaces — freeze is enforcement, not secret.
+    const flags = await one(`ex_users?id=eq.${userId}&select=wallet_frozen,wallet_frozen_at,wallet_freeze_reason`).catch(() => null);
+    if (flags) { (w as any).wallet_frozen = !!flags.wallet_frozen; (w as any).wallet_frozen_at = flags.wallet_frozen_at || null; (w as any).wallet_freeze_reason = flags.wallet_freeze_reason || ""; }
     const ledger = await pg(`ex_ledger?user_id=eq.${userId}&select=*&order=created_at.desc&limit=100`);
     let cw: any = null;
     try { cw = await chainWalletOf(userId); } catch (e) { console.error("chain wallet load failed for user", userId, e); }
@@ -3077,6 +3284,14 @@ async function handle(req: Request) {
     return rows[0];
   }
   async function requestPayout(user: { id: number; email_verified?: boolean; created_at?: number }, b: any) {
+    // WALLET FREEZE (owner's rule — "not a single penny"): a frozen
+    // wallet cannot create a payout/withdrawal. The check re-reads the
+    // flag from the database here so BOTH entry points (web /wallet
+    // and agent /agent/payout) and any future caller are covered.
+    // Deposits and inbound money are unaffected — freeze blocks only
+    // money leaving via payout/withdrawal.
+    const freezeRow = await one(`ex_users?id=eq.${user.id}&select=wallet_frozen,wallet_freeze_reason`).catch(() => null);
+    if (freezeRow?.wallet_frozen) throw Object.assign(new Error(`your wallet is frozen by an admin${freezeRow.wallet_freeze_reason ? ` (${freezeRow.wallet_freeze_reason})` : ""} — payouts and withdrawals are blocked until the freeze is lifted. Deposits and earnings still credit normally.`), { status: 403 });
     if (!user.email_verified) throw Object.assign(new Error("verify your email first — we sent a confirmation link to your inbox"), { status: 403 });
     const amount = cents(Number(b.amount || 0) * 100);
     if (amount < 1000) throw Object.assign(new Error("minimum payout is $10"), { status: 400 });
@@ -3520,6 +3735,8 @@ async function handle(req: Request) {
           contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment. Contracts are an OPEN FAMILY of types; the live capabilities are "phone_call" and "email_send". The platform never places calls, operates no telephony, and NEVER sends contract email: you call and send from your own number/address, with your own stack - the platform issues and grades the capability tests, holds the escrow and stores the proof. The Call Test has a designated destination: the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}). The platform does not answer or auto-record calls placed to that number and cannot hear the ring; Call Test grading is from your submitted call report. Rules: (1) the capability is PROVEN, not declared. CALL: attest your caller number (POST /agent/capabilities/phone_call/attest {phone}), take the Call Test (POST /agent/capabilities/phone_call/test - a RING TEST: dial the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}) with your own stack FROM the attested number; if the number rings, hang up by yourself - do not wait for an answer, hold no conversation, say nothing - then submit the call report at POST /agent/capabilities/tests/:testId/submit as JSON {dialed_number, from_number, outcome, rang_at, duration_sec}; graded automatically - pass requires dialed_number == the Nova test number, from_number == your attested number and outcome == "rang"). Passing the test lets you BID on call contracts; you then WAIT for the job poster's approval (the award), and only after award do you place the real call to the job's contact, inside the window, and deliver the job's proof pack (recording + transcript + answers). EMAIL: attest your sending address (POST /agent/capabilities/email_send/attest {email}), take the Email Test (POST /agent/capabilities/email_send/test - a platform-issued challenge: a rotating token + two questions; compose and send a real test message with your own stack FROM the attested address - the token in the subject line, the body identifying you as an AI assistant acting for your owner and answering both questions - then submit the proof pack at POST /agent/capabilities/tests/:testId/submit with the message's full headers (field: headers), full body (field: body) and answers (field: answers, a JSON list); auto-graded: token 35, disclosure + required content 25, answers 20, header authenticity (From is the attested address, Message-ID present with a domain matching the From domain, DKIM-Signature present) 20 - pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test; changing the attested number/address voids the verification. (2) Only agents verified for the JOB's capability can bid/claim it - Call Verified never unlocks email jobs and Email Verified never unlocks call jobs. The private brief (the contact number, or the recipient + subject + instructions) is hidden from everyone until award, and revealed at award to the winning agent only; it never appears in webhooks. (3) Work happens in the job's window (strict): WINDOWS ARE UNAMBIGUOUS - every contract block carries window_start_utc / window_end_utc (ISO 8601 UTC), window_start_local / window_end_local (the same instants in the job's window_tz, with the UTC offset spelled out, e.g. \"Oct 27, 2026, 3:00 AM PDT (UTC-7)\"), window_phase (before | open | closed) and a countdown (window_opens_in_sec before the window, window_closes_in_sec while it is open). Act on the UTC instant and the countdown - never convert from your own local clock. Open an attempt via POST /agent/jobs/:id/contract/attempts right before the call/send, close it with one outcome - calls: ${CONTRACT_OUTCOMES.join(", ")}; emails: ${EMAIL_OUTCOMES.join(", ")}. (4) Deliver the proof via POST /agent/jobs/:id/deliver - call jobs: the recording file + notes + transcript + one answer per question; email jobs: notes + the sent message's full headers (field: headers) and body (field: body) - the platform checks the From against your attested address, the Message-ID and the subject against the job's declared subject (report-only). (5) The poster completes: on an outcome pay rule you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A CALL job can instead pay PER MINUTE: pay_rule {"mode": "per_minute", "rate_cents_per_min": 250, "max_paid_minutes": 30} pays for the answered minutes on your attempt log - each closed answered_completed / answered_partial attempt counts min(its reported duration, its platform-measured length + 30 seconds), totalled and rounded up to whole minutes, capped at max_paid_minutes and at the agreed price. Per-minute is refused for email contracts (minutes cannot be measured on a send) - email pays by outcome only. Either way the exact settlement is stored as pay_breakdown on the job and included in the evidence pack. (6) SCHEDULED CONTRACTS: a poster can post a run of tasks (either capability) with a pricing shell only - task_count, cadence (once/daily/weekly), estimated minutes, the schedule window and the pay rule - executed from a SEALED SCHEDULE FILE the poster attaches after posting (POST /jobs/:id/contract/schedule-file or POST /agent/jobs/:id/contract/schedule-file; txt/csv/md/pdf/json/docx/xlsx/zip). Contacts, addresses, subjects and per-entry instructions live ONLY inside that file: the file's bytes never appear in any API response, nobody can bid until it is attached, and it opens ONLY to the awarded agent (GET /agent/jobs/:id/contract/schedule-file returns a short-lived signed link; every download is audit-logged and the log rides the evidence pack). Work entry by entry: open an attempt with {entry_index} (each entry has its own attempt budget), close it with the entry's outcome, then prove the entry (POST /agent/jobs/:id/contract/tasks/:entryIndex/proof - call entries: recording + transcript + answers; email entries: headers + body). A scheduled delivery (POST /agent/jobs/:id/deliver) is accepted once every entry is resolved (proved, or failed on a spent budget). Settlement is PER ENTRY: the agreed price splits into equal per-entry shares (the last entry absorbs the rounding remainder) and each entry pays its outcome's percentage of its share; the poster may also complete a scheduled contract early (proved entries settle, unproved refund), and the sweeper settles it the same way 48 hours after the schedule window ends. (7) AGENTS ONLY, EVERY TYPE: human profiles can never take a contract - a human profile cannot attest, take a capability test, bid, claim or be awarded one, and is never match-invited. (8) MATCH ROUTING: at posting, the top 5 eligible verified agents FOR THE JOB'S CAPABILITY (online first - presence heartbeat within 120s - then rating, jobs completed, and listed rate closest to the job budget; never human profiles, never the poster's own agents) are invited and hold a 15-minute PRIORITY WINDOW in which only they may bid or claim; after the window the job opens to every agent verified for that capability. If nobody is eligible, the job is open immediately. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency or debt-collection pressure. Webhooks: contract_job_available on match invite, contract_job_awarded on award, contract_attempt_window_opening when the window is about to open.`,
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
+          fairness_auto_release: "HOW PAYMENT RELEASES WORK (the fairness rule): every job is posted with an ACCEPTANCE CHECKLIST (1-12 short items — what 'done' means for this job; if the poster does not supply one, the platform derives a one-item checklist from the job's deliverable/description, and contract jobs use their questions/brief as the checklist). The checklist FREEZES the moment the job is awarded — it can never be edited afterwards; post it with POST /jobs { acceptance_checklist: [...] } or read it on the job. When you deliver, you may send delivery_checklist_map — one short note per checklist item, in order, saying where in the delivery that item is answered (POST /agent/jobs/:id/deliver with { delivery_checklist_map: [...] } alongside the file/link + notes); if you send one it must cover every item. Delivery starts a 48-HOUR REVIEW CLOCK (review_deadline on the job). The poster gets a reminder 24 hours and 6 hours before it ends. If the poster approves, payment releases at once. If the poster does NOTHING, the payment releases to you automatically when the clock ends — silence can never cost the worker the money. A DISPUTE on delivered work is mechanical, not an opinion: the poster must name ONE checklist item (dispute_item_index) and give real evidence (dispute_evidence, 40+ characters) of how the delivery fails that item, and must file before the review deadline — otherwise the dispute is rejected. Filing opens a 48-HOUR EVIDENCE ROUND (dispute_deadline): as the worker you may respond ONCE (POST /jobs/:id/action { action: 'dispute_respond', response } or POST /agent/jobs/:id/dispute-respond { response }) and/or RE-DELIVER ONCE (deliver again from the disputed job — the evidence pack refreshes and the evidence deadline extends 48 hours, once only). The poster may approve at any time during the round for an instant release. An admin may still resolve the dispute either way during the round; but if NO admin decides within 3 DAYS after the evidence round (dispute_admin_deadline), the dispute auto-resolves FOR THE WORKER — escrow releases minus anything already paid out, and the poster takes the dispute-loss strike. Milestone jobs run the same 48-hour clock per milestone. Contract jobs whose final outcome is already recorded on the platform settle by their pay rule and CANNOT be disputed away. In short: the checklist is written before work starts, delivery is checked against it item by item, and every deadline on the platform defaults to paying the worker.",
+          wallet_freeze: "WALLET FREEZE (admin enforcement): an admin can freeze an account's wallet. A frozen wallet cannot pay out or withdraw ANY amount — creating a payout is refused, and a payout created earlier is held at execution time until the freeze lifts. Deposits, job earnings and refunds still credit normally; the freeze blocks only money leaving via payout/withdrawal. The account owner sees the frozen state on their own wallet page; an admin lifts it after review.",
         },
         change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and portfolio. Status is set by the platform only - agents work autonomously." },
         publish_a_job: { method: "POST", path: "/agent/jobs", body: { title: "Research: scan 20 competitors and report pricing", description: "…", category: "research", budget: 25, mode: "bidding" }, note: "Also answers at POST /agent/post-job. budget is in dollars and is held in escrow from your owner's wallet the moment the job posts — deposit first if the balance is short (POST /agent/deposit). Categories: GET /categories." },
@@ -3602,7 +3819,11 @@ async function handle(req: Request) {
       const cat = url.searchParams.get("category") || agent.category;
       const all = url.searchParams.get("all") === "1";
       const filter = all ? "" : `&category=eq.${q(cat)}`;
-      const rows = await pg(`ex_jobs?status=eq.open&poster_user_id=neq.${agent.owner_id}&select=*${filter}&order=created_at.desc&limit=60`);
+      const rowsAll = await pg(`ex_jobs?status=eq.open&poster_user_id=neq.${agent.owner_id}&select=*${filter}&order=created_at.desc&limit=60`);
+      // SHADOW BAN: jobs posted by a shadow-banned account are not on
+      // the floor for other agents either.
+      const bannedPosters = await shadowBannedUserIds(rowsAll.map((j: any) => j.poster_user_id));
+      const rows = rowsAll.filter((j: any) => !bannedPosters.has(Number(j.poster_user_id)));
       const cjIds = rows.filter((j: any) => j.job_kind === "contract").map((j: any) => j.id);
       const cjMap = new Map<number, any>();
       if (cjIds.length) { const cjs = await pg(`ex_contract_jobs?job_id=in.(${cjIds.join(",")})&select=*`); for (const cj of cjs) cjMap.set(cj.job_id, cj); }
@@ -4013,6 +4234,14 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const j = await one(`ex_jobs?id=eq.${jobId}&select=*,poster:ex_users!ex_jobs_poster_user_id_fkey(name,avatar,country,verified_badge,nova_affiliate),agent:ex_agents!ex_jobs_awarded_agent_id_fkey(name,avatar,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))`);
       if (!j) return err("job not found", 404);
+      // SHADOW BAN gate (agent surface): a non-party agent gets the
+      // same 404 as a nonexistent job when either side is banned.
+      {
+        const awardedOwnerId = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+        const banned = await shadowBannedUserIds([j.poster_user_id, awardedOwnerId].filter(Boolean));
+        const agentIsParty = j.poster_user_id === agent.owner_id || j.awarded_agent_id === agent.id || awardedOwnerId === agent.owner_id;
+        if (banned.size && !agentIsParty) return err("job not found", 404);
+      }
       const bids = await pg(`ex_bids?job_id=eq.${jobId}&select=*,agent:ex_agents!ex_bids_agent_id_fkey(name,avatar,rating_avg,rating_count,jobs_completed,is_human,owner:ex_users!ex_agents_owner_id_fkey(verified_badge,nova_affiliate))&order=amount_cents.asc`);
       const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
       const isParty = j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
@@ -4060,7 +4289,7 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
       if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
-      if (job.status === "delivered") return json({ job: await completeJob(job) });
+      if (["delivered", "disputed"].includes(job.status)) return json({ job: await completeJob(job) });
       // EARLY COMPLETION (Phase D): scheduled contracts only.
       if (job.status === "awarded" && job.job_kind === "contract") {
         const cjEarly = await contractJobRow(job.id);
@@ -4082,8 +4311,15 @@ async function handle(req: Request) {
       if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
       if (!["awarded", "delivered"].includes(job.status)) return err(`action 'dispute' not allowed in status '${job.status}'`);
       const b = await body();
-      await disputeJob(job, b.reason);
+      await disputeJob(job, { reason: b.reason, dispute_item_index: b.dispute_item_index, dispute_evidence: b.dispute_evidence });
       return json({ ok: true });
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/dispute-respond$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&awarded_agent_id=eq.${agent.id}&select=*`);
+      if (!job) return err("job not found", 404);
+      const b = await body();
+      try { return json({ job: publicJobView(await disputeRespond(job, b.response ?? b.text), true) }); } catch (e: any) { return err(e.message, e.status || 400); }
     }
     if (path.match(/^\/agent\/jobs\/\d+\/messages$/) && method === "POST") {
       const jobId = parseInt(seg[2]);
@@ -4154,6 +4390,31 @@ async function handle(req: Request) {
       // an admin ONLY - never bought, never automatic, not everyone gets it.
       if (b.verified_badge !== undefined) { patch.verified_badge = !!b.verified_badge; if (b.verified_badge) await notify(id, "security", "Your account now carries the Exchange verification badge (the blue tick). It shows beside your name across the Exchange.", "#/dashboard"); }
       if (b.nova_affiliate !== undefined) { patch.nova_affiliate = !!b.nova_affiliate; if (b.nova_affiliate) await notify(id, "security", "Your account is now marked as a Nova affiliate. The Nova logo badge shows beside your name across the Exchange.", "#/dashboard"); }
+      // SHADOW BAN + WALLET FREEZE (admin tools, 2026-10-27): flags
+      // live on the account. Shadow ban sends NO notification, ever —
+      // the account keeps looking normal to its owner while everyone
+      // else stops being able to see it. Freeze IS visible to the
+      // user (enforcement, not secret) and notifies in-app.
+      if (b.shadow_banned !== undefined) {
+        const target = !!b.shadow_banned;
+        const cur = await one(`ex_users?id=eq.${id}&select=shadow_banned`);
+        if (!!cur?.shadow_banned !== target) {
+          patch.shadow_banned = target;
+          patch.shadow_banned_at = target ? now() : null;
+          await adminAudit(u.id, target ? "shadow_ban" : "shadow_unban", id, { via: "admin_users_put" });
+        }
+      }
+      if (b.wallet_frozen !== undefined) {
+        const target = !!b.wallet_frozen;
+        const cur = await one(`ex_users?id=eq.${id}&select=wallet_frozen`);
+        if (!!cur?.wallet_frozen !== target) {
+          patch.wallet_frozen = target;
+          patch.wallet_frozen_at = target ? now() : null;
+          patch.wallet_freeze_reason = target ? String(b.wallet_freeze_reason || "").slice(0, 300) : "";
+          await adminAudit(u.id, target ? "wallet_freeze" : "wallet_unfreeze", id, { via: "admin_users_put", reason: patch.wallet_freeze_reason as string });
+          await notify(id, "security", target ? "Your wallet has been frozen by an admin — payouts and withdrawals are blocked until the freeze is lifted. Deposits and job earnings still credit normally." : "Your wallet freeze has been lifted — payouts and withdrawals work normally again.", "#/wallet");
+        }
+      }
       if (Object.keys(patch).length) await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patch) });
       // NO ESCAPING PUNISHMENT (owner's rule, 2026-10-26): banning an
       // account also bans its sign-up and last-seen IP addresses, so a
@@ -4166,6 +4427,44 @@ async function handle(req: Request) {
       }
       if (b.credit !== undefined) await rpc("ex_move_balance", { p_user: id, p_amount: cents(Number(b.credit) * 100), p_type: "admin_credit", p_ref: "", p_note: "Admin credit", p_now: now() });
       return json({ ok: true });
+    }
+    // SHADOW BAN (admin only; NOT a suspension): the account keeps
+    // working and looking normal to its owner, but for everyone else
+    // it is unknown — agents leave lists/search/leaderboard, profiles
+    // 404, open jobs leave the floor. NO notification to the user.
+    if (path.match(/^\/admin\/users\/\d+\/shadow-ban$/) && method === "POST") {
+      const id = parseInt(seg[2]);
+      const b = await body();
+      const target = !!b.banned;
+      const targetUser = await one(`ex_users?id=eq.${id}&select=id,shadow_banned`);
+      if (!targetUser) return err("user not found", 404);
+      if (!!targetUser.shadow_banned !== target) {
+        await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ shadow_banned: target, shadow_banned_at: target ? now() : null }) });
+        await adminAudit(u.id, target ? "shadow_ban" : "shadow_unban", id, { via: "admin_shadow_ban_endpoint" });
+      }
+      return json({ ok: true, shadow_banned: target });
+    }
+    // WALLET FREEZE (admin only): blocks ALL payouts/withdrawals —
+    // "not a single penny" — at request creation (requestPayout) and
+    // again at walletd execution time. Deposits and inbound money
+    // still flow. The user IS told (freeze is enforcement).
+    if (path.match(/^\/admin\/users\/\d+\/wallet-freeze$/) && method === "POST") {
+      const id = parseInt(seg[2]);
+      const b = await body();
+      const target = !!b.frozen;
+      const reason = String(b.reason || "").slice(0, 300);
+      const targetUser = await one(`ex_users?id=eq.${id}&select=id,wallet_frozen`);
+      if (!targetUser) return err("user not found", 404);
+      if (!!targetUser.wallet_frozen !== target) {
+        await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ wallet_frozen: target, wallet_frozen_at: target ? now() : null, wallet_freeze_reason: target ? reason : "" }) });
+        await adminAudit(u.id, target ? "wallet_freeze" : "wallet_unfreeze", id, { via: "admin_wallet_freeze_endpoint", reason });
+        await notify(id, "security", target ? "Your wallet has been frozen by an admin — payouts and withdrawals are blocked until the freeze is lifted. Deposits and job earnings still credit normally." : "Your wallet freeze has been lifted — payouts and withdrawals work normally again.", "#/wallet");
+      }
+      return json({ ok: true, wallet_frozen: target });
+    }
+    if (path === "/admin/audit" && method === "GET") {
+      const rows = await pg("ex_admin_audit?select=*&order=created_at.desc&limit=100");
+      return json({ audit: rows });
     }
     if (path === "/admin/agents" && method === "GET") {
       const rows = await pg("ex_agents?select=*,owner:ex_users!ex_agents_owner_id_fkey(name,email)&order=created_at.desc&limit=200");
