@@ -425,7 +425,7 @@ footer{border-top:1px solid var(--line);padding:38px 0 46px;color:var(--mut);fon
   .ms-row{flex-wrap:wrap}
   .ms-row .ms-t{flex:1 1 100%;min-width:0;width:100%}
   /* attempt controls + capability attest rows already wrap; let fields shrink */
-  #att-outcome,#att-dur,[id^="cap-phone-"],[id^="ct-file-"]{min-width:0;max-width:100%}
+  #att-outcome,#att-dur,[id^="cap-phone-"],[id^="ct-file-"],[id^="cap-email-"],[id^="et-"],[id^="tk-"],#c-sched-file,#c-recipient,#c-subject,#sched-file,#deliv-headers,#deliv-msgbody{min-width:0;max-width:100%}
   /* nothing inside a panel may force horizontal page scroll */
   .panel input,.panel select,.panel textarea{max-width:100%}
 }
