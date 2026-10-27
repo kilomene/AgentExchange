@@ -216,7 +216,10 @@ def main():
     J4 = jwt_for(4)
     created_jobs, settled = [], []
     foreign_settled = []
-    throw = {"user": None, "agent": None, "job": None, "payouts": [], "user2": None}
+    forfeit_poster_settled = []
+    victim_refund_total = [0]
+    throw = {"user": None, "agent": None, "job": None, "payouts": [], "user2": None,
+             "scam": None, "scam_agent": None, "scam2": None}
     w1_0, w4_0 = wallet(1), wallet(4)
     ob0 = outbox_state()
     pool0 = pool()
@@ -516,6 +519,10 @@ def main():
         ok(len(pre_mail) == 1 and pre_mail[0]["status"] == "queued",
            "pre-ban job_awarded mail queued for the throwaway", str(pre_mail))
         pre_mail_id = pre_mail[0]["id"]
+        # id sets, so the ban-notice asserts below cannot race a
+        # same-second timestamp boundary
+        pre_notif_ids = {n["id"] for n in rest(f"ex_notifications?user_id=eq.{tuid}&select=id")}
+        pre_mail_ids = {m["id"] for m in rest(f"ex_outbox?to_email=eq.{temail}&select=id")}
 
         t_ban = int(time.time())
         code, r = api("POST", f"/admin/users/{tuid}/shadow-ban", api_key=ADMIN_KEY,
@@ -548,10 +555,10 @@ def main():
         audit = rest(f"ex_admin_audit?target_user_id=eq.{tuid}&action=eq.shadow_ban&select=id")
         ok(len(audit) >= 1, "shadow ban written to the admin audit trail", "")
         # the user IS told — exactly once: one notification + one email, both with the case ID
-        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_ban}&select=id,body")
+        notifs = [n for n in rest(f"ex_notifications?user_id=eq.{tuid}&select=id,body") if n["id"] not in pre_notif_ids]
         ok(len(notifs) == 1 and case_code in (notifs[0].get("body") or ""),
            "exactly ONE notification reaches the banned user: the ban notice with the case ID", str(notifs)[:220])
-        mails = rest(f"ex_outbox?to_email=eq.{temail}&created_at=gte.{t_ban}&select=id,kind,payload")
+        mails = [m for m in rest(f"ex_outbox?to_email=eq.{temail}&select=id,kind,payload") if m["id"] not in pre_mail_ids]
         ok(len(mails) == 1 and mails[0]["kind"] == "shadow_ban_notice"
            and (mails[0].get("payload") or {}).get("case_id") == case_code,
            "exactly ONE email queued for the banned user: the notice with the case ID", str(mails)[:220])
@@ -573,12 +580,12 @@ def main():
             "status": "active", "created_at": int(time.time())})[0]
         code, r = api("POST", f"/jobs/{jp2}/award", jwt=J1, body={"bid_id": bid_t2["id"]})
         ok(code in (200, 201), "second award to the banned agent still processes (money in flight)", f"{code}")
-        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_ban}&select=id")
+        notifs = [n for n in rest(f"ex_notifications?user_id=eq.{tuid}&select=id") if n["id"] not in pre_notif_ids]
         ok(len(notifs) == 1, "queue-time suppression: the award queued NO new notification", str(notifs))
         mails = rest(f"ex_outbox?to_email=eq.{temail}&select=id")
-        ok(len(mails) == 2, "queue-time suppression: the award queued NO new email (pre-ban + notice only)", str(mails))
+        ok(len(mails) == len(pre_mail_ids) + 1, "queue-time suppression: the award queued NO new email (pre-ban + notice only)", str(mails))
         code, r = api("PUT", f"/admin/users/{tuid}", api_key=ADMIN_KEY, body={"verified_badge": True})
-        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_ban}&select=id")
+        notifs = [n for n in rest(f"ex_notifications?user_id=eq.{tuid}&select=id") if n["id"] not in pre_notif_ids]
         ok(len(notifs) == 1, "even an admin badge-grant notification is suppressed while banned", str(notifs))
         # release the two test escrows (the jobs themselves are swept in finally)
         for jx in (jp, jp2):
@@ -655,10 +662,23 @@ def main():
         ok(wallet(4)[0] == exp_w4 + (AMOUNT - FEE), "dispute default still pays the worker exactly", f"{wallet(4)} vs {exp_w4}")
         exp_w4 += AMOUNT - FEE
         exp_pool += 15
+        # The LIVE sweeper daemon shares this work on its 60s cycle and
+        # may be the one that lands the strike + ban — poll briefly for
+        # the end state instead of racing its post-strike steps.
         urow = user_row(tuid)
+        for _ in range(20):
+            if urow.get("shadow_banned") is True and (urow.get("strikes") or 0) == 3:
+                break
+            time.sleep(2)
+            urow = user_row(tuid)
         ok(urow.get("shadow_banned") is True and (urow.get("strikes") or 0) == 3,
            "AUTO-BAN fired: the dispute-default strike took the poster to 3 and shadow-banned the account", str(urow)[:200])
         cases = rest(f"ex_shadow_cases?user_id=eq.{tuid}&status=eq.active&select=case_code,trigger_rule,evidence_pack")
+        for _ in range(15):
+            if len(cases) == 1:
+                break
+            time.sleep(2)
+            cases = rest(f"ex_shadow_cases?user_id=eq.{tuid}&status=eq.active&select=case_code,trigger_rule,evidence_pack")
         ok(len(cases) == 1 and cases[0]["trigger_rule"] == "auto_3_strikes"
            and (cases[0].get("evidence_pack") or {}).get("user"),
            "auto-ban case + evidence pack created by the system", str(cases)[:220])
@@ -703,6 +723,136 @@ def main():
         ok(len(cases) == 1 and cases[0]["trigger_rule"] == "auto_bad_faith_dispute",
            "bad-faith auto-ban case created with its trigger named", str(cases)[:200])
         ok(not user_row(uid2).get("wallet_frozen"), "auto-ban does NOT auto-freeze the wallet (separate tools)", "")
+
+        # ---------- D. forfeiture: victims-first waterfall ----------
+        print("== forfeiture: victims-first waterfall ==")
+        now_s = int(time.time())
+        sid = rest("ex_users", method="POST", body={
+            "email": f"verify-scammer-{now_s}@example.com", "name": "Verify Scammer",
+            "password_hash": "x", "role": "user", "created_at": now_s, "email_verified": True})[0]["id"]
+        throw["scam"] = sid
+        rest("ex_wallets", method="POST", body={"user_id": sid, "balance_cents": 0, "held_cents": 0})
+        skey = f"verifykeyS{now_s}"
+        sagent = rest("ex_agents", method="POST", body={
+            "owner_id": sid, "name": f"VerifyScam Agent {now_s}", "status": "active",
+            "is_human": False, "category": "research",
+            "api_key_hash": hashlib.sha256(skey.encode()).hexdigest(), "created_at": now_s})[0]
+        throw["scam_agent"] = sagent["id"]
+        JS = jwt_for(sid)
+        sql(f"select ex_move_balance({sid}, 10000, 'test_fund', 'verify:forfeit', 'e2e funding', {now_s});")
+        # P1: scammer posts, agent 13 works, work COMPLETED (delivered) — escrow held
+        p1 = post_job(JS, {"title": "VERIFY forfeit P1 completed work (throwaway)", "description": "Throwaway.",
+                           "category": "research", "budget": 15, "mode": "bidding",
+                           "acceptance_checklist": ["deliverable file present"]})
+        seed_bid_award(p1, JS)
+        code, r = deliver_zip(p1, J4, checklist_map=["the ZIP, index.html"])
+        ok(code == 200, "P1 delivered by the honest worker (work completed, escrow held)", f"{code} {str(r)[:160]}")
+        # P2: scammer posts, awarded, work NEVER delivered — uncompleted escrow
+        p2 = post_job(JS, {"title": "VERIFY forfeit P2 uncompleted (throwaway)", "description": "Throwaway.",
+                           "category": "research", "budget": 15, "mode": "bidding",
+                           "acceptance_checklist": ["deliverable file present"]})
+        created_jobs.append(p2)
+        seed_bid_award(p2, JS)
+        # W1: founder posts, the scammer's agent wins and COMPLETES the work
+        w1 = post_job(J1, {"title": "VERIFY forfeit W1 scam agent work (throwaway)", "description": "Throwaway.",
+                           "category": "research", "budget": 15, "mode": "bidding",
+                           "acceptance_checklist": ["deliverable file present"]})
+        created_jobs.append(w1)
+        forfeit_poster_settled.append(w1)
+        bid_s = rest("ex_bids", method="POST", body={
+            "job_id": w1, "agent_id": sagent["id"], "bidder_user_id": sid,
+            "amount_cents": AMOUNT, "eta_hours": 24, "pitch": "verify bid",
+            "status": "active", "created_at": int(time.time())})[0]
+        code, r = api("POST", f"/jobs/{w1}/award", jwt=J1, body={"bid_id": bid_s["id"]})
+        ok(code in (200, 201), "W1 awarded to the scammer's agent", f"{code}")
+        code, r = api("POST", f"/agent/jobs/{w1}/deliver", agent_key=skey, form=[
+            ("deliverable", "ZIP with index.html and README - open index.html, replace nothing."),
+            ("delivery_checklist_map", json.dumps(["the ZIP, index.html"])),
+            ("file", f"@{make_zip()};type=application/zip")])
+        ok(code in (200, 201), "W1 delivered by the scammer's agent (its completed work)", f"{code} {str(r)[:160]}")
+        w_s = wallet(sid)
+        ok(w_s == (6600, 3000), "scammer wallet staged: 6600 balance / 3000 held (P1+P2 escrow)", str(w_s))
+        # ban + freeze, then the gates
+        code, r = api("POST", f"/admin/users/{sid}/shadow-ban", api_key=ADMIN_KEY,
+                      body={"banned": True, "reason": "e2e forfeiture: proven scam ring"})
+        scode = r.get("case_code") or ""
+        ok(code == 200 and scode.startswith("SB-"), "scammer shadow-banned with a case", f"{code} {str(r)[:140]}")
+        scase = rest(f"ex_shadow_cases?user_id=eq.{sid}&status=eq.active&select=id,case_code")[0]
+        code, r = api("POST", f"/admin/users/{sid}/wallet-freeze", api_key=ADMIN_KEY,
+                      body={"frozen": True, "reason": "e2e forfeiture"})
+        ok(code == 200 and r.get("wallet_frozen") is True, "scammer wallet frozen", f"{code}")
+        code, r = api("POST", f"/admin/shadow-cases/{scase['id']}/forfeit", api_key=ADMIN_KEY,
+                      body={"victims": [{"user_id": 4, "amount_cents": 2000}]})
+        ok(code == 400 and "proven_scam" in json.dumps(r),
+           "GATE: no investigation finding -> forfeiture refused", f"{code} {str(r)[:180]}")
+        code, r = api("POST", f"/admin/shadow-cases/{scase['id']}/investigation", api_key=ADMIN_KEY,
+                      body={"finding": "proven_scam", "appeal_deadline": int(time.time()) + 86400})
+        ok(code == 200, "investigation finding recorded: proven_scam", f"{code} {str(r)[:140]}")
+        code, r = api("POST", "/agent/shadow-appeal", agent_key=skey, body={
+            "case_code": scode,
+            "evidence_text": "I did nothing wrong, the deliveries speak for themselves, please review the pack again.",
+            "evidence_refs": ["delivery:sha256:verify"]})
+        ok(code == 200, "scammer's appeal filed (appeal window open)", f"{code} {str(r)[:140]}")
+        code, r = api("POST", f"/admin/shadow-cases/{scase['id']}/forfeit", api_key=ADMIN_KEY,
+                      body={"victims": [{"user_id": 4, "amount_cents": 2000}]})
+        ok(code == 400 and "appeal" in json.dumps(r).lower(),
+           "GATE: appeal still open -> forfeiture refused", f"{code} {str(r)[:180]}")
+        ok(wallet(sid) == (6600, 3000) and wallet(4)[0] == exp_w4,
+           "nothing moved while the gates were closed (escrow unwinds untouched)", f"{wallet(sid)} {wallet(4)}")
+        code, r = api("POST", f"/admin/shadow-cases/{scase['id']}/investigation", api_key=ADMIN_KEY,
+                      body={"appeal_outcome": "failed"})
+        ok(code == 200, "appeal recorded as failed — gate opens", f"{code}")
+        code, r = api("POST", f"/admin/shadow-cases/{scase['id']}/forfeit", api_key=ADMIN_KEY,
+                      body={"victims": [{"user_id": 4, "amount_cents": 2000}]})
+        f = r.get("forfeiture") or {}
+        ok(code == 200 and r.get("ok") is True, "forfeiture executes as ONE admin action", f"{code} {str(r)[:220]}")
+        ok(f.get("completed_work_paid") == AMOUNT - FEE,
+           "RULE 1: the honest worker on P1 was paid in full from escrow (1500-150)", str(f))
+        ok(f.get("completed_work_credited") == AMOUNT - FEE,
+           "RULE 1: the scammer agent's own completed work (W1) settled into its frozen balance", str(f))
+        ok(f.get("escrow_remitted") == AMOUNT,
+           "RULE 2: P2's uncompleted escrow remitted to Nova in full", str(f))
+        ok(f.get("victim_paid") == 1800 and f.get("victim_charges") == 200,
+           "RULE 3: victim refunded exactly 90% of 2000, Nova's charge exactly 10%", str(f))
+        ok(f.get("remainder_forfeited") == 5950,
+           "RULE 4: remainder forfeited to Nova (6600 + 1350 W1 credit - 2000 victim gross)", str(f))
+        ok(wallet(sid) == (0, 0), "scammer wallet ends at zero balance / zero held", str(wallet(sid)))
+        ok(wallet(4)[0] == exp_w4 + (AMOUNT - FEE) + 1800,
+           "worker/victim (user 4) received exactly 1350 + 1800", f"{wallet(4)} vs {exp_w4}")
+        exp_w4 += (AMOUNT - FEE) + 1800
+        victim_refund_total[0] += 1800
+        foreign_settled.append(p1)
+        ok(pool() == exp_pool + 7680,
+           "guarantee pool delta exact: 15+15 completion shares + 1500 remit + 200 charge + 5950 remainder", f"{pool()} vs {exp_pool}")
+        exp_pool += 7680
+        sledger = [x for x in rest(f"ex_ledger?user_id=eq.{sid}&select=type,amount_cents,ref") if x.get("ref") == f"case:{scode}"]
+        ok(sorted((x["type"], x["amount_cents"]) for x in sledger) == sorted([
+            ("forfeiture_escrow_remit", -1500), ("forfeiture_victim_refund", -2000), ("forfeiture_nova", -5950)]),
+           "per-step ledger entries on the scammer carry the case ID ref", str(sledger))
+        vledger = [x for x in rest("ex_ledger?user_id=eq.4&select=type,amount_cents,ref") if x.get("type") == "victim_refund" and x.get("ref") == f"case:{scode}"]
+        ok(len(vledger) == 1 and vledger[0]["amount_cents"] == 1800,
+           "victim's ledger credit is exactly 1800 with the case ID ref", str(vledger))
+        audit = rest(f"ex_admin_audit?target_user_id=eq.{sid}&action=eq.forfeiture_execute&select=detail")
+        ok(len(audit) == 1 and (audit[0].get("detail") or {}).get("case_code") == scode,
+           "audit entry for the execution carries the case ID", str(audit)[:200])
+        case_after = rest(f"ex_shadow_cases?id=eq.{scase['id']}&select=forfeiture_status")[0]
+        ok(case_after["forfeiture_status"] == "executed", "case marked executed (one-shot)", str(case_after))
+        code, r = api("POST", f"/admin/shadow-cases/{scase['id']}/forfeit", api_key=ADMIN_KEY, body={"victims": []})
+        ok(code == 400, "forfeiture cannot execute twice", f"{code}")
+        # frozen-but-not-proven: a second banned+frozen account with NO finding
+        now_s = int(time.time())
+        sid2 = rest("ex_users", method="POST", body={
+            "email": f"verify-frozen-{now_s}@example.com", "name": "Verify Frozen Only",
+            "password_hash": "x", "role": "user", "created_at": now_s, "email_verified": True})[0]["id"]
+        throw["scam2"] = sid2
+        rest("ex_wallets", method="POST", body={"user_id": sid2, "balance_cents": 5000, "held_cents": 0})
+        code, r = api("POST", f"/admin/users/{sid2}/shadow-ban", api_key=ADMIN_KEY, body={"banned": True, "reason": "e2e: suspicion only"})
+        code, r = api("POST", f"/admin/users/{sid2}/wallet-freeze", api_key=ADMIN_KEY, body={"frozen": True})
+        case2 = rest(f"ex_shadow_cases?user_id=eq.{sid2}&status=eq.active&select=id")[0]
+        code, r = api("POST", f"/admin/shadow-cases/{case2['id']}/forfeit", api_key=ADMIN_KEY, body={"victims": []})
+        ok(code == 400 and "proven" in json.dumps(r).lower(),
+           "a frozen-but-NOT-proven account cannot be forfeited at all", f"{code} {str(r)[:160]}")
+        ok(wallet(sid2) == (5000, 0), "the unproven account's money is untouched", str(wallet(sid2)))
 
         # ---------- B. wallet freeze ----------
         print("== wallet freeze ==")
@@ -770,9 +920,39 @@ def main():
             # deleted below with their trees.
             for jid in foreign_settled:
                 sql(f"select ex_move_balance(4, -{AMOUNT - FEE}, 'test_reversal', 'verify:fairness', 'reverse foreign settlement job {jid}', {now_s});")
+                rest(f"ex_milestones?job_id=eq.{jid}", method="DELETE")
+                rest(f"ex_bids?job_id=eq.{jid}", method="DELETE")
+                rest(f"ex_messages?job_id=eq.{jid}", method="DELETE")
                 rest(f"ex_jobs?id=eq.{jid}", method="DELETE")
         except Exception as e:
             print("money reversal note:", e)
+        # forfeiture settlements: poster (user 1) reimbursed for W1; the
+        # victim refund to user 4 comes back out (pool is restored globally)
+        try:
+            for jid in forfeit_poster_settled:
+                sql(f"select ex_move_balance(1, {AMOUNT}, 'test_reversal', 'verify:fairness', 'reverse forfeiture settlement job {jid}', {now_s});")
+            if victim_refund_total[0]:
+                sql(f"select ex_move_balance(4, -{victim_refund_total[0]}, 'test_reversal', 'verify:fairness', 'reverse victim refund', {now_s});")
+        except Exception as e:
+            print("forfeiture reversal note:", e)
+        # scammer trees (forfeiture section)
+        try:
+            for skey_ in ("scam", "scam2"):
+                su = throw.get(skey_)
+                if su:
+                    rest(f"ex_payouts?user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_deposits?user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_ledger?user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_notifications?user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_shadow_cases?user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_reports?reporter_user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_admin_audit?target_user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_wallets?user_id=eq.{su}", method="DELETE")
+                    rest(f"ex_users?id=eq.{su}", method="DELETE")
+            if throw.get("scam_agent"):
+                rest(f"ex_agents?id=eq.{throw['scam_agent']}", method="DELETE")
+        except Exception as e:
+            print("scammer cleanup note:", e)
         # second throwaway (bad-faith poster) tree + shadow case/report rows
         try:
             if throw.get("user2"):
