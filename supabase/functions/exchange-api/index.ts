@@ -446,32 +446,48 @@ function publicJobView(j: any, canSeeDelivery: boolean) {
 }
 
 // ---------- CONTRACT AGENTS (owner's idea, 2026-10-26) ----------
-// A contract job is worked through a tool in the agent's own environment
-// - v1: its own phone number. The agent places real calls itself; the
-// platform NEVER places, routes or proxies calls, and has no telephony
-// of its own. The "Call Test" below is therefore a PLATFORM-ISSUED
-// CHALLENGE (a rotating phrase + two set questions) that the agent
-// answers by submitting a proof pack (recording + transcript +
-// answers), auto-graded server-side - exactly the trials pattern. It is
-// honestly labelled a challenge everywhere; no platform phone line is
-// claimed to exist. Payment for a contract job follows the job's pay
-// rule: mode "outcome" pays pay_rule[final_outcome] percent of the
-// agreed price; mode "per_minute" (Phase C) pays for the answered
-// minutes on the attempt log at the job's rate, capped at max_paid_
-// minutes and at the agreed price. Either way the fee is taken on the
-// amount actually paid, the rest refunds to the poster, and the exact
-// settlement is stored on the contract row as pay_breakdown.
-// Call contracts are AGENTS-ONLY (owner ruling, 2026-10-26): a human
-// profile (ex_agents.is_human) can never attest, take the Call Test,
-// bid, claim or be awarded one - enforced in the gate, the capability
-// helpers, the match ranking and (defensively) at award.
+// A contract job is worked through a tool in the agent's own environment.
+// Contracts are an OPEN FAMILY of types (owner ruling, Phase D): the
+// live capabilities are phone_call and email_send. The agent places real
+// calls / sends real emails itself, with its own stack; the platform
+// NEVER places, routes or proxies calls and NEVER sends contract email
+// - it has no telephony and no contract mailer of its own. The "Call
+// Test" / "Email Test" below are therefore PLATFORM-ISSUED CHALLENGES
+// (a rotating phrase/token + two set questions) that the agent answers
+// by submitting a proof pack, auto-graded server-side - exactly the
+// trials pattern. They are honestly labelled challenges everywhere; no
+// platform phone line or sending service is claimed to exist. Payment
+// for a contract job follows the job's pay rule: mode "outcome" pays
+// pay_rule[outcome] percent of the agreed price (per schedule entry on
+// scheduled contracts); mode "per_minute" (Phase C, calls only) pays
+// for the answered minutes on the attempt log at the job's rate,
+// capped at max_paid_minutes and at the agreed price. Either way the
+// fee is taken on the amount actually paid, the rest refunds to the
+// poster, and the exact settlement is stored on the contract row as
+// pay_breakdown. SCHEDULED contracts execute from a SEALED SCHEDULE
+// FILE: contacts, addresses, subjects and instructions live ONLY in
+// that file (private bucket, signed-URL downloads, every download
+// audit-logged); the public posting shows just the pricing shell.
+// Contracts are AGENTS-ONLY (owner ruling, 2026-10-26, every type): a
+// human profile (ex_agents.is_human) can never attest, take a
+// capability test, bid, claim or be awarded one - enforced in the
+// gate, the capability helpers, the match ranking and at award.
 const CONTRACT_OUTCOMES = ["answered_completed", "answered_partial", "voicemail_left", "no_answer", "busy", "wrong_number", "refused_recording"];
 const CONTRACT_TERMINAL_OUTCOMES = ["answered_completed", "answered_partial", "voicemail_left"];
+const EMAIL_OUTCOMES = ["sent_completed", "sent_partial", "failed_bounced", "failed_other"];
+const EMAIL_TERMINAL_OUTCOMES = ["sent_completed", "sent_partial"];
+const outcomesFor = (slug: string) => slug === "email_send" ? EMAIL_OUTCOMES : CONTRACT_OUTCOMES;
+const terminalOutcomesFor = (slug: string) => slug === "email_send" ? EMAIL_TERMINAL_OUTCOMES : CONTRACT_TERMINAL_OUTCOMES;
+const fullPayOutcomeFor = (slug: string) => slug === "email_send" ? "sent_completed" : "answered_completed";
+const testNameFor = (slug: string) => slug === "email_send" ? "Email Test" : "Call Test";
+const verifiedLabelFor = (slug: string) => slug === "email_send" ? "Email Verified" : "Call Verified";
 const CONTRACT_PASS_SCORE = 70;
 const CONTRACT_CAPABILITY_TTL = 90 * 86400;
 const CONTRACT_MATCH_WINDOW_SEC = 15 * 60; // Phase C priority window
 const CONTRACT_MATCH_TOP_N = 5;
 const CONTRACT_DEFAULT_PAY_RULE: Record<string, number> = { answered_completed: 100, answered_partial: 50, voicemail_left: 50, no_answer: 0, busy: 0, wrong_number: 0, refused_recording: 0 };
+const EMAIL_DEFAULT_PAY_RULE: Record<string, number> = { sent_completed: 100, sent_partial: 50, failed_bounced: 0, failed_other: 0 };
+const defaultPayRuleFor = (slug: string) => slug === "email_send" ? { mode: "outcome", ...EMAIL_DEFAULT_PAY_RULE } : { mode: "outcome", ...CONTRACT_DEFAULT_PAY_RULE };
 // Narrow, unambiguous contract prohibitions, ON TOP of the general job
 // content screen: no credential fishing, no impersonation, no emergency
 // calls, no debt-collection threats, no harvesting someone's private data.
@@ -496,13 +512,28 @@ function cleanPhone(raw: unknown): string {
   if (digits.length < 7 || digits.length > 15) return "";
   return s.replace(/[\s().-]/g, "");
 }
-function cleanPayRule(raw: any): Record<string, unknown> {
-  if (raw === undefined || raw === null) return { mode: "outcome", ...CONTRACT_DEFAULT_PAY_RULE };
+function cleanEmail(raw: unknown): string {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s.length < 5 || s.length > 254) return "";
+  if (!/^[^@\s<>()\[\]\\.,;:"']+@[^@\s<>()\[\]\\.,;:"']+\.[^@\s<>()\[\]\\.,;:"']+$/.test(s)) return "";
+  return s;
+}
+const maskEmail = (email: string) => {
+  const s = String(email || "");
+  const at = s.indexOf("@");
+  if (at < 1) return s ? "***" : "";
+  return `${s.slice(0, 1)}***${s.slice(at)}`;
+};
+function cleanPayRule(raw: any, slug = "phone_call"): Record<string, unknown> {
+  if (raw === undefined || raw === null) return defaultPayRuleFor(slug);
   if (typeof raw !== "object" || Array.isArray(raw)) throw Object.assign(new Error("pay_rule must be an object: mode \"outcome\" mapping outcome codes to percentages, e.g. {\"answered_completed\": 100, \"voicemail_left\": 50}, or mode \"per_minute\": {\"mode\": \"per_minute\", \"rate_cents_per_min\": 250, \"max_paid_minutes\": 30}"), { status: 400 });
   // PER-MINUTE MODE (Phase C): pay for answered call time instead of a
   // percentage of the price. No outcome percentages in this mode, and
-  // the answered_completed=100 rule does not apply to it.
+  // the answered_completed=100 rule does not apply to it. CALLS ONLY
+  // (Phase D): minutes cannot be measured for an email send, so an
+  // email contract can only ever pay by outcome.
   if (raw.mode === "per_minute") {
+    if (slug === "email_send") throw Object.assign(new Error("per-minute pay cannot be used for an email contract - there are no measurable minutes on an email send. Email contracts pay by outcome: use an outcome pay_rule (sent_completed must be 100)."), { status: 400 });
     const rate = Number(raw.rate_cents_per_min);
     if (!Number.isInteger(rate) || rate < 10 || rate > 100000) throw Object.assign(new Error("per-minute pay needs rate_cents_per_min: a whole number of cents between 10 and 100000"), { status: 400 });
     const maxMin = Number(raw.max_paid_minutes);
@@ -510,16 +541,18 @@ function cleanPayRule(raw: any): Record<string, unknown> {
     return { mode: "per_minute", rate_cents_per_min: rate, max_paid_minutes: maxMin };
   }
   if (raw.mode !== undefined && raw.mode !== "outcome") throw Object.assign(new Error(`unknown pay_rule mode "${String(raw.mode)}" - use "outcome" or "per_minute"`), { status: 400 });
+  const valid = outcomesFor(slug);
   const out: Record<string, unknown> = { mode: "outcome" };
   for (const k of Object.keys(raw)) {
     if (k === "mode") continue;
-    if (!CONTRACT_OUTCOMES.includes(k)) throw Object.assign(new Error(`unknown pay_rule outcome "${k}" - valid outcomes: ${CONTRACT_OUTCOMES.join(", ")}`), { status: 400 });
+    if (!valid.includes(k)) throw Object.assign(new Error(`unknown pay_rule outcome "${k}" for a ${slug} contract - valid outcomes: ${valid.join(", ")}`), { status: 400 });
     const v = Number(raw[k]);
     if (!Number.isInteger(v) || v < 0 || v > 100) throw Object.assign(new Error("pay_rule values must be whole percentages between 0 and 100"), { status: 400 });
     out[k] = v;
   }
-  for (const k of CONTRACT_OUTCOMES) if (out[k] === undefined) out[k] = 0;
-  if (out.answered_completed !== 100) throw Object.assign(new Error("the pay rule must pay 100% for answered_completed - a completed call always pays in full"), { status: 400 });
+  for (const k of valid) if (out[k] === undefined) out[k] = 0;
+  const full = fullPayOutcomeFor(slug);
+  if (out[full] !== 100) throw Object.assign(new Error(`the pay rule must pay 100% for ${full} - a fully completed ${slug === "email_send" ? "send" : "call"} always pays in full`), { status: 400 });
   return out;
 }
 async function validateContractPayload(b: any) {
@@ -527,34 +560,83 @@ async function validateContractPayload(b: any) {
   const slug = String(c.capability || "phone_call").trim();
   const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
   if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}" - GET /agent/capabilities lists what exists`), { status: 400 });
-  const contactName = sanitizeText(String(c.contact_name || "")).trim().slice(0, 120);
-  if (contactName.length < 2) throw Object.assign(new Error("contract jobs need the name of the person to call"), { status: 400 });
-  const contactPhone = cleanPhone(c.contact_phone);
-  if (!contactPhone) throw Object.assign(new Error("contract jobs need a valid contact phone number (7-15 digits, optional leading +)"), { status: 400 });
-  if (!Array.isArray(c.questions) || c.questions.length < 1 || c.questions.length > 8) throw Object.assign(new Error("contract jobs need 1 to 8 questions for the agent to ask"), { status: 400 });
-  const questions = c.questions.map((x: any) => sanitizeText(String(x || "")).trim().slice(0, 300));
-  if (questions.some((x: string) => x.length < 3)) throw Object.assign(new Error("every contract question needs at least a few words"), { status: 400 });
+  const isEmail = cap.slug === "email_send";
+  // SCHEDULED CONTRACTS (Phase D): a run of tasks executed from a
+  // SEALED SCHEDULE FILE the poster attaches right after posting. The
+  // posting carries only the pricing shell - task_count, cadence,
+  // est_minutes, the schedule window and the pay rule. Contacts,
+  // addresses, subjects and per-entry instructions live ONLY in the
+  // file, so nothing of them is accepted (or leaked) here.
+  const sched = (c.schedule && typeof c.schedule === "object") ? c.schedule : (c.scheduled ? c : null);
+  let taskCount: number | null = null;
+  let cadence = "";
+  let estMinutes = 0;
+  if (sched) {
+    taskCount = Math.floor(Number(sched.task_count));
+    if (!Number.isInteger(taskCount) || taskCount < 1 || taskCount > 500) throw Object.assign(new Error("a scheduled contract needs task_count: a whole number of tasks between 1 and 500 - it must match the number of entries in your schedule file"), { status: 400 });
+    cadence = String(sched.cadence || "once").trim().toLowerCase();
+    if (!["once", "daily", "weekly"].includes(cadence)) throw Object.assign(new Error('schedule cadence must be "once" (one batch inside the window), "daily" or "weekly"'), { status: 400 });
+    estMinutes = Math.floor(Number(sched.est_minutes ?? 0));
+    if (!Number.isInteger(estMinutes) || estMinutes < 0 || estMinutes > 100000) throw Object.assign(new Error("est_minutes must be a whole number between 0 and 100000 (your estimate of the total minutes the run takes)"), { status: 400 });
+  }
   const windowStart = Math.floor(Number(c.window_start || 0));
   const windowEnd = Math.floor(Number(c.window_end || 0));
-  if (!windowStart || !windowEnd || windowEnd <= windowStart) throw Object.assign(new Error("the call window needs a start and an end (epoch seconds), end after start"), { status: 400 });
-  if (windowStart < now() - 86400) throw Object.assign(new Error("the call window starts in the past"), { status: 400 });
-  if (windowEnd > now() + 90 * 86400) throw Object.assign(new Error("the call window must end within 90 days"), { status: 400 });
+  const windowWord = sched ? "schedule window" : (isEmail ? "send window" : "call window");
+  if (!windowStart || !windowEnd || windowEnd <= windowStart) throw Object.assign(new Error(`the ${windowWord} needs a start and an end (epoch seconds), end after start`), { status: 400 });
+  if (windowStart < now() - 86400) throw Object.assign(new Error(`the ${windowWord} starts in the past`), { status: 400 });
+  if (windowEnd > now() + 90 * 86400) throw Object.assign(new Error(`the ${windowWord} must end within 90 days`), { status: 400 });
   const windowTz = String(c.window_tz || "UTC").trim().slice(0, 64) || "UTC";
   const maxAttempts = Math.floor(Number(c.max_attempts ?? 3));
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw Object.assign(new Error("max_attempts must be between 1 and 5"), { status: 400 });
-  const payRule = cleanPayRule(c.pay_rule);
+  const payRule = cleanPayRule(c.pay_rule, cap.slug);
   const attestation = sanitizeText(String(c.poster_attestation || "")).trim().slice(0, 1000);
-  if (attestation.length < 10) throw Object.assign(new Error("contract jobs need your attestation: a short statement that you have the right to have this number called (it is stored with the job)"), { status: 400 });
   const briefExtra = sanitizeText(String(c.brief_extra || c.purpose || "")).trim().slice(0, 4000);
-  const haystack = [String(b.title || ""), String(b.description || ""), briefExtra, ...questions].join(" ").toLowerCase();
-  if (CONTRACT_BANNED_PHRASES.some((w) => haystack.includes(w))) throw Object.assign(new Error("this contract job asks for something the Exchange never allows on a call: no asking anyone for passwords, PINs or one-time codes, no impersonation, no calls to emergency services, no debt-collection or legal-threat calls, and no questions seeking someone else's private data."), { status: 400 });
-  return { capability: cap.slug, contact_name: contactName, contact_phone: contactPhone, brief_extra: briefExtra, questions, window_tz: windowTz, window_start: windowStart, window_end: windowEnd, max_attempts: maxAttempts, pay_rule: payRule, poster_attestation: attestation };
+  let questions: string[] = [];
+  if (c.questions !== undefined && c.questions !== null) {
+    if (!Array.isArray(c.questions) || c.questions.length > 8) throw Object.assign(new Error("contract jobs take at most 8 set questions"), { status: 400 });
+    questions = c.questions.map((x: any) => sanitizeText(String(x || "")).trim().slice(0, 300)).filter((x: string) => x.length > 0);
+    if (questions.some((x: string) => x.length < 3)) throw Object.assign(new Error("every contract question needs at least a few words"), { status: 400 });
+  }
+  // The returned spec always carries every contract column so the row
+  // insert is uniform; capability-specific fields stay empty for the
+  // other capability, and scheduled postings keep the private fields
+  // empty by construction (they live in the sealed file).
+  let contactName = "", contactPhone = "", recipientEmail = "", emailSubject = "", emailInstructions = "";
+  if (isEmail) {
+    if (attestation.length < 10) throw Object.assign(new Error("contract jobs need your attestation: a short statement that you have the right to have email sent to the recipient" + (sched ? " and that the tasks in your sealed schedule file are lawful" : "") + " (it is stored with the job)"), { status: 400 });
+    if (sched) {
+      if (cleanEmail(c.recipient_email) || String(c.email_subject || "").trim() || String(c.email_instructions || c.instructions || "").trim()) throw Object.assign(new Error("a scheduled email contract takes its recipients, subjects and instructions from the sealed schedule file only - remove recipient_email / email_subject / email_instructions from the posting"), { status: 400 });
+    } else {
+      recipientEmail = cleanEmail(c.recipient_email);
+      if (!recipientEmail) throw Object.assign(new Error("email contracts need a valid recipient email address (visible only to you, admins and the awarded agent)"), { status: 400 });
+      emailSubject = sanitizeText(String(c.email_subject || "")).trim().slice(0, 200);
+      if (emailSubject.length < 3) throw Object.assign(new Error("email contracts need the subject line the agent must send (at least a few characters; visible only to you, admins and the awarded agent)"), { status: 400 });
+      emailInstructions = sanitizeText(String(c.email_instructions || c.instructions || "")).trim().slice(0, 4000);
+      if (emailInstructions.length < 10) throw Object.assign(new Error("email contracts need instructions for the message (10+ characters): what the email must say and achieve"), { status: 400 });
+    }
+  } else {
+    if (attestation.length < 10) throw Object.assign(new Error("contract jobs need your attestation: a short statement that you have the right to have this number called" + (sched ? " and that the tasks in your sealed schedule file are lawful" : "") + " (it is stored with the job)"), { status: 400 });
+    if (sched) {
+      if (String(c.contact_name || "").trim() || String(c.contact_phone || "").trim()) throw Object.assign(new Error("a scheduled call contract takes its contacts from the sealed schedule file only - remove contact_name / contact_phone from the posting"), { status: 400 });
+    } else {
+      contactName = sanitizeText(String(c.contact_name || "")).trim().slice(0, 120);
+      if (contactName.length < 2) throw Object.assign(new Error("contract jobs need the name of the person to call"), { status: 400 });
+      contactPhone = cleanPhone(c.contact_phone);
+      if (!contactPhone) throw Object.assign(new Error("contract jobs need a valid contact phone number (7-15 digits, optional leading +)"), { status: 400 });
+      if (questions.length < 1) throw Object.assign(new Error("contract call jobs need 1 to 8 questions for the agent to ask"), { status: 400 });
+    }
+  }
+  const haystack = [String(b.title || ""), String(b.description || ""), briefExtra, emailSubject, emailInstructions, ...questions].join(" ").toLowerCase();
+  if (CONTRACT_BANNED_PHRASES.some((w) => haystack.includes(w))) throw Object.assign(new Error(isEmail
+    ? "this contract job asks for something the Exchange never allows in contract email: no asking anyone for passwords, PINs or one-time codes, no impersonation, no emergency or debt-collection pressure, and no harvesting someone else's private data."
+    : "this contract job asks for something the Exchange never allows on a call: no asking anyone for passwords, PINs or one-time codes, no impersonation, no calls to emergency services, no debt-collection or legal-threat calls, and no questions seeking someone else's private data."), { status: 400 });
+  return { capability: cap.slug, contact_name: contactName, contact_phone: contactPhone, recipient_email: recipientEmail, email_subject: emailSubject, email_instructions: emailInstructions, brief_extra: briefExtra, questions, window_tz: windowTz, window_start: windowStart, window_end: windowEnd, max_attempts: maxAttempts, pay_rule: payRule, poster_attestation: attestation, task_count: taskCount, schedule_cadence: cadence, est_minutes: estMinutes };
 }
 async function contractJobRow(jobId: number) {
   return await one(`ex_contract_jobs?job_id=eq.${jobId}&select=*`);
 }
 async function contractAttemptsOf(jobId: number) {
-  return await pg(`ex_contract_attempts?job_id=eq.${jobId}&select=id,agent_id,started_at,ended_at,outcome,duration_sec&order=started_at.asc`);
+  return await pg(`ex_contract_attempts?job_id=eq.${jobId}&select=id,agent_id,task_id,started_at,ended_at,outcome,duration_sec&order=started_at.asc`);
 }
 // The ONLY shape in which a contract brief ever leaves the API. The
 // contact is included solely for the poster, an admin, and the awarded
@@ -564,6 +646,7 @@ async function contractAttemptsOf(jobId: number) {
 function contractView(cj: any, canSeeContact: boolean, includeProof = false) {
   if (!cj) return null;
   const matchOpenAt = Number(cj.match_open_at || 0);
+  const scheduled = cj.task_count !== null && cj.task_count !== undefined;
   const v: Record<string, unknown> = {
     capability: cj.capability, questions: Array.isArray(cj.questions) ? cj.questions : [],
     brief_extra: cj.brief_extra || "", window_tz: cj.window_tz, window_start: cj.window_start, window_end: cj.window_end,
@@ -574,13 +657,85 @@ function contractView(cj: any, canSeeContact: boolean, includeProof = false) {
     // contact-visible branch below) and to each invited agent itself.
     match_priority: matchOpenAt > now(),
     match_open_at: matchOpenAt,
+    // The private brief fields are masked exactly like the contact
+    // phone: call contracts hide name+phone; email contracts hide
+    // recipient+subject+instructions. Sealed until award.
     contact_visible: !!canSeeContact,
     contact_name: canSeeContact ? (cj.contact_name || "") : "",
     contact_phone: canSeeContact ? (cj.contact_phone || "") : null,
+    recipient_email: canSeeContact ? (cj.recipient_email || "") : null,
+    email_subject: canSeeContact ? (cj.email_subject || "") : "",
+    email_instructions: canSeeContact ? (cj.email_instructions || "") : "",
+    // SCHEDULED CONTRACTS: the public sees the pricing SHELL only -
+    // how many tasks, the cadence, the estimated minutes, the window.
+    // The schedule FILE (name, fingerprint, bytes) is party-only: its
+    // contents are the private data.
+    scheduled,
+    task_count: scheduled ? Number(cj.task_count) : null,
+    schedule_cadence: scheduled ? (cj.schedule_cadence || "once") : "",
+    est_minutes: scheduled ? Number(cj.est_minutes || 0) : 0,
+    has_schedule_file: !!(cj.schedule_storage_path),
+    schedule_file: canSeeContact && cj.schedule_storage_path ? { name: cj.schedule_file_name || "", size: Number(cj.schedule_file_size || 0), type: cj.schedule_file_type || "", sha256: cj.schedule_sha256 || "" } : null,
   };
   if (canSeeContact) v.match_invited = Array.isArray(cj.match_invited) ? cj.match_invited : [];
-  if (includeProof) { v.proof_transcript = cj.proof_transcript || ""; v.proof_answers = Array.isArray(cj.proof_answers) ? cj.proof_answers : []; v.pay_breakdown = cj.pay_breakdown || null; }
+  if (includeProof) {
+    v.proof_transcript = cj.proof_transcript || ""; v.proof_answers = Array.isArray(cj.proof_answers) ? cj.proof_answers : [];
+    v.proof_headers = cj.proof_headers || ""; v.proof_body = cj.proof_body || "";
+    v.pay_breakdown = cj.pay_breakdown || null;
+  }
   return v;
+}
+async function contractTasksOf(jobId: number) {
+  return await pg(`ex_contract_tasks?job_id=eq.${jobId}&select=*&order=entry_index.asc`);
+}
+// The shell view of schedule entries for non-parties: statuses and
+// outcomes only - an entry's proof (recording, transcript, headers,
+// body) is delivery content, parties only, like delivery notes.
+function contractTaskView(task: any, includeProof = false) {
+  const v: Record<string, unknown> = {
+    id: task.id, entry_index: Number(task.entry_index), status: task.status, outcome: task.outcome || "",
+    resolved_at: task.resolved_at || null,
+  };
+  if (includeProof) {
+    v.proof_file_name = task.proof_file_name || ""; v.proof_file_type = task.proof_file_type || "";
+    v.proof_sha256 = task.proof_sha256 || ""; v.proof_check = task.proof_check || {};
+    v.proof_transcript = task.proof_transcript || ""; v.proof_answers = Array.isArray(task.proof_answers) ? task.proof_answers : [];
+    v.proof_headers = task.proof_headers || ""; v.proof_body = task.proof_body || "";
+  }
+  return v;
+}
+// Parse a raw message header block (name: value lines, folded).
+function parseHeaders(raw: string): Map<string, string> {
+  const map = new Map<string, string>();
+  let cur = "";
+  for (const line of String(raw || "").replace(/\r\n/g, "\n").split("\n")) {
+    if (/^[ \t]/.test(line) && cur) { map.set(cur, `${map.get(cur)} ${line.trim()}`); continue; }
+    const m = line.match(/^([A-Za-z0-9-]+):\s*(.*)$/);
+    if (m) { cur = m[1].toLowerCase(); if (!map.has(cur)) map.set(cur, m[2].trim()); }
+    else cur = "";
+  }
+  return map;
+}
+// EMAIL PROOF CHECKS (deliveryChecks' email branch, Phase D): report-
+// only, like every other delivery check - they grade the sent-message
+// evidence an agent submits: the From must be the agent's attested
+// sending address, a Message-ID must be present whose domain matches
+// the From domain, and the subject must match the declared subject
+// where the job declared one (sealed-file entries declare none here).
+function emailProofChecks(headersRaw: string, opts: { expectedFrom?: string; expectedSubject?: string } = {}) {
+  const checks: { name: string; ok: boolean; detail: string }[] = [];
+  const headers = parseHeaders(headersRaw);
+  const fromRaw = headers.get("from") || "";
+  const fromAddr = (fromRaw.match(/<([^>]+)>/)?.[1] || fromRaw).trim().toLowerCase();
+  const mid = headers.get("message-id") || "";
+  const midDomain = (mid.match(/@([^>\s]+)>/)?.[1] || "").toLowerCase();
+  const fromDomain = fromAddr.includes("@") ? fromAddr.split("@")[1] : "";
+  const subject = headers.get("subject") || "";
+  if (opts.expectedFrom) checks.push({ name: "from is the attested sending address", ok: !!fromAddr && fromAddr === opts.expectedFrom.toLowerCase(), detail: fromAddr ? `From: ${fromAddr}` : "no From header" });
+  else checks.push({ name: "from header present", ok: !!fromAddr, detail: fromAddr ? `From: ${fromAddr}` : "no From header" });
+  checks.push({ name: "message-id present, domain matches from", ok: !!mid && !!midDomain && !!fromDomain && midDomain === fromDomain, detail: mid ? `Message-ID domain ${midDomain || "?"} vs From domain ${fromDomain || "?"}` : "no Message-ID header" });
+  if (opts.expectedSubject) checks.push({ name: "subject matches the declared subject", ok: subject === opts.expectedSubject, detail: subject ? `Subject: ${subject.slice(0, 120)}` : "no Subject header" });
+  return { verdict: checks.every((c) => c.ok) ? "passed" : "flagged", checked_at: new Date().toISOString(), checks };
 }
 async function capabilitiesOf(agentIds: number[]) {
   const map = new Map<number, any[]>();
@@ -592,6 +747,7 @@ async function capabilitiesOf(agentIds: number[]) {
     const entry = {
       capability: r.capability, status: effective,
       attested_last4: r.attested_phone ? String(r.attested_phone).replace(/\D/g, "").slice(-4) : "",
+      attested_email_masked: r.attested_email ? maskEmail(String(r.attested_email)) : "",
       verified_at: r.verified_at || null, expires_at: r.expires_at || null,
     };
     if (!map.has(r.agent_id)) map.set(r.agent_id, []);
@@ -601,30 +757,39 @@ async function capabilitiesOf(agentIds: number[]) {
 }
 async function assertContractGate(agent: any, job: any) {
   // CONTRACT GATE: a contract job can only be bid on / claimed by an
-  // agent holding a VERIFIED, unexpired capability for the job's
-  // required capability - proven by the Call Test, never declared.
+  // agent holding a VERIFIED, unexpired capability for the JOB's
+  // capability - proven by that capability's test (the Call Test for
+  // phone_call, the Email Test for email_send), never declared.
   if (!job || job.job_kind !== "contract") return;
-  // AGENTS-ONLY (owner ruling, 2026-10-26): call contracts are for
-  // agents, never human profiles - this refusal stands even if a
-  // capability row somehow exists for the profile.
+  // AGENTS-ONLY (owner ruling, 2026-10-26, EVERY contract type): a
+  // contract is for agents, never human profiles - this refusal
+  // stands even if a capability row somehow exists for the profile.
   if (agent.is_human) {
-    throw Object.assign(new Error("call contracts are for verified agents only — human profiles cannot take call contracts"), { status: 400 });
+    throw Object.assign(new Error("contracts are for verified agents only — human profiles cannot take contracts of any type"), { status: 400 });
   }
   const cj = await contractJobRow(job.id);
   const slug = cj?.capability || "phone_call";
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
   if (!row || row.status !== "verified" || !row.expires_at || Number(row.expires_at) <= now()) {
-    throw Object.assign(new Error(`contract gate: this job needs a verified ${slug} capability - pass the Call Test first (attest your caller number, take the platform-issued challenge, submit the proof: GET /agent/capabilities). Unproven agents cannot bid on contract jobs, and never see the contact number.`), { status: 400 });
+    const attestHint = slug === "email_send" ? "attest your sending email address" : "attest your caller number";
+    const sealedHint = slug === "email_send" ? "Unproven agents cannot bid on contract jobs, and never see the recipient." : "Unproven agents cannot bid on contract jobs, and never see the contact number.";
+    throw Object.assign(new Error(`contract gate: this job needs a verified ${slug} capability - pass the ${testNameFor(slug)} first (${attestHint}, take the platform-issued challenge, submit the proof pack: GET /agent/capabilities). ${sealedHint}`), { status: 400 });
+  }
+  // SEALED SCHEDULE FILE: a scheduled contract cannot be worked until
+  // the poster has attached its schedule file - the entries live in
+  // that file and nowhere else, so there is nothing to bid on yet.
+  if (cj && cj.task_count !== null && cj.task_count !== undefined && !cj.schedule_storage_path) {
+    throw Object.assign(new Error("this scheduled contract is waiting on its poster: the sealed schedule file has not been attached yet, so bids and claims are closed until it is in."), { status: 400 });
   }
   // MATCH PRIORITY WINDOW (Phase C): for the first 15 minutes after
-  // posting, only the invited agents (top-ranked Call Verified agents,
-  // computed at posting) may bid or claim. After match_open_at the job
-  // opens to every Call Verified agent. Poster-side actions never come
-  // through this gate.
+  // posting, only the invited agents (top-ranked verified agents for
+  // the job's capability, computed at posting) may bid or claim. After
+  // match_open_at the job opens to every verified agent for that
+  // capability. Poster-side actions never come through this gate.
   const openAt = Number(cj?.match_open_at || 0);
   const invited: any[] = Array.isArray(cj?.match_invited) ? cj.match_invited : [];
   if (openAt > now() && invited.length && !invited.some((x: any) => Number(x?.agent_id) === Number(agent.id))) {
-    throw Object.assign(new Error(`match priority window: this contract job is in its 15-minute priority window - only the invited Call Verified agents can bid or claim until ${new Date(openAt * 1000).toISOString()}. After that it opens to every Call Verified agent.`), { status: 403 });
+    throw Object.assign(new Error(`match priority window: this contract job is in its 15-minute priority window - only the invited ${verifiedLabelFor(slug)} agents can bid or claim until ${new Date(openAt * 1000).toISOString()}. After that it opens to every ${verifiedLabelFor(slug)} agent.`), { status: 403 });
   }
 }
 // MATCH ROUTING (Phase C, contract jobs only): at posting, rank the
@@ -662,25 +827,33 @@ async function computeContractMatches(job: any, contractSpec: any, posterUserId:
     agentsById: new Map<number, any>(top.map((a: any) => [Number(a.id), a])),
   };
 }
-async function attestCapability(agent: any, slug: string, phoneRaw: unknown) {
-  // AGENTS-ONLY (owner ruling, 2026-10-26): a human profile cannot
-  // attest a caller number at all - call contracts are for agents.
-  if (agent.is_human) throw Object.assign(new Error("human profiles cannot attest a caller number — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
+async function attestCapability(agent: any, slug: string, idRaw: unknown) {
+  // AGENTS-ONLY (owner ruling, 2026-10-26, EVERY contract type): a
+  // human profile cannot attest an identifier at all - contracts are
+  // for agents, and a human profile can never hold a verification.
+  if (agent.is_human) throw Object.assign(new Error(slug === "email_send"
+    ? "human profiles cannot attest a sending address — email contracts are for verified agents only, and a human profile can never be Email Verified"
+    : "human profiles cannot attest a caller number — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
   const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
   if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}"`), { status: 404 });
-  const phone = cleanPhone(phoneRaw);
-  if (!phone) throw Object.assign(new Error("a valid caller number is required (7-15 digits, optional leading +) - this is the number your proofs must come from"), { status: 400 });
+  const isEmail = slug === "email_send";
+  const ident = isEmail ? cleanEmail(idRaw) : cleanPhone(idRaw);
+  if (!ident) throw Object.assign(new Error(isEmail
+    ? "a valid sending email address is required - this is the address your proofs must be sent from"
+    : "a valid caller number is required (7-15 digits, optional leading +) - this is the number your proofs must come from"), { status: 400 });
+  const column = isEmail ? "attested_email" : "attested_phone";
   const existing = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
   const t = now();
   if (existing) {
-    // Changing the attested number invalidates a verification: proofs
-    // must come from the attested number, so a new number re-tests.
-    const patch: Record<string, unknown> = { attested_phone: phone, updated_at: t };
-    if (existing.attested_phone !== phone && existing.status === "verified") { patch.status = "unverified"; patch.verified_at = null; patch.expires_at = null; }
+    // Changing the attested identifier invalidates a verification:
+    // proofs must come from the attested identifier, so a new one
+    // re-tests.
+    const patch: Record<string, unknown> = { [column]: ident, updated_at: t };
+    if (existing[column] !== ident && existing.status === "verified") { patch.status = "unverified"; patch.verified_at = null; patch.expires_at = null; }
     const rows = await pg(`ex_agent_capabilities?id=eq.${existing.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     return rows[0];
   }
-  const rows = await pg("ex_agent_capabilities", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, attested_phone: phone, status: "unverified", test_ref: {}, created_at: t, updated_at: t }) });
+  const rows = await pg("ex_agent_capabilities", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, [column]: ident, status: "unverified", test_ref: {}, created_at: t, updated_at: t }) });
   return rows[0];
 }
 const CHALLENGE_WORDS_A = ["amber", "brisk", "cobalt", "delta", "ember", "fable", "glacier", "harbor", "ivory", "juniper", "kestrel", "lumen", "meadow", "nickel", "onyx", "prairie", "quartz", "raven", "sable", "tundra"];
@@ -694,15 +867,35 @@ const CALL_TEST_QUESTIONS = [
   "State your agent name exactly as it is listed on the Exchange.",
   "In one sentence, what is a contract call job on the Exchange?",
 ];
+const EMAIL_TEST_QUESTIONS = [
+  "State your agent name exactly as it is listed on the Exchange.",
+  "In one sentence, what is a contract email job on the Exchange?",
+];
 async function startCallTest(agent: any, slug: string) {
-  // AGENTS-ONLY (owner ruling, 2026-10-26): a human profile cannot
-  // take the Call Test - call contracts are for agents.
-  if (agent.is_human) throw Object.assign(new Error("human profiles cannot take the Call Test — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
+  // AGENTS-ONLY (owner ruling, 2026-10-26, EVERY contract type): a
+  // human profile cannot take a capability test - contracts are for
+  // agents, and a human profile can never hold a verification.
+  if (agent.is_human) throw Object.assign(new Error(slug === "email_send"
+    ? "human profiles cannot take the Email Test — email contracts are for verified agents only, and a human profile can never be Email Verified"
+    : "human profiles cannot take the Call Test — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
   const cap = await one(`ex_capabilities?slug=eq.${q(slug)}&active=eq.true&select=*`);
   if (!cap) throw Object.assign(new Error(`unknown or inactive capability "${slug}"`), { status: 404 });
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&select=*`);
-  if (!row?.attested_phone) throw Object.assign(new Error("attest your caller number first - proofs are only accepted from the number you register"), { status: 400 });
   const t = now();
+  if (slug === "email_send") {
+    if (!row?.attested_email) throw Object.assign(new Error("attest your sending email address first - proofs are only accepted from the address you register"), { status: 400 });
+    await pg(`ex_capability_tests?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&status=eq.started`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) });
+    // The challenge token rides in the test row's phrase column: the
+    // graded artefact is the subject line carrying this exact token.
+    const token = `${challengePhrase()} ${1000 + Math.floor(Math.random() * 9000)}`;
+    const rows = await pg("ex_capability_tests", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, phrase: token, questions: EMAIL_TEST_QUESTIONS, status: "started", created_at: t, expires_at: t + 3600 }) });
+    return {
+      test_id: rows[0].id, capability: slug, attested_email: row.attested_email,
+      challenge_token: token, questions: EMAIL_TEST_QUESTIONS, expires_at: t + 3600, pass_score: CONTRACT_PASS_SCORE,
+      instructions: "This is a platform-issued challenge - the Exchange never sends email itself and claims no sending service. Using YOUR OWN mail stack, compose and send a real test message FROM your attested address (to any address you control): the subject line must contain the challenge token exactly; the body must identify you as an AI assistant acting on behalf of your owner and answer both questions. Then submit the proof pack here (JSON or multipart): the message's FULL headers (field: headers - including From, Subject, Message-ID and your DKIM-Signature), the full body (field: body), and your two answers (field: answers, a JSON list). Grading is automatic: token in the subject 35, AI-assistant disclosure + required content 25, answers 20, header authenticity (From is your attested address, Message-ID present with a domain matching the From domain, DKIM-Signature present) 20 - pass at 70.",
+    };
+  }
+  if (!row?.attested_phone) throw Object.assign(new Error("attest your caller number first - proofs are only accepted from the number you register"), { status: 400 });
   await pg(`ex_capability_tests?agent_id=eq.${agent.id}&capability=eq.${q(slug)}&status=eq.started`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) });
   const phrase = challengePhrase();
   const rows = await pg("ex_capability_tests", { method: "POST", prefer: "return=representation", body: JSON.stringify({ agent_id: agent.id, capability: slug, phrase, questions: CALL_TEST_QUESTIONS, status: "started", created_at: t, expires_at: t + 3600 }) });
@@ -713,12 +906,16 @@ async function startCallTest(agent: any, slug: string) {
   };
 }
 async function submitCallTest(agent: any, testId: number, input: DeliveryInput) {
-  // AGENTS-ONLY (owner ruling, 2026-10-26): as startCallTest.
-  if (agent.is_human) throw Object.assign(new Error("human profiles cannot take the Call Test — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
   const test = await one(`ex_capability_tests?id=eq.${testId}&agent_id=eq.${agent.id}&select=*`);
-  if (!test) throw Object.assign(new Error("call test not found"), { status: 404 });
-  if (test.status !== "started") throw Object.assign(new Error(`this call test is ${test.status} - start a fresh one`), { status: 400 });
-  if (Number(test.expires_at) < now()) { await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) }); throw Object.assign(new Error("this call test challenge has expired (1 hour) - start a fresh one"), { status: 400 }); }
+  if (!test) throw Object.assign(new Error("capability test not found"), { status: 404 });
+  // AGENTS-ONLY (owner ruling, 2026-10-26, EVERY contract type): as
+  // startCallTest - a human profile can never submit a test proof.
+  if (agent.is_human) throw Object.assign(new Error(test.capability === "email_send"
+    ? "human profiles cannot take the Email Test — email contracts are for verified agents only, and a human profile can never be Email Verified"
+    : "human profiles cannot take the Call Test — call contracts are for verified agents only, and a human profile can never be Call Verified"), { status: 400 });
+  if (test.status !== "started") throw Object.assign(new Error(`this ${testNameFor(test.capability)} is ${test.status} - start a fresh one`), { status: 400 });
+  if (Number(test.expires_at) < now()) { await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: "expired" }) }); throw Object.assign(new Error(`this ${testNameFor(test.capability)} challenge has expired (1 hour) - start a fresh one`), { status: 400 }); }
+  if (test.capability === "email_send") return await submitEmailTest(agent, test, input);
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.${q(test.capability)}&select=*`);
   if (!row?.attested_phone) throw Object.assign(new Error("no attested caller number on file for this agent"), { status: 400 });
   const transcript = String(input.fields.transcript || "").trim();
@@ -749,18 +946,80 @@ async function submitCallTest(agent: any, testId: number, input: DeliveryInput) 
   }
   return { test_id: test.id, score, passed, pass_score: CONTRACT_PASS_SCORE, report, capability_status: passed ? "verified" : row.status, expires_at: passed ? t + CONTRACT_CAPABILITY_TTL : null, recording_sha256: stored.sha256 };
 }
-async function openContractAttempt(job: any, agent: any) {
+// THE EMAIL TEST (Phase D): the mirror of the Call Test for email_send.
+// The platform issues a challenge (a rotating token + two set
+// questions); the agent composes and sends a real test message with
+// its OWN mail stack from its attested address, then submits the proof
+// pack: the message's full headers + full body + the two answers. The
+// platform never sends the test message - it only issues and grades.
+// Grading: token in the subject 35 / disclosure + required content 25
+// / answers 20 / header authenticity 20 - pass at 70, verified 90 days.
+async function submitEmailTest(agent: any, test: any, input: DeliveryInput) {
+  const row = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.email_send&select=*`);
+  if (!row?.attested_email) throw Object.assign(new Error("no attested sending address on file for this agent"), { status: 400 });
+  const headers = String(input.fields.headers || "").trim();
+  if (headers.length < 40) throw Object.assign(new Error("the proof pack needs the test message's FULL headers (field: headers) - From, Subject, Message-ID and DKIM-Signature included"), { status: 400 });
+  const body = String(input.fields.body || input.fields.message || "").trim();
+  if (body.length < 20) throw Object.assign(new Error("the proof pack needs the test message's full body (field: body)"), { status: 400 });
+  let answers: any[] = [];
+  const answersRaw = String(input.fields.answers || "").trim();
+  if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list of strings, one per test question"), { status: 400 }); } }
+  if (!Array.isArray(answers)) throw Object.assign(new Error("answers must be a JSON list of strings, one per test question"), { status: 400 });
+  const parsed = parseHeaders(headers);
+  const subject = parsed.get("subject") || "";
+  const report: { label: string; ok: boolean; points: number; earned: number }[] = [];
+  const grade = (label: string, ok: boolean, points: number) => { report.push({ label, ok, points, earned: ok ? points : 0 }); return ok ? points : 0; };
+  let score = 0;
+  score += grade("challenge token in the subject line", !!String(test.phrase) && subject.includes(String(test.phrase)), 35);
+  score += grade("body identifies the sender as an AI assistant acting for its owner, with the required content", /ai assistant/i.test(body) && /(on behalf of|acting for|for my owner|my principal|sent by)/i.test(body), 25);
+  score += grade("both challenge questions answered", Array.isArray(test.questions) && answers.length === test.questions.length && answers.every((a: any) => String(a || "").trim().length >= 2), 20);
+  const auth = emailProofChecks(headers, { expectedFrom: row.attested_email });
+  const fromOk = auth.checks.find((x) => x.name.startsWith("from is"))?.ok === true;
+  const midOk = auth.checks.find((x) => x.name.startsWith("message-id"))?.ok === true;
+  const dkimOk = parsed.has("dkim-signature");
+  score += grade("header authenticity: From is the attested address, Message-ID domain matches, DKIM-Signature present", fromOk && midOk && dkimOk, 20);
+  const passed = score >= CONTRACT_PASS_SCORE;
+  const t = now();
+  const packSha = await sha256hex(`${headers}\n\n${body}`);
+  await pg(`ex_capability_tests?id=eq.${test.id}`, { method: "PATCH", body: JSON.stringify({ status: passed ? "passed" : "failed", score, report: { checks: report, attested_email: row.attested_email, header_checks: auth.checks }, recording_sha256: packSha, submitted_at: t }) });
+  if (passed) {
+    const capPatch = { status: "verified", verified_at: t, expires_at: t + CONTRACT_CAPABILITY_TTL, test_ref: { last_test_id: test.id, score, proof_sha256: packSha, graded_at: t }, updated_at: t };
+    if (row.id) await pg(`ex_agent_capabilities?id=eq.${row.id}`, { method: "PATCH", body: JSON.stringify(capPatch) });
+    await feed("review", `${agent.name} passed the email_send Email Test (${score}/100) - Email Verified`, null);
+  }
+  return { test_id: test.id, score, passed, pass_score: CONTRACT_PASS_SCORE, report, capability_status: passed ? "verified" : row.status, expires_at: passed ? t + CONTRACT_CAPABILITY_TTL : null, proof_sha256: packSha };
+}
+async function openContractAttempt(job: any, agent: any, entryIndex?: number) {
   const cj = await contractJobRow(job.id);
   if (!cj) throw Object.assign(new Error("this job has no contract record"), { status: 400 });
-  if (job.awarded_agent_id !== agent.id) throw Object.assign(new Error("only the awarded agent can open call attempts on this job"), { status: 403 });
+  if (job.awarded_agent_id !== agent.id) throw Object.assign(new Error("only the awarded agent can open attempts on this job"), { status: 403 });
   if (job.status !== "awarded") throw Object.assign(new Error(`attempts can only be opened while the job is awarded (it is ${job.status})`), { status: 400 });
   const t = now();
-  // The call window is STRICT: no early opening, no late opening.
-  if (t < Number(cj.window_start)) throw Object.assign(new Error(`the call window has not opened yet - it opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz})`), { status: 400 });
-  if (t > Number(cj.window_end)) throw Object.assign(new Error(`the call window has closed (it ended ${new Date(Number(cj.window_end) * 1000).toISOString()} ${cj.window_tz})`), { status: 400 });
+  const slug = cj.capability || "phone_call";
+  const scheduled = cj.task_count !== null && cj.task_count !== undefined;
+  // The window is STRICT: no early opening, no late opening. For a
+  // scheduled contract this window is the schedule window.
+  if (t < Number(cj.window_start)) throw Object.assign(new Error(`the ${scheduled ? "schedule" : (slug === "email_send" ? "send" : "call")} window has not opened yet - it opens ${new Date(Number(cj.window_start) * 1000).toISOString()} (${cj.window_tz})`), { status: 400 });
+  if (t > Number(cj.window_end)) throw Object.assign(new Error(`the ${scheduled ? "schedule" : (slug === "email_send" ? "send" : "call")} window has closed (it ended ${new Date(Number(cj.window_end) * 1000).toISOString()} ${cj.window_tz})`), { status: 400 });
   const attempts = await contractAttemptsOf(job.id);
+  if (scheduled) {
+    // PER-ENTRY attempts (Phase D): each schedule entry carries its
+    // own attempt budget and its own open-attempt slot; entries work
+    // independently of each other.
+    const idx = Math.floor(Number(entryIndex || 0));
+    if (!idx || idx < 1 || idx > Number(cj.task_count)) throw Object.assign(new Error(`a scheduled contract attempt needs entry_index: the schedule entry being worked (1..${cj.task_count}) - pass it in the request body`), { status: 400 });
+    const task = await one(`ex_contract_tasks?job_id=eq.${job.id}&entry_index=eq.${idx}&select=*`);
+    if (!task) throw Object.assign(new Error(`schedule entry ${idx} does not exist on this job`), { status: 404 });
+    if (task.status === "proved" || task.status === "failed") throw Object.assign(new Error(`schedule entry ${idx} is already resolved (${task.status})`), { status: 400 });
+    const mine = attempts.filter((a: any) => Number(a.task_id) === Number(task.id));
+    if (mine.length >= Number(cj.max_attempts)) throw Object.assign(new Error(`attempt budget spent on entry ${idx}: this job allows at most ${cj.max_attempts} attempts per entry`), { status: 400 });
+    if (mine.some((a: any) => !a.ended_at)) throw Object.assign(new Error(`an attempt is already open on entry ${idx} - close it with its outcome first`), { status: 400 });
+    const rows = await pg("ex_contract_attempts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, task_id: task.id, started_at: t, created_at: t }) });
+    if (task.status === "pending") await pg(`ex_contract_tasks?id=eq.${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "attempted", updated_at: t }) });
+    return rows[0];
+  }
   if (attempts.length >= Number(cj.max_attempts)) throw Object.assign(new Error(`attempt budget spent: this job allows at most ${cj.max_attempts} attempts`), { status: 400 });
-  if (attempts.some((a: any) => !a.ended_at)) throw Object.assign(new Error("an attempt is already open on this job - close it with its outcome first (one call at a time)"), { status: 400 });
+  if (attempts.some((a: any) => !a.ended_at)) throw Object.assign(new Error("an attempt is already open on this job - close it with its outcome first (one attempt at a time)"), { status: 400 });
   const rows = await pg("ex_contract_attempts", { method: "POST", prefer: "return=representation", body: JSON.stringify({ job_id: job.id, agent_id: agent.id, started_at: t, created_at: t }) });
   return rows[0];
 }
@@ -771,30 +1030,133 @@ async function closeContractAttempt(job: any, agent: any, attemptId: number, b: 
   if (!attempt) throw Object.assign(new Error("attempt not found"), { status: 404 });
   if (attempt.agent_id !== agent.id) throw Object.assign(new Error("this attempt belongs to another agent"), { status: 403 });
   if (attempt.ended_at) throw Object.assign(new Error("this attempt is already closed"), { status: 400 });
+  const slug = cj.capability || "phone_call";
+  const valid = outcomesFor(slug);
   const outcome = String(b.outcome || "");
-  if (!CONTRACT_OUTCOMES.includes(outcome)) throw Object.assign(new Error(`outcome must be one of: ${CONTRACT_OUTCOMES.join(", ")}`), { status: 400 });
+  if (!valid.includes(outcome)) throw Object.assign(new Error(`outcome must be one of: ${valid.join(", ")}`), { status: 400 });
   const duration = Math.max(0, Math.min(86400, Math.floor(Number(b.duration_sec || 0))));
   const t = now();
   const rows = await pg(`ex_contract_attempts?id=eq.${attempt.id}&ended_at=is.null`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ ended_at: t, outcome, duration_sec: duration }) });
   if (!rows.length) throw Object.assign(new Error("attempt was already closed"), { status: 409 });
+  if (attempt.task_id) {
+    // PER-ENTRY close (Phase D): the entry records the outcome; a
+    // terminal outcome leaves it ready for its per-entry proof, and a
+    // non-terminal outcome with the entry's budget spent resolves it
+    // as failed (it settles at its outcome's percentage - 0 by rule).
+    const patch: Record<string, unknown> = { outcome, updated_at: t };
+    const entryAttempts = (await contractAttemptsOf(job.id)).filter((a: any) => Number(a.task_id) === Number(attempt.task_id));
+    if (!terminalOutcomesFor(slug).includes(outcome) && entryAttempts.length >= Number(cj.max_attempts)) { patch.status = "failed"; patch.resolved_at = t; }
+    await pg(`ex_contract_tasks?id=eq.${attempt.task_id}`, { method: "PATCH", body: JSON.stringify(patch) });
+    return { attempt: rows[0], entry_outcome: outcome };
+  }
   // The job's final outcome: a terminal outcome settles it; otherwise,
   // when the attempt budget is exhausted, the last outcome settles it.
   let finalOutcome = cj.final_outcome || "";
   if (!finalOutcome) {
     const attempts = await contractAttemptsOf(job.id);
-    if (CONTRACT_TERMINAL_OUTCOMES.includes(outcome) || attempts.length >= Number(cj.max_attempts)) {
+    if (terminalOutcomesFor(slug).includes(outcome) || attempts.length >= Number(cj.max_attempts)) {
       finalOutcome = outcome;
       await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ final_outcome: outcome }) });
     }
   }
   return { attempt: rows[0], final_outcome: finalOutcome };
 }
+// ---------- SEALED SCHEDULE FILE (Phase D) ----------
+// The schedule file is the ONLY place a scheduled contract's private
+// data exists. It is stored in the private deliverables bucket under
+// the contract/schedules prefix, its SHA-256 is pinned on the contract
+// row at upload, its bytes never appear in any API JSON, and every
+// download is audit-logged in ex_schedule_file_access.
+const SCHEDULE_FILE_EXTS = ["txt", "csv", "md", "pdf", "json", "docx", "xlsx", "zip"];
+function scheduleFileKind(file: File, bytes: Uint8Array): { ok: boolean; detail: string } {
+  const name = String(file.name || "").toLowerCase();
+  const ext = name.includes(".") ? name.split(".").pop()! : "";
+  if (!SCHEDULE_FILE_EXTS.includes(ext)) return { ok: false, detail: `file type .${ext || "?"} is not allowed - schedule files must be one of: ${SCHEDULE_FILE_EXTS.join(", ")}` };
+  const head = bytes.slice(0, 4);
+  const isZip = head[0] === 0x50 && head[1] === 0x4b;
+  if (ext === "pdf") return { ok: bytes.length >= 4 && new TextDecoder().decode(bytes.slice(0, 4)) === "%PDF", detail: "pdf signature check" };
+  if (ext === "zip" || ext === "docx" || ext === "xlsx") return { ok: isZip, detail: "zip container signature check" };
+  // Text family: must decode as UTF-8 with no NUL bytes in the sample.
+  const sample = bytes.slice(0, 8192);
+  if (sample.some((x) => x === 0)) return { ok: false, detail: "file looks binary, not text" };
+  try { new TextDecoder("utf-8", { fatal: true }).decode(sample); } catch { return { ok: false, detail: "file is not valid UTF-8 text" }; }
+  if (ext === "json") { try { JSON.parse(new TextDecoder().decode(bytes)); } catch { return { ok: false, detail: "file does not parse as JSON" }; } }
+  return { ok: true, detail: "text file" };
+}
+async function uploadScheduleFile(job: any, actorUserId: number, isAdmin: boolean, input: DeliveryInput) {
+  const cj = await contractJobRow(job.id);
+  if (!cj) throw Object.assign(new Error("this job has no contract record"), { status: 400 });
+  if (cj.task_count === null || cj.task_count === undefined) throw Object.assign(new Error("this is not a scheduled contract - only scheduled contracts carry a sealed schedule file"), { status: 400 });
+  if (!isAdmin && job.poster_user_id !== actorUserId) throw Object.assign(new Error("only the poster can attach the schedule file"), { status: 403 });
+  if (job.status !== "open") throw Object.assign(new Error(`the schedule file can only be attached while the job is open (it is ${job.status})`), { status: 400 });
+  if (!input.file) throw Object.assign(new Error("attach the schedule file as multipart field: file"), { status: 400 });
+  const buf = await input.file.arrayBuffer();
+  const kind = scheduleFileKind(input.file, new Uint8Array(buf));
+  if (!kind.ok) throw Object.assign(new Error(`schedule file rejected: ${kind.detail}`), { status: 400 });
+  const stored = await storeDeliveryFile(job.id, input.file, "contract/schedules");
+  if (cj.schedule_storage_path && cj.schedule_storage_path !== stored.storage_path) await deleteDeliveryFile(cj.schedule_storage_path).catch(() => null);
+  await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ schedule_file_name: stored.file_name, schedule_file_size: stored.file_size, schedule_file_type: stored.file_type, schedule_storage_path: stored.storage_path, schedule_sha256: stored.sha256 }) });
+  return { file_name: stored.file_name, file_size: stored.file_size, file_type: stored.file_type, sha256: stored.sha256, task_count: Number(cj.task_count), note: "Sealed. The file's contents are visible to no one through the API - the awarded agent downloads it over a short-lived signed link after award, and every download is logged." };
+}
+// actor: who is asking, already authorized by the route. role is what
+// gets written into the audit log.
+async function downloadScheduleFile(job: any, actor: { userId: number; agentId: number | null; role: string }) {
+  const cj = await contractJobRow(job.id);
+  if (!cj?.schedule_storage_path) throw Object.assign(new Error("this contract has no schedule file attached"), { status: 404 });
+  const t = now();
+  await pg("ex_schedule_file_access", { method: "POST", body: JSON.stringify({ job_id: job.id, actor_user_id: actor.userId || null, actor_agent_id: actor.agentId || null, actor_role: actor.role, created_at: t }) });
+  const url = await signedDeliveryUrl(cj.schedule_storage_path);
+  return { url, file_name: cj.schedule_file_name || "", file_size: Number(cj.schedule_file_size || 0), sha256: cj.schedule_sha256 || "", expires_in: 600 };
+}
+async function scheduleAccessOf(jobId: number) {
+  return await pg(`ex_schedule_file_access?job_id=eq.${jobId}&select=id,actor_user_id,actor_agent_id,actor_role,created_at&order=created_at.asc`);
+}
+// PER-ENTRY PROOF (Phase D): the awarded agent proves ONE schedule
+// entry. Call entries: recording + transcript + answers (the Phase A
+// proof rules). Email entries: the sent message's headers + body,
+// graded by emailProofChecks against the agent's attested address
+// (and the declared subject, where the job itself declared one).
+async function submitTaskProof(job: any, agent: any, entryIndex: number, input: DeliveryInput) {
+  const cj = await contractJobRow(job.id);
+  if (!cj) throw Object.assign(new Error("this job has no contract record"), { status: 400 });
+  if (job.awarded_agent_id !== agent.id) throw Object.assign(new Error("only the awarded agent can submit entry proof on this job"), { status: 403 });
+  if (job.status !== "awarded") throw Object.assign(new Error(`entry proof can only be submitted while the job is awarded (it is ${job.status})`), { status: 400 });
+  const idx = Math.floor(Number(entryIndex || 0));
+  const task = await one(`ex_contract_tasks?job_id=eq.${job.id}&entry_index=eq.${idx}&select=*`);
+  if (!task) throw Object.assign(new Error(`schedule entry ${idx} does not exist on this job`), { status: 404 });
+  if (task.status === "proved" || task.status === "failed") throw Object.assign(new Error(`schedule entry ${idx} is already resolved (${task.status})`), { status: 400 });
+  const slug = cj.capability || "phone_call";
+  if (!terminalOutcomesFor(slug).includes(String(task.outcome || ""))) throw Object.assign(new Error(`entry ${idx} has no completed attempt yet - log an attempt and close it with a terminal outcome (${terminalOutcomesFor(slug).join(", ")}) before submitting its proof`), { status: 400 });
+  const t = now();
+  if (slug === "email_send") {
+    const headers = String(input.fields.headers || "").trim();
+    if (headers.length < 40) throw Object.assign(new Error("email entry proof needs the sent message's full headers (field: headers), Message-ID included"), { status: 400 });
+    const bodyText = String(input.fields.body || input.fields.message || "").trim();
+    if (bodyText.length < 10) throw Object.assign(new Error("email entry proof needs a copy of the sent message body (field: body)"), { status: 400 });
+    const capRow = await one(`ex_agent_capabilities?agent_id=eq.${agent.id}&capability=eq.email_send&select=*`);
+    const check = emailProofChecks(headers, { expectedFrom: capRow?.attested_email || "", expectedSubject: cj.task_count === null || cj.task_count === undefined ? (cj.email_subject || "") : "" });
+    await pg(`ex_contract_tasks?id=eq.${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "proved", resolved_at: t, proof_headers: headers.slice(0, 20000), proof_body: bodyText.slice(0, 20000), proof_check: check, updated_at: t }) });
+    return { entry_index: idx, status: "proved", proof_check: check };
+  }
+  const transcript = String(input.fields.transcript || "").trim();
+  if (transcript.length < 10) throw Object.assign(new Error("call entry proof needs the call transcript (field: transcript)"), { status: 400 });
+  let answers: any[] = [];
+  const answersRaw = String(input.fields.answers || "").trim();
+  if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list of strings, one per job question"), { status: 400 }); } }
+  const questions = Array.isArray(cj.questions) ? cj.questions : [];
+  if (!Array.isArray(answers) || answers.length !== questions.length) throw Object.assign(new Error(`call entry proof needs exactly ${questions.length} answers (field: answers, a JSON list) - one per question on this job`), { status: 400 });
+  if (!input.file) throw Object.assign(new Error("call entry proof needs the call recording (multipart field: file) - a link is not proof"), { status: 400 });
+  if (!isAudioFile(input.file)) throw Object.assign(new Error("the entry recording must be an audio file (mp3, wav, ogg, webm, m4a, opus or flac)"), { status: 400 });
+  const stored = await storeDeliveryFile(job.id, input.file, "contract");
+  await pg(`ex_contract_tasks?id=eq.${task.id}`, { method: "PATCH", body: JSON.stringify({ status: "proved", resolved_at: t, proof_storage_path: stored.storage_path, proof_file_name: stored.file_name, proof_file_type: stored.file_type, proof_sha256: stored.sha256, proof_check: stored.check, proof_transcript: transcript, proof_answers: answers, updated_at: t }) });
+  return { entry_index: idx, status: "proved", proof_sha256: stored.sha256, proof_check: stored.check };
+}
 async function revokeCapability(agentId: number, slug: string, reason: string) {
   const row = await one(`ex_agent_capabilities?agent_id=eq.${agentId}&capability=eq.${q(slug)}&select=*`);
   if (!row) throw Object.assign(new Error("that agent holds no such capability record"), { status: 404 });
   const rows = await pg(`ex_agent_capabilities?id=eq.${row.id}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "revoked", test_ref: { ...(row.test_ref || {}), revoked_at: now(), revoke_reason: String(reason || "").slice(0, 300) }, updated_at: now() }) });
   const agent = await one(`ex_agents?id=eq.${agentId}&select=name,owner_id`);
-  if (agent) await notify(agent.owner_id, "security", `${agent.name}'s ${slug} capability was revoked by an admin${reason ? `: ${String(reason).slice(0, 200)}` : ""}. The agent must pass the Call Test again before it can bid on contract jobs.`, `#/agent/${agentId}`);
+  if (agent) await notify(agent.owner_id, "security", `${agent.name}'s ${slug} capability was revoked by an admin${reason ? `: ${String(reason).slice(0, 200)}` : ""}. The agent must pass the ${testNameFor(slug)} again before it can bid on contract jobs.`, `#/agent/${agentId}`);
   return rows[0];
 }
 
@@ -1237,8 +1599,13 @@ async function handle(req: Request) {
       const cjs = await pg(`ex_contract_jobs?job_id=in.(${contractIds.join(",")})&select=*`);
       for (const cj of cjs) cjMap.set(cj.job_id, cj);
     }
+    const capFilter = (url.searchParams.get("capability") || "").trim();
     const out = [];
     for (const j of rows) {
+      // Capability floor filter (Phase D): ?capability=email_send
+      // shows only email contracts, ?capability=phone_call only call
+      // contracts - the floor's Call jobs / Email jobs chips.
+      if (capFilter && (j.job_kind !== "contract" || cjMap.get(j.id)?.capability !== capFilter)) continue;
       const bidRows = await pg(`ex_bids?job_id=eq.${j.id}&select=amount_cents&status=eq.active`);
       const view: any = { ...publicJobView(j, false), poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, bid_count: bidRows.length, lowest_bid_cents: bidRows.length ? Math.min(...bidRows.map((b: any) => b.amount_cents)) : null };
       if (j.job_kind === "contract") view.contract = contractView(cjMap.get(j.id), false);
@@ -1268,6 +1635,14 @@ async function handle(req: Request) {
       const canSeeContact = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
       (jobView as any).contract = contractView(cj, canSeeContact, canSeeDelivery);
       (jobView as any).attempts = await contractAttemptsOf(id);
+      if (cj && cj.task_count !== null && cj.task_count !== undefined) {
+        // SCHEDULED CONTRACTS: the entry shells (status + outcome) are
+        // public like the attempt timeline; entry PROOF is party-only.
+        // The sealed file's download log is poster/admin only.
+        const tasks = await contractTasksOf(id);
+        (jobView as any).contract_tasks = tasks.map((x: any) => contractTaskView(x, canSeeDelivery));
+        if (viewer && (viewer.id === j.poster_user_id || viewer.role === "admin")) (jobView as any).schedule_access = await scheduleAccessOf(id);
+      }
     }
     return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review });
   }
@@ -1325,6 +1700,45 @@ async function handle(req: Request) {
     if (!j.delivery_storage_path) return err("this delivery has no uploaded file - it was delivered with an external download link", 404);
     const dl = await signedDeliveryUrl(j.delivery_storage_path);
     return json({ url: dl, file_name: j.delivery_file_name, file_size: j.delivery_file_size, expires_in: 600 });
+  }
+  // SEALED SCHEDULE FILE (Phase D): the poster attaches it right after
+  // posting (the job must still be open); downloads are role-gated -
+  // poster + admin any time, the awarded agent's owner only once the
+  // job is awarded - and EVERY download is audit-logged.
+  if (path.match(/^\/jobs\/\d+\/contract\/schedule-file$/) && method === "POST") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j) return err("job not found", 404);
+    if (j.poster_user_id !== u.id && u.role !== "admin") return err("only the poster can attach the schedule file", 403);
+    const input = await readDeliveryInput(req);
+    try { return json({ schedule_file: await uploadScheduleFile(j, u.id, u.role === "admin", input) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/jobs\/\d+\/contract\/schedule-file$/) && method === "GET") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j) return err("job not found", 404);
+    const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    let role = "";
+    if (u.role === "admin") role = "admin";
+    else if (j.poster_user_id === u.id) role = "poster";
+    else if (awardedOwner === u.id && ["awarded", "delivered", "completed", "disputed"].includes(j.status)) role = "awarded_owner";
+    if (!role) return err("the sealed schedule file opens only to the poster, admins, and - after award - the awarded agent", 403);
+    try { return json({ download: await downloadScheduleFile(j, { userId: u.id, agentId: null, role }) }); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/jobs\/\d+\/contract\/tasks\/\d+\/proof-file$/) && method === "GET") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[1]);
+    const entryIndex = parseInt(seg[4]);
+    const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!j) return err("job not found", 404);
+    const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+    if (!(j.poster_user_id === u.id || awardedOwner === u.id || u.role === "admin")) return err("entry proof files are private to the buyer, the worker and admins", 403);
+    const task = await one(`ex_contract_tasks?job_id=eq.${jobId}&entry_index=eq.${entryIndex}&select=*`);
+    if (!task?.proof_storage_path) return err("this entry has no uploaded proof file", 404);
+    const dl = await signedDeliveryUrl(task.proof_storage_path);
+    return json({ url: dl, file_name: task.proof_file_name, file_size: 0, sha256: task.proof_sha256, expires_in: 600 });
   }
 
   // ===== auth =====
@@ -1513,20 +1927,32 @@ async function handle(req: Request) {
       }
       if (contractSpec) {
         await pg("ex_contract_jobs", { method: "POST", body: JSON.stringify({ job_id: job.id, ...contractSpec, created_at: t }) });
-        // MATCH ROUTING (Phase C): invite the top Call Verified agents
-        // and hold a 15-minute priority window for them. If nobody is
-        // eligible the job simply opens to everyone at once - a job is
-        // never trapped by the match step. The webhook payload carries
-        // the job's public brief only - NEVER the contact phone.
+        // SCHEDULED CONTRACTS (Phase D): create one shell row per
+        // schedule entry now - the entries' private contents stay in
+        // the sealed file the poster attaches next; these rows only
+        // track execution (attempts, outcome, per-entry proof).
+        if (contractSpec.task_count) {
+          for (let i = 1; i <= Number(contractSpec.task_count); i++) {
+            await pg("ex_contract_tasks", { method: "POST", body: JSON.stringify({ job_id: job.id, entry_index: i, status: "pending", created_at: t, updated_at: t }) });
+          }
+        }
+        // MATCH ROUTING (Phase C): invite the top verified agents for
+        // the job's capability and hold a 15-minute priority window
+        // for them. If nobody is eligible the job simply opens to
+        // everyone at once - a job is never trapped by the match step.
+        // The webhook payload carries the job's public brief only -
+        // NEVER the contact phone, the recipient or the schedule file.
         try {
           const m = await computeContractMatches(job, contractSpec, posterUserId);
           if (m.invited.length) {
             await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ match_invited: m.invited, match_open_at: m.openAt }) });
+            const capWord = contractSpec.capability === "email_send" ? "email" : "call";
+            const sealedWord = contractSpec.capability === "email_send" ? "The recipient stays hidden until award." : "The contact number stays hidden until award.";
             for (const inv of m.invited) {
               const ag = m.agentsById.get(inv.agent_id);
               if (!ag) continue;
-              await notify(ag.owner_id, "award", `${ag.name} is invited to a new contract call job: "${job.title}" - the 15-minute priority window is open, so invited Call Verified agents bid first; after that every Call Verified agent can. The contact number stays hidden until award.`, `#/job/${job.id}`);
-              if (ag.webhook_url) await fireWebhook(ag.webhook_url, { event: "contract_job_available", job_id: job.id, title: job.title, budget_cents: job.budget_cents, category: job.category, window_start: contractSpec.window_start, window_end: contractSpec.window_end, window_tz: contractSpec.window_tz, match_open_at: m.openAt });
+              await notify(ag.owner_id, "award", `${ag.name} is invited to a new contract ${capWord} job: "${job.title}" - the 15-minute priority window is open, so invited ${verifiedLabelFor(contractSpec.capability as string)} agents bid first; after that every ${verifiedLabelFor(contractSpec.capability as string)} agent can. ${sealedWord}`, `#/job/${job.id}`);
+              if (ag.webhook_url) await fireWebhook(ag.webhook_url, { event: "contract_job_available", job_id: job.id, title: job.title, budget_cents: job.budget_cents, category: job.category, capability: contractSpec.capability, scheduled: !!contractSpec.task_count, task_count: contractSpec.task_count || null, window_start: contractSpec.window_start, window_end: contractSpec.window_end, window_tz: contractSpec.window_tz, match_open_at: m.openAt });
             }
           }
         } catch (e) { console.error("contract match routing failed for job", job.id, e); }
@@ -1681,7 +2107,11 @@ async function handle(req: Request) {
     // awarded to one - checked again here so no path can slip through.
     if (job.job_kind === "contract") {
       const winner = await one(`ex_agents?id=eq.${bid.agent_id}&select=is_human`);
-      if (winner?.is_human) throw Object.assign(new Error("call contracts are for verified agents only — a human profile cannot be awarded a call contract"), { status: 400 });
+      if (winner?.is_human) throw Object.assign(new Error("contracts are for verified agents only — a human profile cannot be awarded a contract of any type"), { status: 400 });
+      // SEALED SCHEDULE FILE: a scheduled contract has nothing to work
+      // from until its file is attached - it cannot be awarded first.
+      const cjAward = await contractJobRow(job.id);
+      if (cjAward && cjAward.task_count !== null && cjAward.task_count !== undefined && !cjAward.schedule_storage_path) throw Object.assign(new Error("this scheduled contract cannot be awarded yet - its poster has not attached the sealed schedule file"), { status: 400 });
     }
     await assertNoSharedSignupIp(job.poster_user_id, bid.bidder_user_id);
     // ESCROW INVARIANT: the full agreed price must be held before the
@@ -1741,11 +2171,20 @@ async function handle(req: Request) {
       }
     } catch (e) { console.error("bid_not_selected mail failed", e); }
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, deliver_via: `/agent/jobs/${job.id}/deliver` });
-    // CONTRACT JOBS: the winner gets the dedicated event too. The contact
-    // number itself is NOT put in the webhook (webhooks get logged in
-    // places the platform does not control) - it is revealed on the job
-    // through the authenticated API, to the awarded agent only.
-    if (job.job_kind === "contract" && agent?.webhook_url) await fireWebhook(agent.webhook_url, { event: "contract_job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, note: "You won a contract call job. The contact is revealed to you on GET /agent/jobs/:id - open an attempt inside the call window before dialling (POST /agent/jobs/:id/contract/attempts)." });
+    // CONTRACT JOBS: the winner gets the dedicated event too. The
+    // private brief (contact number, recipient, schedule file) is NOT
+    // put in the webhook (webhooks get logged in places the platform
+    // does not control) - it is revealed on the job through the
+    // authenticated API, to the awarded agent only.
+    if (job.job_kind === "contract" && agent?.webhook_url) {
+      const cjWon = await contractJobRow(job.id).catch(() => null);
+      const capWon = cjWon?.capability || "phone_call";
+      const isSchedWon = cjWon && cjWon.task_count !== null && cjWon.task_count !== undefined;
+      const note = capWon === "email_send"
+        ? `You won a contract email job. The recipient and subject are revealed to you on GET /agent/jobs/:id - open an attempt inside the send window before sending (POST /agent/jobs/:id/contract/attempts).${isSchedWon ? " This is a SCHEDULED contract: download the sealed schedule file (GET /agent/jobs/:id/contract/schedule-file) - the recipients, subjects and instructions live only in that file; work entry by entry and prove each entry." : ""}`
+        : `You won a contract call job. The contact is revealed to you on GET /agent/jobs/:id - open an attempt inside the call window before dialling (POST /agent/jobs/:id/contract/attempts).${isSchedWon ? " This is a SCHEDULED contract: download the sealed schedule file (GET /agent/jobs/:id/contract/schedule-file) - the contacts and per-entry instructions live only in that file; work entry by entry and prove each entry." : ""}`;
+      await fireWebhook(agent.webhook_url, { event: "contract_job_awarded", job_id: job.id, title: job.title, agreed_cents: bid.amount_cents, capability: capWon, scheduled: !!isSchedWon, note });
+    }
     await feed("awarded", `"${job.title}" awarded to ${agent?.name} for $${(bid.amount_cents / 100).toFixed(2)}`, job.id);
     return updated[0];
   }
@@ -1800,13 +2239,22 @@ async function handle(req: Request) {
       review: review || null,
       // CONTRACT JOBS: the evidence pack IS the case file - the full
       // contract brief (this pack only reaches parties and admins, so
-      // the contact is included), the server-timestamped attempt log,
-      // and the proof transcript + answers. The recording itself is in
-      // the delivery block above (fingerprint + signed download route).
+      // the private fields are included), the server-timestamped
+      // attempt log, the proof, and - for scheduled contracts - the
+      // per-entry task rows with their proof, the schedule file's
+      // fingerprint and its full download audit log. The file bytes
+      // themselves are never in the pack: fingerprint + log only.
       contract: job.job_kind === "contract" ? await (async () => {
         const cj = await contractJobRow(job.id);
         if (!cj) return null;
-        return { ...cj, attempts: await contractAttemptsOf(job.id) };
+        const scheduled = cj.task_count !== null && cj.task_count !== undefined;
+        return {
+          ...cj,
+          attempts: await contractAttemptsOf(job.id),
+          tasks: scheduled ? await contractTasksOf(job.id) : [],
+          schedule_file: scheduled ? { name: cj.schedule_file_name || "", size: Number(cj.schedule_file_size || 0), type: cj.schedule_file_type || "", sha256: cj.schedule_sha256 || "", attached: !!cj.schedule_storage_path } : null,
+          schedule_access: scheduled ? await scheduleAccessOf(job.id) : [],
+        };
       })() : null,
     };
   }
@@ -1993,45 +2441,79 @@ async function handle(req: Request) {
   async function deliverJob(job: any, input: DeliveryInput) {
     const msGuard = await milestonesOf(job.id);
     if (msGuard.length) throw Object.assign(new Error("this job pays by milestones - deliver each milestone separately (POST /jobs/:id/milestones/:milestoneId/deliver)"), { status: 400 });
-    // CONTRACT JOBS: the delivery IS the proof pack - the call recording
-    // (a real audio file, no links), the full transcript, and one answer
-    // per question - and it is only accepted once at least one attempt
-    // has been closed, so a final outcome exists to price the job by.
+    // CONTRACT JOBS: the delivery IS the proof. Three shapes:
+    //  - single CALL contract: the proof pack - the call recording (a
+    //    real audio file, no links), the full transcript, one answer
+    //    per question - accepted once a final outcome exists.
+    //  - single EMAIL contract: the sent-message evidence - the full
+    //    headers + body of the message the agent sent with its own
+    //    stack, graded by emailProofChecks - accepted once a final
+    //    outcome exists.
+    //  - SCHEDULED contract (either capability): the per-entry proofs
+    //    already submitted entry by entry; delivery is the act of
+    //    declaring the run complete, allowed only when EVERY entry is
+    //    resolved (proved, or terminally failed on a spent budget).
     let contractProof: { transcript: string; answers: any[] } | null = null;
+    let contractEmailProof: { headers: string; body: string; check: any } | null = null;
+    let contractDeliveryOverride: { check: any; sha256: string } | null = null;
     if (job.job_kind === "contract") {
       const cj = await contractJobRow(job.id);
       if (!cj) throw Object.assign(new Error("contract record missing for this job"), { status: 400 });
-      if (!cj.final_outcome) throw Object.assign(new Error("no closed call attempt yet: open an attempt inside the call window, place the call, close it with its outcome - then deliver the proof pack (POST /agent/jobs/:id/contract/attempts)"), { status: 400 });
-      const transcript = String(input.fields.transcript || "").trim();
-      if (transcript.length < 10) throw Object.assign(new Error("contract delivery requires the full call transcript (field: transcript)"), { status: 400 });
-      let answers: any[] = [];
-      const answersRaw = String(input.fields.answers || "").trim();
-      if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list with one answer per question, in order"), { status: 400 }); } }
-      if (!Array.isArray(answers) || answers.length !== (cj.questions || []).length) throw Object.assign(new Error(`contract delivery requires an answer to each of the ${(cj.questions || []).length} questions, in order (field: answers, a JSON list)`), { status: 400 });
-      if (!input.file) throw Object.assign(new Error("contract delivery requires the call recording as an uploaded audio file - a download link is not proof of a call"), { status: 400 });
-      if (!isAudioFile(input.file)) throw Object.assign(new Error("the proof recording must be an audio file (mp3, wav, ogg, webm, m4a, opus or flac)"), { status: 400 });
-      contractProof = { transcript: transcript.slice(0, 20000), answers };
+      const scheduled = cj.task_count !== null && cj.task_count !== undefined;
+      if (scheduled) {
+        const tasks = await contractTasksOf(job.id);
+        const unresolved = tasks.filter((x: any) => x.status !== "proved" && x.status !== "failed");
+        if (unresolved.length) throw Object.assign(new Error(`this scheduled contract still has ${unresolved.length} unresolved ${unresolved.length === 1 ? "entry" : "entries"} (of ${tasks.length}) - prove each entry (POST /agent/jobs/:id/contract/tasks/:entryIndex/proof) or spend its attempt budget so it resolves as failed, then deliver`), { status: 400 });
+        const flagged = tasks.some((x: any) => (x.proof_check || {}).verdict === "flagged");
+        contractDeliveryOverride = {
+          check: { verdict: flagged ? "flagged" : "passed", checked_at: now(), checks: tasks.map((x: any) => ({ name: `entry ${x.entry_index}`, ok: x.status === "proved" && (x.proof_check || {}).verdict !== "flagged", detail: `entry ${x.entry_index}: ${x.status}${x.outcome ? ` (${x.outcome})` : ""}${x.proof_sha256 ? `, proof ${String(x.proof_sha256).slice(0, 12)}…` : ""}` })) },
+          sha256: await sha256hex(JSON.stringify(tasks.map((x: any) => [x.entry_index, x.status, x.outcome, x.proof_sha256 || ""]))),
+        };
+      } else if (cj.capability === "email_send") {
+        if (!cj.final_outcome) throw Object.assign(new Error("no closed send attempt yet: open an attempt inside the send window, send the email with your own stack, close the attempt with its outcome - then deliver the sent-message evidence (POST /agent/jobs/:id/contract/attempts)"), { status: 400 });
+        const headers = String(input.fields.headers || "").trim();
+        if (headers.length < 40) throw Object.assign(new Error("email contract delivery requires the sent message's full headers (field: headers), Message-ID included"), { status: 400 });
+        const bodyText = String(input.fields.body || input.fields.message || "").trim();
+        if (bodyText.length < 10) throw Object.assign(new Error("email contract delivery requires a copy of the sent message body (field: body)"), { status: 400 });
+        const capRow = job.awarded_agent_id ? await one(`ex_agent_capabilities?agent_id=eq.${job.awarded_agent_id}&capability=eq.email_send&select=*`) : null;
+        const check = emailProofChecks(headers, { expectedFrom: capRow?.attested_email || "", expectedSubject: cj.email_subject || "" });
+        contractEmailProof = { headers: headers.slice(0, 20000), body: bodyText.slice(0, 20000), check };
+        contractDeliveryOverride = { check, sha256: await sha256hex(`${headers}\n\n${bodyText}`) };
+      } else {
+        if (!cj.final_outcome) throw Object.assign(new Error("no closed call attempt yet: open an attempt inside the call window, place the call, close it with its outcome - then deliver the proof pack (POST /agent/jobs/:id/contract/attempts)"), { status: 400 });
+        const transcript = String(input.fields.transcript || "").trim();
+        if (transcript.length < 10) throw Object.assign(new Error("contract delivery requires the full call transcript (field: transcript)"), { status: 400 });
+        let answers: any[] = [];
+        const answersRaw = String(input.fields.answers || "").trim();
+        if (answersRaw) { try { answers = JSON.parse(answersRaw); } catch { throw Object.assign(new Error("answers must be a JSON list with one answer per question, in order"), { status: 400 }); } }
+        if (!Array.isArray(answers) || answers.length !== (cj.questions || []).length) throw Object.assign(new Error(`contract delivery requires an answer to each of the ${(cj.questions || []).length} questions, in order (field: answers, a JSON list)`), { status: 400 });
+        if (!input.file) throw Object.assign(new Error("contract delivery requires the call recording as an uploaded audio file - a download link is not proof of a call"), { status: 400 });
+        if (!isAudioFile(input.file)) throw Object.assign(new Error("the proof recording must be an audio file (mp3, wav, ogg, webm, m4a, opus or flac)"), { status: 400 });
+        contractProof = { transcript: transcript.slice(0, 20000), answers };
+      }
     }
     const notes = String(input.notes || "").trim();
     if (notes.length < 2) throw Object.assign(new Error("delivery notes required - say what is inside and what the buyer must edit or replace (README / setup notes)"), { status: 400 });
     const link = String(input.link || "").trim();
     if (link && !/^https?:\/\/.+/i.test(link)) throw Object.assign(new Error("the download link must be a full https:// link (Dropbox, Google Drive, MEGA)"), { status: 400 });
-    if (!input.file && !link) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
+    if (!input.file && !link && !contractDeliveryOverride) throw Object.assign(new Error(DELIVERY_RULE_MSG), { status: 400 });
     let stored: any = null;
-    if (input.file) stored = await storeDeliveryFile(job.id, input.file, contractProof ? "contract" : undefined);
+    if (input.file && !contractDeliveryOverride) stored = await storeDeliveryFile(job.id, input.file, contractProof ? "contract" : undefined);
     const patch: Record<string, unknown> = { status: "delivered", deliverable: notes.slice(0, 8000), delivery_link: link.slice(0, 1000), updated_at: now(), delivered_at: now() };
     if (stored) { patch.delivery_storage_path = stored.storage_path; patch.delivery_file_name = stored.file_name; patch.delivery_file_size = stored.file_size; patch.delivery_file_type = stored.file_type; patch.delivery_sha256 = stored.sha256; patch.delivery_check = stored.check; }
+    else if (contractDeliveryOverride) { patch.delivery_check = contractDeliveryOverride.check; patch.delivery_sha256 = contractDeliveryOverride.sha256; }
     else if (link) { patch.delivery_sha256 = await sha256hex(link); patch.delivery_check = { verdict: "link", checked_at: now(), checks: [{ name: "download link", ok: true, detail: "link deliveries cannot be content-checked; the fingerprint covers the URL itself" }] }; }
     const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.awarded`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify(patch) });
     if (!updated.length) { if (stored) await deleteDeliveryFile(stored.storage_path); throw Object.assign(new Error(`cannot deliver a job in status ${job.status}`), { status: 400 }); }
     if (contractProof) await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ proof_transcript: contractProof.transcript, proof_answers: contractProof.answers }) });
+    if (contractEmailProof) await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ proof_headers: contractEmailProof.headers, proof_body: contractEmailProof.body }) });
     await notify(job.poster_user_id, "delivery", `"${job.title}" has been delivered — review and release payment`, `#/job/${job.id}`);
     const dAgentName = job.awarded_agent_id ? (await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=name`))?.name : null;
     await queueLifecycleMail("job_delivered", job.poster_user_id, { agent_name: dAgentName || "The worker", title: job.title, notes: notes.slice(0, 300), link: `${SITE_URL}/#/job/${job.id}` });
     await feed("delivered", `"${job.title}" delivered`, job.id);
     return updated[0];
   }
-  async function completeContractJob(job: any) {
+  async function completeContractJob(job: any, opts: { early?: boolean } = {}) {
     // CONTRACT PAY: the job's pay rule prices the work. Mode "outcome"
     // pays pay_rule[final_outcome] percent of the agreed price. Mode
     // "per_minute" (Phase C) pays for the ANSWERED minutes on the
@@ -2054,6 +2536,13 @@ async function handle(req: Request) {
     const agreed = Number(job.agreed_cents || 0);
     const outcome = cj.final_outcome || "";
     const perMinute = rule.mode === "per_minute";
+    // SCHEDULED CONTRACTS (Phase D) settle PER ENTRY: the agreed price
+    // is split into one share per schedule entry (equal shares, the
+    // LAST entry absorbs the rounding remainder - the milestone
+    // pattern), and each entry pays its own outcome's percentage of
+    // its share. Unresolved entries (early completion) pay 0.
+    const scheduled = cj.task_count !== null && cj.task_count !== undefined;
+    const tasks: any[] = scheduled ? await contractTasksOf(job.id) : [];
     let pct = 0;
     let due = 0;
     let fee = 0;
@@ -2075,7 +2564,20 @@ async function handle(req: Request) {
       const paidMinutes = Math.min(billableMinutes, capMin);
       due = Math.min(paidMinutes * rate, agreed);
       fee = due <= 0 ? 0 : (due >= agreed && agreed > 0 ? Number(job.fee_cents || 0) : Math.round((due * (await feePct())) / 100));
-      breakdown = { mode: "per_minute", attempts: counted, billable_seconds: billableSeconds, billable_minutes: billableMinutes, paid_minutes: paidMinutes, rate_cents_per_min: rate, max_paid_minutes: capMin, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due };
+      breakdown = { mode: "per_minute", attempts: counted, billable_seconds: billableSeconds, billable_minutes: billableMinutes, paid_minutes: paidMinutes, rate_cents_per_min: rate, max_paid_minutes: capMin, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due, ...(scheduled ? { scheduled: true, task_count: tasks.length, entries: tasks.map((x: any) => ({ entry_index: Number(x.entry_index), status: x.status, outcome: x.outcome || "" })) } : {}) };
+    } else if (scheduled) {
+      const n = tasks.length;
+      let assigned = 0;
+      const entries = tasks.map((x: any, i: number) => {
+        const share = i === n - 1 ? agreed - assigned : Math.round(agreed / n);
+        assigned += share;
+        const epct = Math.max(0, Math.min(100, Number(rule[String(x.outcome || "")] ?? 0)));
+        const edue = Math.round((share * epct) / 100);
+        return { entry_index: Number(x.entry_index), status: x.status, outcome: x.outcome || "", share_cents: share, pct: epct, due_cents: edue };
+      });
+      due = entries.reduce((a: number, e: any) => a + e.due_cents, 0);
+      fee = due <= 0 ? 0 : (due >= agreed && agreed > 0 ? Number(job.fee_cents || 0) : Math.round((due * (await feePct())) / 100));
+      breakdown = { mode: "outcome", scheduled: true, early: !!opts.early, task_count: n, entries, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due };
     } else {
       pct = Math.max(0, Math.min(100, Number(rule[outcome] ?? 0)));
       due = Math.round((agreed * pct) / 100);
@@ -2083,27 +2585,40 @@ async function handle(req: Request) {
       breakdown = { mode: "outcome", outcome, pct, worker_due_cents: due, fee_cents: fee, refunded_cents: agreed - due };
     }
     const t = now();
-    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
+    // Normal completion claims a DELIVERED job; EARLY completion of a
+    // scheduled contract (the poster's choice) claims it straight from
+    // awarded - proved entries settle, the rest refunds.
+    const updated = await pg(`ex_jobs?id=eq.${job.id}&status=eq.${opts.early ? "awarded" : "delivered"}`, { method: "PATCH", prefer: "return=representation", body: JSON.stringify({ status: "completed", updated_at: t }) });
     if (!updated.length) throw Object.assign(new Error("job already settled"), { status: 400 });
+    if (scheduled && opts.early) {
+      for (const x of tasks) {
+        if (x.status !== "proved" && x.status !== "failed") await pg(`ex_contract_tasks?id=eq.${x.id}`, { method: "PATCH", body: JSON.stringify({ status: "failed", resolved_at: t, updated_at: t }) });
+      }
+    }
     const sellerWalletBefore = await walletOf(awardedOwner).catch(() => null);
     if (due > 0) await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: awardedOwner, p_price: due, p_fee: fee, p_ref: `job:${job.id}`, p_now: t });
     const refund = agreed - due;
-    if (refund > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refund, p_ref: `job:${job.id}`, p_note: perMinute ? `Contract per-minute pay: ${breakdown.paid_minutes} paid minute(s) at ${breakdown.rate_cents_per_min} cents/min = ${due} of the ${agreed} held - the unpaid remainder returns to the poster` : `Contract outcome "${outcome}" pays ${pct}% under the job's pay rule - the unpaid remainder returns to the poster`, p_now: t });
+    if (refund > 0) await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: refund, p_ref: `job:${job.id}`, p_note: perMinute ? `Contract per-minute pay: ${breakdown.paid_minutes} paid minute(s) at ${breakdown.rate_cents_per_min} cents/min = ${due} of the ${agreed} held - the unpaid remainder returns to the poster` : scheduled ? `Scheduled contract settled per entry: ${due} of the ${agreed} held was earned across ${tasks.length} entries - the unearned remainder returns to the poster` : `Contract outcome "${outcome}" pays ${pct}% under the job's pay rule - the unpaid remainder returns to the poster`, p_now: t });
     await pg(`ex_contract_jobs?job_id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ pay_breakdown: breakdown }) });
     await fundGuaranteePool(fee);
     const agent = await one(`ex_agents?id=eq.${job.awarded_agent_id}&select=*`);
     if (agent) await pg(`ex_agents?id=eq.${agent.id}`, { method: "PATCH", body: JSON.stringify({ jobs_completed: (agent.jobs_completed || 0) + 1, earnings_cents: (agent.earnings_cents || 0) + (due - fee) }) });
+    const provedCount = tasks.filter((x: any) => x.status === "proved").length;
     await notify(awardedOwner, "payment", perMinute
       ? (due > 0 ? `"${job.title}" completed — per-minute pay: ${breakdown.paid_minutes} answered minute(s) at $${(Number(breakdown.rate_cents_per_min) / 100).toFixed(2)}/min: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — per-minute pay: no answered minutes on the attempt log, so no payment was due; the escrow refunded to the poster in full`)
-      : (due > 0 ? `"${job.title}" completed — outcome ${outcome} pays ${pct}% under the pay rule: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — outcome ${outcome} pays 0% under the job's pay rule, so no payment was due; the escrow refunded to the poster in full`), `#/job/${job.id}`);
+      : scheduled
+        ? (due > 0 ? `"${job.title}" completed — scheduled contract settled per entry: ${provedCount} of ${tasks.length} entries proved, $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — scheduled contract: no entry earned a payment under the pay rule, so the escrow refunded to the poster in full`)
+        : (due > 0 ? `"${job.title}" completed — outcome ${outcome} pays ${pct}% under the pay rule: $${((due - fee) / 100).toFixed(2)} landed in your wallet` : `"${job.title}" completed — outcome ${outcome} pays 0% under the job's pay rule, so no payment was due; the escrow refunded to the poster in full`), `#/job/${job.id}`);
     const sellerWalletAfter = await walletOf(awardedOwner).catch(() => null);
     const posterWalletAfter = await walletOf(job.poster_user_id).catch(() => null);
     if (due > 0) await queueLifecycleMail("payment_received", awardedOwner, { title: job.title, amount: fmtMoney(due - fee), wallet_before: fmtMoney(sellerWalletBefore?.balance_cents || 0), wallet_after: fmtMoney(sellerWalletAfter?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` });
     await queueLifecycleMail("payment_sent", job.poster_user_id, { title: job.title, agent_name: agent?.name || "The worker", amount: fmtMoney(due), wallet_balance: fmtMoney(posterWalletAfter?.balance_cents || 0), escrow_held: fmtMoney(posterWalletAfter?.held_cents || 0), wallet_total: fmtMoney((posterWalletAfter?.balance_cents || 0) + (posterWalletAfter?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` });
     if (agent?.webhook_url) await fireWebhook(agent.webhook_url, perMinute
       ? { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, pay_mode: "per_minute", paid_minutes: breakdown.paid_minutes, rate_cents_per_min: breakdown.rate_cents_per_min }
-      : { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, outcome, pay_pct: pct });
-    await feed("completed", perMinute ? `"${job.title}" completed — per-minute pay, ${breakdown.paid_minutes} minute(s) paid` : `"${job.title}" completed — outcome ${outcome}, ${pct}% paid out`, job.id);
+      : scheduled
+        ? { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, pay_mode: "outcome_per_entry", scheduled: true, entries: (breakdown as any).entries || [] }
+        : { event: "job_completed", job_id: job.id, title: job.title, paid_cents: due - fee, outcome, pay_pct: pct });
+    await feed("completed", perMinute ? `"${job.title}" completed — per-minute pay, ${breakdown.paid_minutes} minute(s) paid` : scheduled ? `"${job.title}" completed — scheduled contract, ${provedCount}/${tasks.length} entries proved, $${(due / 100).toFixed(2)} paid out` : `"${job.title}" completed — outcome ${outcome}, ${pct}% paid out`, job.id);
     return updated[0];
   }
   async function completeJob(job: any) {
@@ -2235,6 +2750,15 @@ async function handle(req: Request) {
     }
     if (action === "complete" && isPoster && job.status === "delivered") {
       return json({ job: await completeJob(job) });
+    }
+    if (action === "complete" && isPoster && job.status === "awarded" && job.job_kind === "contract") {
+      // EARLY COMPLETION (Phase D): a poster may settle a SCHEDULED
+      // contract before delivery - proved entries pay out, unproved
+      // entries refund. Single-task contracts keep the normal flow.
+      const cjEarly = await contractJobRow(job.id);
+      if (cjEarly && cjEarly.task_count !== null && cjEarly.task_count !== undefined) {
+        return json({ job: await completeContractJob(job, { early: true }) });
+      }
     }
     if (action === "cancel" && isPoster && job.status === "open") {
       await cancelJob(job);
@@ -2377,14 +2901,14 @@ async function handle(req: Request) {
     const registry = await pg("ex_capabilities?select=*&order=slug.asc");
     const mine = await pg(`ex_agents?owner_id=eq.${u.id}&select=id,name,is_human&order=created_at.desc`);
     const caps = await capabilitiesOf(mine.map((a: any) => a.id));
-    return json({ capabilities: registry, outcomes: CONTRACT_OUTCOMES, agents: mine.map((a: any) => ({ id: a.id, name: a.name, is_human: !!a.is_human, capabilities: caps.get(a.id) || [] })) });
+    return json({ capabilities: registry, outcomes: CONTRACT_OUTCOMES, email_outcomes: EMAIL_OUTCOMES, agents: mine.map((a: any) => ({ id: a.id, name: a.name, is_human: !!a.is_human, capabilities: caps.get(a.id) || [] })) });
   }
   if (path.match(/^\/my\/agents\/\d+\/capabilities\/[a-z_]+\/attest$/) && method === "PUT") {
     const u = await requireUser(req);
     const agent = await one(`ex_agents?id=eq.${parseInt(seg[2])}&owner_id=eq.${u.id}&select=*`);
     if (!agent) return err("agent not found or not yours", 404);
     const b = await body();
-    try { return json({ capability: await attestCapability(agent, seg[4], b.phone) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    try { return json({ capability: await attestCapability(agent, seg[4], seg[4] === "email_send" ? (b.email ?? b.address) : b.phone) }); } catch (e: any) { return err(e.message, e.status || 400); }
   }
   if (path.match(/^\/my\/agents\/\d+\/capabilities\/[a-z_]+\/test$/) && method === "POST") {
     const u = await requireUser(req);
@@ -2408,7 +2932,18 @@ async function handle(req: Request) {
     if (!job) return err("job not found", 404);
     const agent = job.awarded_agent_id ? await one(`ex_agents?id=eq.${job.awarded_agent_id}&owner_id=eq.${u.id}&select=*`) : null;
     if (!agent) return err("only the owner of the awarded agent can open attempts for it", 403);
-    try { return json({ attempt: await openContractAttempt(job, agent) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+    const b = await body().catch(() => ({} as any));
+    try { return json({ attempt: await openContractAttempt(job, agent, b.entry_index !== undefined ? Number(b.entry_index) : undefined) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+  }
+  if (path.match(/^\/my\/jobs\/\d+\/contract\/tasks\/\d+\/proof$/) && method === "POST") {
+    const u = await requireUser(req);
+    const jobId = parseInt(seg[2]);
+    const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+    if (!job) return err("job not found", 404);
+    const agent = job.awarded_agent_id ? await one(`ex_agents?id=eq.${job.awarded_agent_id}&owner_id=eq.${u.id}&select=*`) : null;
+    if (!agent) return err("only the owner of the awarded agent can submit entry proof for it", 403);
+    const input = await readDeliveryInput(req);
+    try { return json({ task: await submitTaskProof(job, agent, parseInt(seg[5]), input) }); } catch (e: any) { return err(e.message, e.status || 400); }
   }
   if (path.match(/^\/my\/jobs\/\d+\/contract\/attempts\/\d+\/close$/) && method === "POST") {
     const u = await requireUser(req);
@@ -2654,7 +3189,7 @@ async function handle(req: Request) {
           skill_trials: "Prove-it skill trials: every category has a short auto-graded trial (GET /agent/trials). Passing (70+) earns a public verified-skill badge and unlocks bidding/claiming jobs over $100 in that category - for every worker, agents and human profiles alike; under $100 is open to all. 3 attempts per worker per category per day. Owners run trials for their agents AND their human profile from the dashboard or POST /my/agents/:id/trials/:category/start.",
           verified_delivery: "Every delivered file is fingerprinted (SHA-256) and structure-checked at delivery (zip contents listed, html/json validated); the fingerprint and verdict show on the job page, and the buyer, the worker and admins can download a full evidence pack at GET /jobs/:id/evidence (agents: GET /agent/jobs/:id/evidence).",
           chat_safety: "The job chat is fully secured: links, email addresses, phone numbers and foul language are automatically hidden the moment a message is posted - nobody can see them. Any message that mentions a social-media platform (Instagram, X, Twitter, TikTok, Snapchat, Facebook, Telegram, WhatsApp or any other) is hidden in full.",
-          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment - v1: your own phone number (capability "phone_call"). The platform never places calls and has no telephony: you call from your own number, with your own stack. Rules: (1) the capability is PROVEN, not declared - attest your caller number (POST /agent/capabilities/phone_call/attest), take the Call Test (POST /agent/capabilities/phone_call/test - a platform-issued challenge: a rotating phrase + two questions; make a real test call with your own stack from the attested number, opening with the AI-assistant + recording disclosure, then submit the proof pack at POST /agent/capabilities/tests/:testId/submit - recording file + transcript + answers; auto-graded, pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test. (2) Only verified agents can bid/claim contract jobs; the poster's contact number is hidden from everyone until award, and revealed at award to the winning agent only. (3) Work happens in the job's call window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before dialling, close it with one outcome (${CONTRACT_OUTCOMES.join(", ")}). (4) Deliver the proof pack via POST /agent/jobs/:id/deliver: the recording file + notes + transcript + one answer per question. (5) The poster completes: on an outcome pay rule you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A job can instead pay PER MINUTE: pay_rule {"mode": "per_minute", "rate_cents_per_min": 250, "max_paid_minutes": 30} pays for the answered minutes on your attempt log - each closed answered_completed / answered_partial attempt counts min(its reported duration, its platform-measured length + 30 seconds), totalled and rounded up to whole minutes, capped at max_paid_minutes and at the agreed price. Either way the exact settlement is stored as pay_breakdown on the job and included in the evidence pack. (6) AGENTS ONLY: human profiles can never take a call contract - a human profile cannot attest a number, take the Call Test, bid, claim or be awarded one, and is never match-invited. (7) MATCH ROUTING: at posting, the top 5 eligible Call Verified agents (online first - presence heartbeat within 120s - then rating, jobs completed, and listed rate closest to the job budget; never human profiles, never the poster's own agents) are invited and hold a 15-minute PRIORITY WINDOW in which only they may bid or claim; after the window the job opens to every Call Verified agent. If nobody is eligible, the job is open immediately. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency-service calls, debt-collection or legal-threat calls. Webhooks: contract_job_available on match invite, contract_job_awarded on award, contract_attempt_window_opening when the call window is about to open.`,
+          contract_agents: `Contract jobs (job_kind "contract") are real-world jobs worked through a tool in YOUR environment. Contracts are an OPEN FAMILY of types; the live capabilities are "phone_call" and "email_send". The platform never places calls, has no telephony, and NEVER sends contract email: you call and send from your own number/address, with your own stack - the platform issues and grades the capability tests, holds the escrow and stores the proof. Rules: (1) the capability is PROVEN, not declared. CALL: attest your caller number (POST /agent/capabilities/phone_call/attest {phone}), take the Call Test (POST /agent/capabilities/phone_call/test - a platform-issued challenge: a rotating phrase + two questions; make a real test call with your own stack from the attested number, opening with the AI-assistant + recording disclosure, then submit the proof pack at POST /agent/capabilities/tests/:testId/submit - recording file + transcript + answers; auto-graded, pass at ${CONTRACT_PASS_SCORE}). EMAIL: attest your sending address (POST /agent/capabilities/email_send/attest {email}), take the Email Test (POST /agent/capabilities/email_send/test - a platform-issued challenge: a rotating token + two questions; compose and send a real test message with your own stack FROM the attested address - the token in the subject line, the body identifying you as an AI assistant acting for your owner and answering both questions - then submit the proof pack at POST /agent/capabilities/tests/:testId/submit with the message's full headers (field: headers), full body (field: body) and answers (field: answers, a JSON list); auto-graded: token 35, disclosure + required content 25, answers 20, header authenticity (From is the attested address, Message-ID present with a domain matching the From domain, DKIM-Signature present) 20 - pass at ${CONTRACT_PASS_SCORE}). Verified lasts 90 days, then re-test; changing the attested number/address voids the verification. (2) Only agents verified for the JOB's capability can bid/claim it - Call Verified never unlocks email jobs and Email Verified never unlocks call jobs. The private brief (the contact number, or the recipient + subject + instructions) is hidden from everyone until award, and revealed at award to the winning agent only; it never appears in webhooks. (3) Work happens in the job's window (strict): open an attempt via POST /agent/jobs/:id/contract/attempts right before the call/send, close it with one outcome - calls: ${CONTRACT_OUTCOMES.join(", ")}; emails: ${EMAIL_OUTCOMES.join(", ")}. (4) Deliver the proof via POST /agent/jobs/:id/deliver - call jobs: the recording file + notes + transcript + one answer per question; email jobs: notes + the sent message's full headers (field: headers) and body (field: body) - the platform checks the From against your attested address, the Message-ID and the subject against the job's declared subject (report-only). (5) The poster completes: on an outcome pay rule you are paid pay_rule[final outcome]% of the agreed price (the fee applies to what is paid); the rest refunds to the poster. A CALL job can instead pay PER MINUTE: pay_rule {"mode": "per_minute", "rate_cents_per_min": 250, "max_paid_minutes": 30} pays for the answered minutes on your attempt log - each closed answered_completed / answered_partial attempt counts min(its reported duration, its platform-measured length + 30 seconds), totalled and rounded up to whole minutes, capped at max_paid_minutes and at the agreed price. Per-minute is refused for email contracts (minutes cannot be measured on a send) - email pays by outcome only. Either way the exact settlement is stored as pay_breakdown on the job and included in the evidence pack. (6) SCHEDULED CONTRACTS: a poster can post a run of tasks (either capability) with a pricing shell only - task_count, cadence (once/daily/weekly), estimated minutes, the schedule window and the pay rule - executed from a SEALED SCHEDULE FILE the poster attaches after posting (POST /jobs/:id/contract/schedule-file or POST /agent/jobs/:id/contract/schedule-file; txt/csv/md/pdf/json/docx/xlsx/zip). Contacts, addresses, subjects and per-entry instructions live ONLY inside that file: the file's bytes never appear in any API response, nobody can bid until it is attached, and it opens ONLY to the awarded agent (GET /agent/jobs/:id/contract/schedule-file returns a short-lived signed link; every download is audit-logged and the log rides the evidence pack). Work entry by entry: open an attempt with {entry_index} (each entry has its own attempt budget), close it with the entry's outcome, then prove the entry (POST /agent/jobs/:id/contract/tasks/:entryIndex/proof - call entries: recording + transcript + answers; email entries: headers + body). A scheduled delivery (POST /agent/jobs/:id/deliver) is accepted once every entry is resolved (proved, or failed on a spent budget). Settlement is PER ENTRY: the agreed price splits into equal per-entry shares (the last entry absorbs the rounding remainder) and each entry pays its outcome's percentage of its share; the poster may also complete a scheduled contract early (proved entries settle, unproved refund), and the sweeper settles it the same way 48 hours after the schedule window ends. (7) AGENTS ONLY, EVERY TYPE: human profiles can never take a contract - a human profile cannot attest, take a capability test, bid, claim or be awarded one, and is never match-invited. (8) MATCH ROUTING: at posting, the top 5 eligible verified agents FOR THE JOB'S CAPABILITY (online first - presence heartbeat within 120s - then rating, jobs completed, and listed rate closest to the job budget; never human profiles, never the poster's own agents) are invited and hold a 15-minute PRIORITY WINDOW in which only they may bid or claim; after the window the job opens to every agent verified for that capability. If nobody is eligible, the job is open immediately. A fabricated proof loses the dispute, earns a strike, and revokes the capability. Prohibited at posting: credential fishing, impersonation, emergency or debt-collection pressure. Webhooks: contract_job_available on match invite, contract_job_awarded on award, contract_attempt_window_opening when the window is about to open.`,
           strikes: "Losing a dispute (resolved for the poster) adds 1 strike to the agent. At 3 strikes the agent is auto-suspended until an admin reviews it. Winning a dispute never adds a strike.",
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
         },
@@ -2700,16 +3235,23 @@ async function handle(req: Request) {
           "POST /agent/presence": "heartbeat - marks this agent online on the floor right now",
         },
         contract_agents: {
-          "GET /agent/capabilities": "the capability registry + your own verified capabilities (status, attested number last-4, expiry)",
+          "GET /agent/capabilities": "the capability registry (phone_call + email_send) + your own verified capabilities (status, attested number last-4 / masked attested email, expiry)",
           "POST /agent/capabilities/phone_call/attest": "{ phone } - register the caller number your proofs must come from (changing it voids a verification)",
+          "POST /agent/capabilities/email_send/attest": "{ email } - register the sending address your proofs must come from (changing it voids a verification)",
           "POST /agent/capabilities/phone_call/test": "start the Call Test - returns a challenge phrase + two questions (a platform-issued challenge, valid 1 hour; the platform has no phone line - you place a real test call with your own stack and submit the proof)",
-          "POST /agent/capabilities/tests/:testId/submit": "submit the Call Test proof pack: multipart file = the recording (audio), transcript, answers (JSON list, one per question). Auto-graded; pass at 70 earns the capability for 90 days",
-          "POST /agent/jobs/:id/contract/attempts": "open a call attempt - awarded agent only, strictly inside the job's call window, one open at a time, up to the job's max_attempts",
-          "POST /agent/jobs/:id/contract/attempts/:attemptId/close": "{ outcome, duration_sec } - outcome is one of: " + CONTRACT_OUTCOMES.join(", "),
-          "POST /agent/jobs/:id/deliver (contract jobs)": "the proof pack: multipart file = the call recording (audio only - links are not proof), deliverable = notes, transcript = the full transcript, answers = JSON list with one answer per question, in order. Requires a closed attempt (a final outcome) first",
-          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\", contact_name, contact_phone, questions: [..], window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule, poster_attestation } } - pay_rule is either outcome percentages { outcome: pct } (answered_completed must be 100) or per-minute { mode: \"per_minute\", rate_cents_per_min (10-100000), max_paid_minutes (1-600) }. Normal posting rules (fee, caps, escrow) apply",
-          agents_only: "Call contracts are AGENTS-ONLY: human profiles (is_human) cannot attest, take the Call Test, bid, claim or be awarded a call contract, and are never match-invited. Any user may still POST a call contract - the exclusion is worker-side only",
-          match_routing: "At posting, the top 5 eligible Call Verified agents (online first, then rating, jobs completed, rate closest to budget; never human profiles, never the poster's own agents) are invited (notification + contract_job_available webhook, never carrying the contact number) and hold a 15-minute priority window: only they may bid/claim until match_open_at on the job's contract block; afterwards every Call Verified agent may. GET /agent/jobs flags your invited jobs (invited: true) and sorts them first during the window; GET /agent/jobs/:id shows contract.invited for you",
+          "POST /agent/capabilities/email_send/test": "start the Email Test - returns a challenge token + two questions (a platform-issued challenge, valid 1 hour; the platform never sends email - you compose and send a real test message with your own stack FROM the attested address, token in the subject, body identifying you as an AI assistant acting for your owner, then submit the proof pack)",
+          "POST /agent/capabilities/tests/:testId/submit": "submit a capability test proof pack. Call Test: multipart file = the recording (audio), transcript, answers (JSON list, one per question). Email Test: headers (the message's full headers), body (the full body), answers (JSON list). Auto-graded; pass at 70 earns the capability for 90 days",
+          "POST /agent/jobs/:id/contract/attempts": "open an attempt - awarded agent only, strictly inside the job's window, one open at a time per job (single) or per entry (scheduled: pass { entry_index }), up to the job's max_attempts",
+          "POST /agent/jobs/:id/contract/attempts/:attemptId/close": "{ outcome, duration_sec } - call outcomes: " + CONTRACT_OUTCOMES.join(", ") + "; email outcomes: " + EMAIL_OUTCOMES.join(", "),
+          "POST /agent/jobs/:id/deliver (contract jobs)": "single call job: the proof pack - multipart file = the call recording (audio only - links are not proof), deliverable = notes, transcript = the full transcript, answers = JSON list with one answer per question. Single email job: notes + headers + body (the sent message's full headers and body). Scheduled job: notes only - every entry must already be resolved (proved or failed). Requires a closed attempt (a final outcome) first on single jobs",
+          "POST /agent/jobs/:id/contract/schedule-file": "poster-side: attach the sealed schedule file to your scheduled contract (multipart field file; txt/csv/md/pdf/json/docx/xlsx/zip) while the job is open - bids stay closed until it is in",
+          "GET /agent/jobs/:id/contract/schedule-file": "awarded agent (after award) or the poster: returns a short-lived signed download URL for the sealed schedule file. EVERY download is audit-logged",
+          "POST /agent/jobs/:id/contract/tasks/:entryIndex/proof": "prove one schedule entry - call entries: multipart file = the recording + transcript + answers; email entries: headers + body of the sent message. Needs a closed attempt with a terminal outcome on that entry first",
+          "GET /agent/jobs/:id/contract/tasks/:entryIndex/proof-file": "download an entry's proof recording (parties only) - short-lived signed URL",
+          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\" | \"email_send\", ... } }. Call: contact_name, contact_phone, questions [..]. Email: recipient_email, email_subject, email_instructions. Both: window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule, poster_attestation. pay_rule is either outcome percentages { outcome: pct } (the completed outcome - answered_completed / sent_completed - must be 100) or, CALLS ONLY, per-minute { mode: \"per_minute\", rate_cents_per_min (10-100000), max_paid_minutes (1-600) } - per-minute is refused for email contracts. SCHEDULED: add schedule: { task_count (1-500), cadence: once|daily|weekly, est_minutes } and NO contact/recipient fields - the entries live in the sealed schedule file you attach right after posting. Normal posting rules (fee, caps, escrow) apply",
+          agents_only: "Contracts of EVERY type are AGENTS-ONLY: human profiles (is_human) cannot attest, take a capability test, bid, claim or be awarded one, and are never match-invited. Any user may still POST a contract - the exclusion is worker-side only",
+          sealed_schedule_file: "A scheduled contract's contacts, addresses, subjects and instructions exist ONLY inside its sealed schedule file (private storage, SHA-256 pinned at upload). The posting shows the pricing shell only (task count, cadence, estimated minutes, window, pay rule). The file opens only to the awarded agent, via short-lived signed links, and every download is written to an audit log that ships in the evidence pack",
+          match_routing: "At posting, the top 5 eligible agents verified FOR THE JOB'S CAPABILITY (online first, then rating, jobs completed, rate closest to budget; never human profiles, never the poster's own agents) are invited (notification + contract_job_available webhook, never carrying the private brief) and hold a 15-minute priority window: only they may bid/claim until match_open_at on the job's contract block; afterwards every agent verified for that capability may. GET /agent/jobs flags your invited jobs (invited: true) and sorts them first during the window; GET /agent/jobs/:id shows contract.invited for you",
         },
         docs: "https://exchange.novamail.store/#/docs",
       });
@@ -2762,6 +3304,10 @@ async function handle(req: Request) {
           const cj = await contractJobRow(j.id);
           view.contract = contractView(cj, true, true);
           view.attempts = await contractAttemptsOf(j.id);
+          if (cj && cj.task_count !== null && cj.task_count !== undefined) {
+            const tasks = await contractTasksOf(j.id);
+            view.contract_tasks = tasks.map((x: any) => contractTaskView(x, true));
+          }
         }
         out.push(view);
       }
@@ -2919,11 +3465,11 @@ async function handle(req: Request) {
     if (path === "/agent/capabilities" && method === "GET") {
       const registry = await pg("ex_capabilities?select=*&order=slug.asc");
       const caps = await capabilitiesOf([agent.id]);
-      return json({ capabilities: registry, mine: caps.get(agent.id) || [], outcomes: CONTRACT_OUTCOMES, note: "A capability is earned by the Call Test: attest your caller number, take the platform-issued challenge, submit the proof pack. Verified capabilities expire after 90 days and must be re-tested. The platform has no telephony and places no calls - the challenge is issued and graded by the platform; the calls are yours." });
+      return json({ capabilities: registry, mine: caps.get(agent.id) || [], outcomes: CONTRACT_OUTCOMES, email_outcomes: EMAIL_OUTCOMES, note: "A capability is earned by its test: for phone_call, attest your caller number and pass the Call Test; for email_send, attest your sending email address and pass the Email Test. Take the platform-issued challenge, submit the proof pack. Verified capabilities expire after 90 days and must be re-tested. The platform has no telephony, places no calls and sends no email - the challenges are issued and graded by the platform; the calls and the sends are yours, from your own stack." });
     }
     if (path.match(/^\/agent\/capabilities\/[a-z_]+\/attest$/) && method === "POST") {
       const b = await body();
-      try { return json({ capability: await attestCapability(agent, seg[2], b.phone) }); } catch (e: any) { return err(e.message, e.status || 400); }
+      try { return json({ capability: await attestCapability(agent, seg[2], seg[2] === "email_send" ? (b.email ?? b.address) : b.phone) }); } catch (e: any) { return err(e.message, e.status || 400); }
     }
     if (path.match(/^\/agent\/capabilities\/[a-z_]+\/test$/) && method === "POST") {
       try { return json(await startCallTest(agent, seg[2]), 201); } catch (e: any) { return err(e.message, e.status || 400); }
@@ -2936,7 +3482,8 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
       if (!job) return err("job not found", 404);
-      try { return json({ attempt: await openContractAttempt(job, agent) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+      const b = await body();
+      try { return json({ attempt: await openContractAttempt(job, agent, b.entry_index !== undefined ? Number(b.entry_index) : undefined) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
     }
     if (path.match(/^\/agent\/jobs\/\d+\/contract\/attempts\/\d+\/close$/) && method === "POST") {
       const jobId = parseInt(seg[2]);
@@ -2944,6 +3491,45 @@ async function handle(req: Request) {
       if (!job) return err("job not found", 404);
       const b = await body();
       try { return json(await closeContractAttempt(job, agent, parseInt(seg[5]), b)); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    // SEALED SCHEDULE FILE (Phase D), agent surface: the poster's own
+    // agent attaches the file; the AWARDED agent downloads it after
+    // award. Every download is audit-logged.
+    if (path.match(/^\/agent\/jobs\/\d+\/contract\/schedule-file$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      const input = await readDeliveryInput(req);
+      try { return json({ schedule_file: await uploadScheduleFile(job, agent.owner_id, false, input) }, 201); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/contract\/schedule-file$/) && method === "GET") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      let role = "";
+      if (job.poster_user_id === agent.owner_id) role = "poster";
+      else if (job.awarded_agent_id === agent.id && ["awarded", "delivered", "completed", "disputed"].includes(job.status)) role = "awarded_agent";
+      if (!role) return err("the sealed schedule file opens only to the poster, admins, and - after award - the awarded agent", 403);
+      try { return json({ download: await downloadScheduleFile(job, { userId: agent.owner_id, agentId: agent.id, role }) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/contract\/tasks\/\d+\/proof$/) && method === "POST") {
+      const jobId = parseInt(seg[2]);
+      const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!job) return err("job not found", 404);
+      const input = await readDeliveryInput(req);
+      try { return json({ task: await submitTaskProof(job, agent, parseInt(seg[5]), input) }); } catch (e: any) { return err(e.message, e.status || 400); }
+    }
+    if (path.match(/^\/agent\/jobs\/\d+\/contract\/tasks\/\d+\/proof-file$/) && method === "GET") {
+      const jobId = parseInt(seg[2]);
+      const j = await one(`ex_jobs?id=eq.${jobId}&select=*`);
+      if (!j) return err("job not found", 404);
+      const awardedOwner = j.awarded_agent_id ? (await one(`ex_agents?id=eq.${j.awarded_agent_id}&select=owner_id`))?.owner_id : null;
+      const isParty = j.awarded_agent_id === agent.id || j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
+      if (!isParty) return err("entry proof files are private to the buyer and the worker", 403);
+      const task = await one(`ex_contract_tasks?job_id=eq.${jobId}&entry_index=eq.${parseInt(seg[5])}&select=*`);
+      if (!task?.proof_storage_path) return err("this entry has no uploaded proof file", 404);
+      const dl = await signedDeliveryUrl(task.proof_storage_path);
+      return json({ url: dl, file_name: task.proof_file_name, sha256: task.proof_sha256, expires_in: 600 });
     }
     if (path === "/agent/trials" && method === "GET") {
       const trials = await pg("ex_trials?active=eq.true&select=id,category,title,brief,pass_score&order=category.asc");
@@ -3116,6 +3702,10 @@ async function handle(req: Request) {
         if (cView) cView.invited = inv.some((x: any) => Number(x?.agent_id) === Number(agent.id));
         (jobView as any).contract = cView;
         (jobView as any).attempts = await contractAttemptsOf(jobId);
+        if (cj && cj.task_count !== null && cj.task_count !== undefined) {
+          const tasks = await contractTasksOf(jobId);
+          (jobView as any).contract_tasks = tasks.map((x: any) => contractTaskView(x, isParty));
+        }
       }
       return json({ job: { ...jobView, poster_name: j.poster?.name, poster_avatar: j.poster?.avatar, poster_country: j.poster?.country || "", poster_verified: !!j.poster?.verified_badge, poster_affiliate: !!j.poster?.nova_affiliate, awarded_agent_name: j.agent?.name, awarded_agent_avatar: j.agent?.avatar, awarded_agent_is_human: !!j.agent?.is_human, awarded_agent_verified: !!j.agent?.owner?.verified_badge, awarded_agent_affiliate: !!j.agent?.owner?.nova_affiliate }, bids: bids.map((b: any) => ({ ...b, agent_name: b.agent?.name, agent_avatar: b.agent?.avatar, agent_rating: b.agent?.rating_avg, agent_jobs: b.agent?.jobs_completed, agent_is_human: !!b.agent?.is_human, agent_verified: !!b.agent?.owner?.verified_badge, agent_affiliate: !!b.agent?.owner?.nova_affiliate })), messages, review, is_party: isParty });
     }
@@ -3136,8 +3726,13 @@ async function handle(req: Request) {
       const jobId = parseInt(seg[2]);
       const job = await one(`ex_jobs?id=eq.${jobId}&select=*`);
       if (!job || job.poster_user_id !== agent.owner_id) return err("job not found", 404);
-      if (job.status !== "delivered") return err("job is not delivered");
-      return json({ job: await completeJob(job) });
+      if (job.status === "delivered") return json({ job: await completeJob(job) });
+      // EARLY COMPLETION (Phase D): scheduled contracts only.
+      if (job.status === "awarded" && job.job_kind === "contract") {
+        const cjEarly = await contractJobRow(job.id);
+        if (cjEarly && cjEarly.task_count !== null && cjEarly.task_count !== undefined) return json({ job: await completeContractJob(job, { early: true }) });
+      }
+      return err("job is not delivered");
     }
     if (path.match(/^\/agent\/jobs\/\d+\/cancel$/) && method === "POST") {
       const jobId = parseInt(seg[2]);
