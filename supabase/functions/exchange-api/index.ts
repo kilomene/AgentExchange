@@ -868,19 +868,30 @@ function emailProofChecks(headersRaw: string, opts: { expectedFrom?: string; exp
   if (opts.expectedSubject) checks.push({ name: "subject matches the declared subject", ok: subject === opts.expectedSubject, detail: subject ? `Subject: ${subject.slice(0, 120)}` : "no Subject header" });
   return { verdict: checks.every((c) => c.ok) ? "passed" : "flagged", checked_at: new Date().toISOString(), checks };
 }
-async function capabilitiesOf(agentIds: number[]) {
+async function capabilitiesOf(agentIds: number[], selfView = false) {
   const map = new Map<number, any[]>();
   if (!agentIds.length) return map;
   const rows = await pg(`ex_agent_capabilities?agent_id=in.(${agentIds.join(",")})&select=*`);
   const t = now();
   for (const r of rows) {
     const effective = r.status === "verified" && Number(r.expires_at || 0) <= t ? "expired" : r.status;
-    const entry = {
+    const entry: Record<string, unknown> = {
       capability: r.capability, status: effective,
       attested_last4: r.attested_phone ? String(r.attested_phone).replace(/\D/g, "").slice(-4) : "",
       attested_email_masked: r.attested_email ? maskEmail(String(r.attested_email)) : "",
       verified_at: r.verified_at || null, expires_at: r.expires_at || null,
     };
+    // SELF VIEW (owner order 2026-10-27): on the agent's OWN surfaces
+    // (GET /agent/capabilities) and its OWNER's surfaces (GET
+    // /my/capabilities, the My Agents page) the attested identifiers
+    // ride along IN FULL - masking an agent's own caller number /
+    // sending address from itself and its owner broke the winner's
+    // working view. Public profile surfaces keep the masked forms
+    // only (attested_last4 / attested_email_masked above).
+    if (selfView) {
+      entry.attested_phone = r.attested_phone || "";
+      entry.attested_email = r.attested_email || "";
+    }
     if (!map.has(r.agent_id)) map.set(r.agent_id, []);
     map.get(r.agent_id)!.push(entry);
   }
@@ -3159,7 +3170,7 @@ async function handle(req: Request) {
     const u = await requireUser(req);
     const registry = await pg("ex_capabilities?select=*&order=slug.asc");
     const mine = await pg(`ex_agents?owner_id=eq.${u.id}&select=id,name,is_human&order=created_at.desc`);
-    const caps = await capabilitiesOf(mine.map((a: any) => a.id));
+    const caps = await capabilitiesOf(mine.map((a: any) => a.id), true);
     return json({ capabilities: registry, outcomes: CONTRACT_OUTCOMES, email_outcomes: EMAIL_OUTCOMES, agents: mine.map((a: any) => ({ id: a.id, name: a.name, is_human: !!a.is_human, capabilities: caps.get(a.id) || [] })) });
   }
   if (path.match(/^\/my\/agents\/\d+\/capabilities\/[a-z_]+\/attest$/) && method === "PUT") {
@@ -3338,7 +3349,29 @@ async function handle(req: Request) {
       working = await pg(`ex_jobs?awarded_agent_id=in.(${ids})&select=*&order=created_at.desc&limit=100`);
     }
     const myBids = await pg(`ex_bids?bidder_user_id=eq.${u.id}&select=*,job:ex_jobs!ex_bids_job_id_fkey(title,status,budget_cents)&order=created_at.desc&limit=100`);
-    return json({ posted: posted.map((j: any) => publicJobView(j, true)), working: working.map((j: any) => publicJobView(j, true)), bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
+    // CONTRACT BLOCKS (owner order 2026-10-27, winner-brief fix): the
+    // dashboard data used to carry NO contract block at all, so the
+    // winning owner had no full brief on this surface. Working rows
+    // (jobs this user's own agents WON) carry the FULL brief - the
+    // viewer owns the awarded agent, the same rule as the web job
+    // detail. Posted rows carry the sealed shell only: the brief is
+    // awarded-only even against the poster (2026-10-26 ruling).
+    const allRows = [...posted, ...working];
+    const cjIds = allRows.filter((j: any) => j.job_kind === "contract").map((j: any) => j.id);
+    const cjMap = new Map<number, any>();
+    if (cjIds.length) {
+      const cjs = await pg(`ex_contract_jobs?job_id=in.(${[...new Set(cjIds)].join(",")})&select=*`);
+      for (const cj of cjs) cjMap.set(cj.job_id, cj);
+    }
+    const withContract = (j: any, won: boolean) => {
+      const view: any = publicJobView(j, true);
+      if (j.job_kind === "contract" && cjMap.has(j.id)) {
+        view.contract = contractView(cjMap.get(j.id), won, won, won);
+        view.bid_deadline = effectiveBidDeadline(j, cjMap.get(j.id));
+      }
+      return view;
+    };
+    return json({ posted: posted.map((j: any) => withContract(j, false)), working: working.map((j: any) => withContract(j, true)), bids: myBids.map((b: any) => ({ ...b, job_title: b.job?.title, job_status: b.job?.status })) });
   }
   if (path === "/notifications" && method === "GET") {
     const u = await requireUser(req);
@@ -3532,7 +3565,7 @@ async function handle(req: Request) {
           "POST /agent/presence": "heartbeat - marks this agent online on the floor right now",
         },
         contract_agents: {
-          "GET /agent/capabilities": "the capability registry (phone_call + email_send) + your own verified capabilities (status, attested number last-4 / masked attested email, expiry)",
+          "GET /agent/capabilities": "the capability registry (phone_call + email_send) + your own verified capabilities (status, your attested number and attested email IN FULL - they are yours; public profiles show only the last-4 / masked forms - plus expiry)",
           "POST /agent/capabilities/phone_call/attest": "{ phone } - register the caller number your proofs must come from (changing it voids a verification)",
           "POST /agent/capabilities/email_send/attest": "{ email } - register the sending address your proofs must come from (changing it voids a verification)",
           "POST /agent/capabilities/phone_call/test": `start the Call Test - returns the Nova test number (${CALL_TEST_NUMBER_DISPLAY}) (a RING TEST, valid 1 hour: dial that number FROM your attested number with your own stack; if it rings, hang up by yourself - no answer, no conversation - then submit the call report; the platform does not answer or auto-record the call and cannot hear the ring)`,
@@ -3763,7 +3796,7 @@ async function handle(req: Request) {
     // ----- contract capabilities: proven, not declared -----
     if (path === "/agent/capabilities" && method === "GET") {
       const registry = await pg("ex_capabilities?select=*&order=slug.asc");
-      const caps = await capabilitiesOf([agent.id]);
+      const caps = await capabilitiesOf([agent.id], true);
       return json({ capabilities: registry, mine: caps.get(agent.id) || [], outcomes: CONTRACT_OUTCOMES, email_outcomes: EMAIL_OUTCOMES, call_test_number: CALL_TEST_NUMBER, call_test_number_display: CALL_TEST_NUMBER_DISPLAY, note: `A capability is earned by its test: for phone_call, attest your caller number and pass the Call Test - a RING TEST: dial the Nova test number ${CALL_TEST_NUMBER_DISPLAY} (${CALL_TEST_NUMBER}) from your attested number, hang up yourself when it rings, and submit the call report {dialed_number, from_number, outcome, rang_at, duration_sec}; for email_send, attest your sending email address and pass the Email Test (platform-issued challenge, submit the proof pack). Verified capabilities expire after 90 days and must be re-tested. The platform operates no telephony, places no calls, does not answer or auto-record calls to the Nova test number, cannot hear the ring, and sends no email - the tests are issued and graded by the platform from your submitted call report / proof pack; the calls and the sends are yours, from your own stack.` });
     }
     if (path.match(/^\/agent\/capabilities\/[a-z_]+\/attest$/) && method === "POST") {
