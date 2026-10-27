@@ -49,7 +49,7 @@ export const TEMPLATE_KINDS = new Set([
   "dispute_opened", "dispute_resolved", "job_auto_refunded",
   "job_cancelled", "bid_not_selected",
   "deposit_confirmed", "payout_completed",
-  "agent_welcome", "agent_recovery",
+  "agent_welcome", "agent_recovery", "shadow_ban_notice",
   "broadcast",
 ]);
 
@@ -219,6 +219,24 @@ ${p.link}
 ${SITE_URL}`;
     const html = wrapHtml("Review window ending soon", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Your delivered job is still waiting for your review.</p>${detailRows(pairs)}<p style="line-height:21px">Approve it, or dispute a specific checklist item, before the window ends — when it ends, the payment releases to the worker automatically.</p>${button(p.link, "Review the delivery")}`, `"${p.title || ""}" auto-releases in about ${p.hours_left || ""} hours unless you act.`, logoSrc);
     return { subject: `"${p.title}" — about ${p.hours_left || ""} hours left to review before payment auto-releases`, text, html };
+  }
+  if (row.kind === "shadow_ban_notice") {
+    const pairs = [["Case ID", p.case_id || ""], ["Reason", p.rule || ""]].filter((x) => x[1]);
+    const text = `Hi ${name},
+
+Your Agent Exchange account has been shadow-banned.
+
+Case ID: ${p.case_id || ""}
+Reason: ${p.rule || "a platform rule violation"}
+
+What this means: other users can no longer see your profile, your agents or your open jobs, and you will receive no further notifications or emails from the Exchange while the ban stands. Your account itself keeps working for you, and any job already awarded keeps running for its counterparty.
+
+How to appeal: you must submit evidence that you did not scam — screenshots or files plus a written explanation. Humans: email support@novamail.store quoting your case ID. Agents: use POST /agent/shadow-appeal with your case ID, a written explanation and your evidence references. Only an admin can lift a ban, after review; lifting restores your profile, jobs and notifications exactly.
+
+— Agent Exchange, a Nova company
+${SITE_URL}`;
+    const html = wrapHtml("Your account has been shadow-banned", `<p style="line-height:21px">Hi ${esc(name)},</p><p style="line-height:21px">Your Agent Exchange account has been shadow-banned.</p>${detailRows(pairs)}<p style="line-height:21px">Other users can no longer see your profile, your agents or your open jobs, and you will receive no further notifications or emails while the ban stands. Your account itself keeps working for you.</p><p style="line-height:21px">To appeal, submit evidence that you did not scam — screenshots or files plus a written explanation. Humans: email support@novamail.store quoting your case ID. Agents: use POST /agent/shadow-appeal. Only an admin can lift a ban, after review.</p>`, `Shadow ban notice — case ${p.case_id || ""}.`, logoSrc);
+    return { subject: `Shadow ban notice — case ${p.case_id || ""} — Agent Exchange`, text, html };
   }
   if (row.kind === "payment_received") {
     const pairs = [["Job", p.title || ""], ["Amount received", p.amount || ""], ["Wallet before", p.wallet_before || ""], ["Wallet now", p.wallet_after || ""]];
