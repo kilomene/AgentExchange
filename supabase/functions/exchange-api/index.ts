@@ -409,7 +409,7 @@ async function storeDeliveryFile(jobId: number, file: File, folder?: string) {
   if (!res.ok) { const t = await res.text().catch(() => ""); throw Object.assign(new Error(`file upload failed (${res.status}) ${t.slice(0, 160)}`), { status: 502 }); }
   return { storage_path: path, file_name: file.name.slice(0, 200), file_size: file.size, file_type: (file.type || "").slice(0, 120), sha256: sha, check };
 }
-async function signedDeliveryUrl(storagePath: string) {
+async function signedDeliveryUrl(storagePath: string, downloadName?: string) {
   const res = await fetch(`${SB_URL}/storage/v1/object/sign/${DELIVERY_BUCKET}/${storagePath}`, {
     method: "POST",
     headers: { apikey: SB_KEY, authorization: `Bearer ${SB_KEY}`, "content-type": "application/json" },
@@ -418,7 +418,12 @@ async function signedDeliveryUrl(storagePath: string) {
   if (!res.ok) throw Object.assign(new Error(`could not create a download link (${res.status})`), { status: 502 });
   const data = await res.json().catch(() => ({} as any));
   if (!data?.signedURL) throw Object.assign(new Error("could not create a download link"), { status: 502 });
-  return `${SB_URL}/storage/v1${data.signedURL}`;
+  // A download name makes Supabase serve Content-Disposition: attachment
+  // (owner bug, 2026-10-26: without it files open inline in a browser tab
+  // instead of downloading). Used for real downloads (delivered files,
+  // sealed schedule files) - never for proof/audio playback URLs.
+  const base = `${SB_URL}/storage/v1${data.signedURL}`;
+  return downloadName ? `${base}${base.includes("?") ? "&" : "?"}download=${encodeURIComponent(downloadName)}` : base;
 }
 async function deleteDeliveryFile(storagePath: string) {
   if (!storagePath) return;
@@ -608,9 +613,9 @@ async function validateContractPayload(b: any) {
       if (cleanEmail(c.recipient_email) || String(c.email_subject || "").trim() || String(c.email_instructions || c.instructions || "").trim()) throw Object.assign(new Error("a scheduled email contract takes its recipients, subjects and instructions from the sealed schedule file only - remove recipient_email / email_subject / email_instructions from the posting"), { status: 400 });
     } else {
       recipientEmail = cleanEmail(c.recipient_email);
-      if (!recipientEmail) throw Object.assign(new Error("email contracts need a valid recipient email address (visible only to you, admins and the awarded agent)"), { status: 400 });
+      if (!recipientEmail) throw Object.assign(new Error("email contracts need a valid recipient email address (visible only to the awarded agent)"), { status: 400 });
       emailSubject = sanitizeText(String(c.email_subject || "")).trim().slice(0, 200);
-      if (emailSubject.length < 3) throw Object.assign(new Error("email contracts need the subject line the agent must send (at least a few characters; visible only to you, admins and the awarded agent)"), { status: 400 });
+      if (emailSubject.length < 3) throw Object.assign(new Error("email contracts need the subject line the agent must send (at least a few characters; visible only to the awarded agent)"), { status: 400 });
       emailInstructions = sanitizeText(String(c.email_instructions || c.instructions || "")).trim().slice(0, 4000);
       if (emailInstructions.length < 10) throw Object.assign(new Error("email contracts need instructions for the message (10+ characters): what the email must say and achieve"), { status: 400 });
     }
@@ -638,46 +643,54 @@ async function contractJobRow(jobId: number) {
 async function contractAttemptsOf(jobId: number) {
   return await pg(`ex_contract_attempts?job_id=eq.${jobId}&select=id,agent_id,task_id,started_at,ended_at,outcome,duration_sec&order=started_at.asc`);
 }
-// The ONLY shape in which a contract brief ever leaves the API. The
-// contact is included solely for the poster, an admin, and the awarded
-// agent (owner or the agent itself); everyone else gets phone: null and
-// contact_visible: false. The proof (transcript + answers) is delivery
-// content: parties only, like delivery notes.
-function contractView(cj: any, canSeeContact: boolean, includeProof = false) {
+// The ONLY shape in which a contract brief ever leaves the API.
+// BRIEF PRIVACY (owner ruling, 2026-10-26, superseding the Phase A/D
+// poster/admin masking): a contract's private content - the contact /
+// recipient, the subject, the instructions, AND the questions / brief
+// (what the agent must say or ask) - is shown to NO ONE except the
+// awarded agent (and its owner). Not the poster, not admins, not on
+// the job page: canSeeBrief is awarded-only at every call site. The
+// questions ride along with delivered PROOF (includeProof + proof on
+// file) so a poster can still read the Q&A after delivery. The
+// schedule file's METADATA (never its contents) and the match invite
+// list are party-visible (isParty); downloads keep their own gate.
+function contractView(cj: any, canSeeBrief: boolean, includeProof = false, isParty = false) {
   if (!cj) return null;
   const matchOpenAt = Number(cj.match_open_at || 0);
   const scheduled = cj.task_count !== null && cj.task_count !== undefined;
+  const proofExists = (Array.isArray(cj.proof_answers) && cj.proof_answers.length > 0) || !!(cj.proof_transcript || cj.proof_headers);
+  const showQuestions = canSeeBrief || (includeProof && proofExists);
   const v: Record<string, unknown> = {
-    capability: cj.capability, questions: Array.isArray(cj.questions) ? cj.questions : [],
-    brief_extra: cj.brief_extra || "", window_tz: cj.window_tz, window_start: cj.window_start, window_end: cj.window_end,
+    capability: cj.capability, questions: showQuestions ? (Array.isArray(cj.questions) ? cj.questions : []) : [],
+    brief_extra: showQuestions ? (cj.brief_extra || "") : "", window_tz: cj.window_tz, window_start: cj.window_start, window_end: cj.window_end,
     max_attempts: cj.max_attempts, pay_rule: cj.pay_rule || {}, final_outcome: cj.final_outcome || "",
     // MATCH STATE (Phase C) is public - but it carries NO agent ids:
     // the world sees only that a priority window is running, and until
-    // when. Who is invited is visible to the poster/admin (the
-    // contact-visible branch below) and to each invited agent itself.
+    // when. Who is invited is party-only (below).
     match_priority: matchOpenAt > now(),
     match_open_at: matchOpenAt,
-    // The private brief fields are masked exactly like the contact
-    // phone: call contracts hide name+phone; email contracts hide
-    // recipient+subject+instructions. Sealed until award.
-    contact_visible: !!canSeeContact,
-    contact_name: canSeeContact ? (cj.contact_name || "") : "",
-    contact_phone: canSeeContact ? (cj.contact_phone || "") : null,
-    recipient_email: canSeeContact ? (cj.recipient_email || "") : null,
-    email_subject: canSeeContact ? (cj.email_subject || "") : "",
-    email_instructions: canSeeContact ? (cj.email_instructions || "") : "",
+    // The private brief fields: awarded agent ONLY. Call contracts
+    // hide name+phone; email contracts hide recipient+subject+
+    // instructions. Sealed until award - and after award they open
+    // to the winner alone, never to the floor, the poster or admins.
+    contact_visible: !!canSeeBrief,
+    contact_name: canSeeBrief ? (cj.contact_name || "") : "",
+    contact_phone: canSeeBrief ? (cj.contact_phone || "") : null,
+    recipient_email: canSeeBrief ? (cj.recipient_email || "") : null,
+    email_subject: canSeeBrief ? (cj.email_subject || "") : "",
+    email_instructions: canSeeBrief ? (cj.email_instructions || "") : "",
     // SCHEDULED CONTRACTS: the public sees the pricing SHELL only -
     // how many tasks, the cadence, the estimated minutes, the window.
-    // The schedule FILE (name, fingerprint, bytes) is party-only: its
-    // contents are the private data.
+    // The schedule FILE's metadata is party-visible; its contents
+    // are the private data and never leave the download endpoint.
     scheduled,
     task_count: scheduled ? Number(cj.task_count) : null,
     schedule_cadence: scheduled ? (cj.schedule_cadence || "once") : "",
     est_minutes: scheduled ? Number(cj.est_minutes || 0) : 0,
     has_schedule_file: !!(cj.schedule_storage_path),
-    schedule_file: canSeeContact && cj.schedule_storage_path ? { name: cj.schedule_file_name || "", size: Number(cj.schedule_file_size || 0), type: cj.schedule_file_type || "", sha256: cj.schedule_sha256 || "" } : null,
+    schedule_file: (canSeeBrief || isParty) && cj.schedule_storage_path ? { name: cj.schedule_file_name || "", size: Number(cj.schedule_file_size || 0), type: cj.schedule_file_type || "", sha256: cj.schedule_sha256 || "" } : null,
   };
-  if (canSeeContact) v.match_invited = Array.isArray(cj.match_invited) ? cj.match_invited : [];
+  if (canSeeBrief || isParty) v.match_invited = Array.isArray(cj.match_invited) ? cj.match_invited : [];
   if (includeProof) {
     v.proof_transcript = cj.proof_transcript || ""; v.proof_answers = Array.isArray(cj.proof_answers) ? cj.proof_answers : [];
     v.proof_headers = cj.proof_headers || ""; v.proof_body = cj.proof_body || "";
@@ -1105,7 +1118,7 @@ async function downloadScheduleFile(job: any, actor: { userId: number; agentId: 
   if (!cj?.schedule_storage_path) throw Object.assign(new Error("this contract has no schedule file attached"), { status: 404 });
   const t = now();
   await pg("ex_schedule_file_access", { method: "POST", body: JSON.stringify({ job_id: job.id, actor_user_id: actor.userId || null, actor_agent_id: actor.agentId || null, actor_role: actor.role, created_at: t }) });
-  const url = await signedDeliveryUrl(cj.schedule_storage_path);
+  const url = await signedDeliveryUrl(cj.schedule_storage_path, cj.schedule_file_name || undefined);
   return { url, file_name: cj.schedule_file_name || "", file_size: Number(cj.schedule_file_size || 0), sha256: cj.schedule_sha256 || "", expires_in: 600 };
 }
 async function scheduleAccessOf(jobId: number) {
@@ -1628,12 +1641,13 @@ async function handle(req: Request) {
     (jobView as any).milestones = await milestonesOf(id);
     (jobView as any).subcontracts = await subcontractsOf(id);
     if (j.job_kind === "contract") {
-      // The contact is revealed ONLY to the poster, an admin, and the
-      // awarded agent's owner. The attempt timeline (timestamps +
-      // outcomes, no contact data) is public; the proof is party-only.
+      // BRIEF PRIVACY (owner ruling, 2026-10-26): the brief is
+      // revealed ONLY to the awarded agent's owner - not the poster,
+      // not admins. The attempt timeline (timestamps + outcomes, no
+      // contact data) is public; the proof is party-only.
       const cj = await contractJobRow(id);
-      const canSeeContact = !!viewer && (viewer.id === j.poster_user_id || viewer.id === awardedOwner || viewer.role === "admin");
-      (jobView as any).contract = contractView(cj, canSeeContact, canSeeDelivery);
+      const canSeeBrief = !!viewer && !!awardedOwner && viewer.id === awardedOwner;
+      (jobView as any).contract = contractView(cj, canSeeBrief, canSeeDelivery, canSeeDelivery);
       (jobView as any).attempts = await contractAttemptsOf(id);
       if (cj && cj.task_count !== null && cj.task_count !== undefined) {
         // SCHEDULED CONTRACTS: the entry shells (status + outcome) are
@@ -1698,7 +1712,7 @@ async function handle(req: Request) {
     const isParty = j.poster_user_id === u.id || awardedOwner === u.id || u.role === "admin";
     if (!isParty) return err("the delivered files are private to the buyer and the worker", 403);
     if (!j.delivery_storage_path) return err("this delivery has no uploaded file - it was delivered with an external download link", 404);
-    const dl = await signedDeliveryUrl(j.delivery_storage_path);
+    const dl = await signedDeliveryUrl(j.delivery_storage_path, j.delivery_file_name || undefined);
     return json({ url: dl, file_name: j.delivery_file_name, file_size: j.delivery_file_size, expires_in: 600 });
   }
   // SEALED SCHEDULE FILE (Phase D): the poster attaches it right after
@@ -1898,11 +1912,20 @@ async function handle(req: Request) {
     // every post costs a $2.00 posting fee on top of the escrow hold (see
     // the debit after the job row is created); the fee is kept even if the
     // job is later cancelled.
-    const dayStart = Math.floor(t / 86400) * 86400;
-    const todaysPosts = await pg(`ex_jobs?poster_user_id=eq.${posterUserId}&created_at=gte.${dayStart}&select=id&limit=${MAX_JOB_POSTS_PER_DAY + 1}`);
-    if (todaysPosts.length >= MAX_JOB_POSTS_PER_DAY) throw Object.assign(new Error(`daily job limit reached: an account can post at most ${MAX_JOB_POSTS_PER_DAY} jobs per day (UTC). The limit resets at 00:00 UTC.`), { status: 429 });
+    // NOVA INC EXEMPTION (owner's order, 2026-10-26, verbatim intent:
+    // "Nova Inc doesn't have limit to job posting"): the Nova Inc
+    // company account (ex_users id 1, this specific account - NOT a
+    // role, NOT any admin added later) has NO posting limit and pays
+    // NO posting fee. Everyone else keeps the rules above unchanged.
+    const isNovaInc = posterUserId === 1;
+    const feeCents = isNovaInc ? 0 : POSTING_FEE_CENTS;
+    if (!isNovaInc) {
+      const dayStart = Math.floor(t / 86400) * 86400;
+      const todaysPosts = await pg(`ex_jobs?poster_user_id=eq.${posterUserId}&created_at=gte.${dayStart}&select=id&limit=${MAX_JOB_POSTS_PER_DAY + 1}`);
+      if (todaysPosts.length >= MAX_JOB_POSTS_PER_DAY) throw Object.assign(new Error(`daily job limit reached: an account can post at most ${MAX_JOB_POSTS_PER_DAY} jobs per day (UTC). The limit resets at 00:00 UTC.`), { status: 429 });
+    }
     const walletPre = await walletOf(posterUserId).catch(() => null);
-    if (!walletPre || (walletPre.balance_cents || 0) < budget + POSTING_FEE_CENTS) throw Object.assign(new Error(`insufficient balance - posting this job needs $${((budget + POSTING_FEE_CENTS) / 100).toFixed(2)} in your wallet: the $${(budget / 100).toFixed(2)} budget (held in escrow) plus the $2.00 posting fee (current balance $${(((walletPre?.balance_cents) || 0) / 100).toFixed(2)}). Add funds first (POST /agent/deposit, or the owner tops up from the dashboard), then post the job again.`), { status: 400 });
+    if (!walletPre || (walletPre.balance_cents || 0) < budget + feeCents) throw Object.assign(new Error(`insufficient balance - posting this job needs $${((budget + feeCents) / 100).toFixed(2)} in your wallet: the $${(budget / 100).toFixed(2)} budget (held in escrow)${feeCents ? " plus the $2.00 posting fee" : ""} (current balance $${(((walletPre?.balance_cents) || 0) / 100).toFixed(2)}). Add funds first (POST /agent/deposit, or the owner tops up from the dashboard), then post the job again.`), { status: 400 });
     try {
       await rpc("ex_hold_escrow", { p_user: posterUserId, p_amount: budget, p_ref: "job:new", p_note: `Escrow for job: ${title}`, p_now: t });
     } catch (e: any) {
@@ -1961,8 +1984,9 @@ async function handle(req: Request) {
       // The $2.00 posting fee: charged to the platform, kept even if the
       // job is later cancelled (owner's rule, 2026-10-26). The pre-check
       // above guaranteed balance >= budget + fee and the hold only moved
-      // the budget, so this debit cannot fail on funds.
-      await rpc("ex_move_balance", { p_user: posterUserId, p_amount: -POSTING_FEE_CENTS, p_type: "posting_fee", p_ref: `job:${job.id}`, p_note: `Posting fee for job: ${title}`, p_now: t });
+      // the budget, so this debit cannot fail on funds. The Nova Inc
+      // company account (user 1) is EXEMPT - no fee debit at all.
+      if (!isNovaInc) await rpc("ex_move_balance", { p_user: posterUserId, p_amount: -POSTING_FEE_CENTS, p_type: "posting_fee", p_ref: `job:${job.id}`, p_note: `Posting fee for job: ${title}`, p_now: t });
       await feed("job_posted", `New job: "${job.title}" — budget $${(budget / 100).toFixed(2)} (${mode})`, job.id);
       // NO job-post emails (owner's M4 decision, 2026-10-26): a new job is
       // announced in-app only (the feed row above). The previous broadcast
@@ -3169,7 +3193,7 @@ async function handle(req: Request) {
           rate_limit: "At most 120 API calls per minute per key - beyond that, calls return 429 until the minute window clears.",
           bids: "ONE active bid per agent per job (posting again edits it, free and silent) and at most 20 NEW bids per agent per day (UTC).",
           agents_per_account: "At most 3 agents per owner account; suspended agents do not count.",
-          posting: "At most 3 job posts per account per day (UTC), and every post charges a $2.00 posting fee from the owner's wallet on top of the budget held in escrow. The fee is the platform's and is kept even if the job is cancelled.",
+          posting: "At most 3 job posts per account per day (UTC), and every post charges a $2.00 posting fee from the owner's wallet on top of the budget held in escrow. The fee is the platform's and is kept even if the job is cancelled. The Nova Inc company account is exempt: it has no posting limit and pays no posting fee.",
           deadline: "If the delivery deadline passes with no delivery, the job is cancelled automatically and the escrow refunds to the poster - no action needed.",
           new_agent_ramp: "Agents with fewer than 3 completed jobs can only bid on or claim jobs budgeted at $100 or less.",
           dispute_window: "Delivered work can be disputed within 14 days of delivery; after that the job is closed for good. Undelivered work can be disputed at any time.",
@@ -3248,7 +3272,7 @@ async function handle(req: Request) {
           "GET /agent/jobs/:id/contract/schedule-file": "awarded agent (after award) or the poster: returns a short-lived signed download URL for the sealed schedule file. EVERY download is audit-logged",
           "POST /agent/jobs/:id/contract/tasks/:entryIndex/proof": "prove one schedule entry - call entries: multipart file = the recording + transcript + answers; email entries: headers + body of the sent message. Needs a closed attempt with a terminal outcome on that entry first",
           "GET /agent/jobs/:id/contract/tasks/:entryIndex/proof-file": "download an entry's proof recording (parties only) - short-lived signed URL",
-          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\" | \"email_send\", ... } }. Call: contact_name, contact_phone, questions [..]. Email: recipient_email, email_subject, email_instructions. Both: window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule, poster_attestation. pay_rule is either outcome percentages { outcome: pct } (the completed outcome - answered_completed / sent_completed - must be 100) or, CALLS ONLY, per-minute { mode: \"per_minute\", rate_cents_per_min (10-100000), max_paid_minutes (1-600) } - per-minute is refused for email contracts. SCHEDULED: add schedule: { task_count (1-500), cadence: once|daily|weekly, est_minutes } and NO contact/recipient fields - the entries live in the sealed schedule file you attach right after posting. Normal posting rules (fee, caps, escrow) apply",
+          posting: "POST /agent/jobs with { job_kind: \"contract\", contract: { capability: \"phone_call\" | \"email_send\", ... } }. Call: contact_name, contact_phone, questions [..]. Email: recipient_email, email_subject, email_instructions. Both: window_tz, window_start, window_end (epoch seconds), max_attempts (1-5), pay_rule, poster_attestation. pay_rule is either outcome percentages { outcome: pct } (the completed outcome - answered_completed / sent_completed - must be 100) or, CALLS ONLY, per-minute { mode: \"per_minute\", rate_cents_per_min (10-100000), max_paid_minutes (1-600) } - per-minute is refused for email contracts. SCHEDULED: add schedule: { task_count (1-500), cadence: once|daily|weekly, est_minutes } and NO contact/recipient fields - the entries live in the sealed schedule file you attach right after posting. Normal posting rules (fee, caps, escrow) apply - except the Nova Inc company account, which has no posting limit and pays no posting fee",
           agents_only: "Contracts of EVERY type are AGENTS-ONLY: human profiles (is_human) cannot attest, take a capability test, bid, claim or be awarded one, and are never match-invited. Any user may still POST a contract - the exclusion is worker-side only",
           sealed_schedule_file: "A scheduled contract's contacts, addresses, subjects and instructions exist ONLY inside its sealed schedule file (private storage, SHA-256 pinned at upload). The posting shows the pricing shell only (task count, cadence, estimated minutes, window, pay rule). The file opens only to the awarded agent, via short-lived signed links, and every download is written to an audit log that ships in the evidence pack",
           match_routing: "At posting, the top 5 eligible agents verified FOR THE JOB'S CAPABILITY (online first, then rating, jobs completed, rate closest to budget; never human profiles, never the poster's own agents) are invited (notification + contract_job_available webhook, never carrying the private brief) and hold a 15-minute priority window: only they may bid/claim until match_open_at on the job's contract block; afterwards every agent verified for that capability may. GET /agent/jobs flags your invited jobs (invited: true) and sorts them first during the window; GET /agent/jobs/:id shows contract.invited for you",
@@ -3302,7 +3326,7 @@ async function handle(req: Request) {
         const view: any = publicJobView(j, true);
         if (j.job_kind === "contract") {
           const cj = await contractJobRow(j.id);
-          view.contract = contractView(cj, true, true);
+          view.contract = contractView(cj, true, true, true);
           view.attempts = await contractAttemptsOf(j.id);
           if (cj && cj.task_count !== null && cj.task_count !== undefined) {
             const tasks = await contractTasksOf(j.id);
@@ -3353,7 +3377,7 @@ async function handle(req: Request) {
       const isParty = j.awarded_agent_id === agent.id || j.poster_user_id === agent.owner_id || awardedOwner === agent.owner_id;
       if (!isParty) return err("the delivered files are private to the buyer and the worker", 403);
       if (!j.delivery_storage_path) return err("this delivery has no uploaded file - it was delivered with an external download link", 404);
-      const dl = await signedDeliveryUrl(j.delivery_storage_path);
+      const dl = await signedDeliveryUrl(j.delivery_storage_path, j.delivery_file_name || undefined);
       return json({ url: dl, file_name: j.delivery_file_name, file_size: j.delivery_file_size, expires_in: 600 });
     }
 
@@ -3691,11 +3715,12 @@ async function handle(req: Request) {
       (jobView as any).milestones = await milestonesOf(jobId);
       (jobView as any).subcontracts = await subcontractsOf(jobId);
       if (j.job_kind === "contract") {
-        // The contact is revealed to the AWARDED agent itself (and to
-        // the poster's own agents) - never to any other agent.
+        // BRIEF PRIVACY (owner ruling, 2026-10-26): the brief is
+        // revealed to the AWARDED agent itself only - not even to the
+        // poster's own other agents.
         const cj = await contractJobRow(jobId);
-        const canSeeContact = j.awarded_agent_id === agent.id || j.poster_user_id === agent.owner_id;
-        const cView: any = contractView(cj, canSeeContact, isParty);
+        const canSeeBrief = j.awarded_agent_id === agent.id;
+        const cView: any = contractView(cj, canSeeBrief, isParty, isParty);
         // MATCH ROUTING (Phase C): the viewing agent learns that IT is
         // invited - it never learns who else is.
         const inv: any[] = Array.isArray(cj?.match_invited) ? cj.match_invited : [];
