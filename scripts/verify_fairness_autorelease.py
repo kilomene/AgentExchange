@@ -16,7 +16,14 @@ and one-shot sweeper cycles:
   - reminder flags fire once and not twice (24h + 6h, one mail each)
   - per-milestone 48h auto-release pays the milestone share exactly
   - contract job with a recorded final_outcome refuses dispute
-  - shadow ban: profile 404 public/other, 200 owner+admin, list /
+  - shadow ban (expansion): ghosting incl. jobs/listings; the user IS
+    told exactly once (self-only badge + case ID, one notification,
+    one notice email), then total notification/email suppression at
+    queue time AND at mailer send time; immutable evidence pack per
+    case; reports open cases (never auto-ban); agent appeal lands in
+    the admin queue; AUTO-BAN on 3 strikes (sweeper dispute default)
+    and on a bad-faith dispute lost against a verified delivery;
+    unban restores everything. Profile 404 public/other, 200 owner+admin, list /
     leaderboard / floor exclusion, audit row, NO notification, unban
     restores exactly
   - wallet freeze: payout create rejected, pre-freeze payout held at
@@ -208,7 +215,8 @@ def main():
     J1 = jwt_for(1)
     J4 = jwt_for(4)
     created_jobs, settled = [], []
-    throw = {"user": None, "agent": None, "job": None, "payouts": []}
+    foreign_settled = []
+    throw = {"user": None, "agent": None, "job": None, "payouts": [], "user2": None}
     w1_0, w4_0 = wallet(1), wallet(4)
     ob0 = outbox_state()
     pool0 = pool()
@@ -450,11 +458,12 @@ def main():
         rest(f"ex_jobs?id=eq.{je}", method="DELETE")
         created_jobs.remove(je)
 
-        # ---------- A. shadow ban ----------
+        # ---------- A. shadow ban (expansion: told + suppressed + cases) ----------
         print("== shadow ban ==")
         now_s = int(time.time())
+        temail = f"verify-throwaway-{now_s}@example.com"
         tuid = rest("ex_users", method="POST", body={
-            "email": f"verify-throwaway-{now_s}@example.com", "name": "Verify Throwaway",
+            "email": temail, "name": "Verify Throwaway",
             "password_hash": "x", "role": "user", "created_at": now_s, "email_verified": True})[0]["id"]
         throw["user"] = tuid
         rest("ex_wallets", method="POST", body={"user_id": tuid, "balance_cents": 0, "held_cents": 0})
@@ -472,25 +481,60 @@ def main():
         throw["job"] = tjob
         JT = jwt_for(tuid)
         code, r = api("GET", "/agent/help", agent_key=plain_key)
-        ok(code == 200 and "fairness_auto_release" in json.dumps(r),
-           "agent help carries the fairness_auto_release policy", f"{code}")
+        ok(code == 200 and "fairness_auto_release" in json.dumps(r) and "shadow_ban" in json.dumps(r),
+           "agent help carries the fairness + shadow-ban policies", f"{code}")
         code, r = api("GET", f"/agents?q=VerifyThrow", jwt=None)
         ok(any(a["id"] == tagent["id"] for a in r.get("agents", [])), "agent listed before ban", "")
         code, r = api("GET", f"/agents/{tagent['id']}", jwt=None)
         ok(code == 200, "agent profile public 200 before ban", f"{code}")
         code, r = api("GET", "/jobs", jwt=None)
         ok(any(j["id"] == tjob for j in r.get("jobs", [])), "open job on the floor before ban", "")
+
+        # reports: a report opens an admin case — it NEVER bans by itself
+        code, r = api("POST", "/reports", jwt=J4, body={
+            "target_user_id": tuid, "reason": "suspected scam: took a deposit off-platform and vanished",
+            "evidence_text": "chat screenshots referenced", "evidence_refs": ["chat:job-999"]})
+        ok(code == 200 and r.get("report_id"), "web scam report accepted (opens a case)", f"{code} {str(r)[:160]}")
+        code, r = api("POST", "/agent/reports", agent_key=plain_key, body={
+            "target_user_id": 4, "reason": "agent-channel report for the queue test",
+            "evidence_text": "evidence supplied with the report"})
+        ok(code == 200 and r.get("report_id"), "agent scam report accepted (opens a case)", f"{code} {str(r)[:160]}")
+        ok(not user_row(tuid).get("shadow_banned"), "a single report alone does NOT auto-ban", "")
+
+        # pre-ban award -> a job_awarded mail sits QUEUED for the throwaway
+        jp = post_job(J1, {"title": "VERIFY shadow pre-ban award (throwaway)", "description": "Throwaway.",
+                           "category": "research", "budget": 15, "mode": "bidding",
+                           "acceptance_checklist": ["deliverable file present"]})
+        created_jobs.append(jp)
+        bid_t = rest("ex_bids", method="POST", body={
+            "job_id": jp, "agent_id": tagent["id"], "bidder_user_id": tuid,
+            "amount_cents": AMOUNT, "eta_hours": 24, "pitch": "verify bid",
+            "status": "active", "created_at": int(time.time())})[0]
+        code, r = api("POST", f"/jobs/{jp}/award", jwt=J1, body={"bid_id": bid_t["id"]})
+        ok(code in (200, 201), "pre-ban award to the throwaway agent lands", f"{code} {str(r)[:160]}")
+        pre_mail = rest(f"ex_outbox?to_email=eq.{temail}&kind=eq.job_awarded&select=id,status")
+        ok(len(pre_mail) == 1 and pre_mail[0]["status"] == "queued",
+           "pre-ban job_awarded mail queued for the throwaway", str(pre_mail))
+        pre_mail_id = pre_mail[0]["id"]
+
         t_ban = int(time.time())
-        code, r = api("POST", f"/admin/users/{tuid}/shadow-ban", api_key=ADMIN_KEY, body={"banned": True})
-        ok(code == 200 and r.get("shadow_banned") is True, "admin shadow-ban endpoint", f"{code} {str(r)[:120]}")
+        code, r = api("POST", f"/admin/users/{tuid}/shadow-ban", api_key=ADMIN_KEY,
+                      body={"banned": True, "reason": "e2e: suspected scam ring"})
+        case_code = r.get("case_code") or ""
+        ok(code == 200 and r.get("shadow_banned") is True and case_code.startswith("SB-"),
+           "admin shadow-ban endpoint returns a case ID", f"{code} {str(r)[:160]}")
         code, r = api("GET", f"/agents/{tagent['id']}", jwt=None)
         ok(code == 404, "shadow-banned profile 404 for the public", f"{code}")
         code, r = api("GET", f"/agents/{tagent['id']}", jwt=J4)
-        ok(code == 404, "shadow-banned profile 404 for other signed-in users", f"{code}")
+        ok(code == 404 and "shadow" not in json.dumps(r).lower(),
+           "shadow-banned profile 404 for other users, no badge leaks", f"{code}")
         code, r = api("GET", f"/agents/{tagent['id']}", jwt=JT)
-        ok(code == 200, "shadow-banned profile still 200 for the OWNER", f"{code}")
+        ag_view = r.get("agent") or {}
+        ok(code == 200 and ag_view.get("shadow_banned") is True and ag_view.get("shadow_case_code") == case_code,
+           "OWNER sees the Shadow Banned badge + case ID on their own profile", f"{code} {str(ag_view)[:200]}")
         code, r = api("GET", f"/agents/{tagent['id']}", api_key=ADMIN_KEY)
-        ok(code == 200, "shadow-banned profile still 200 for ADMIN", f"{code}")
+        ok(code == 200 and (r.get("agent") or {}).get("shadow_banned") is True,
+           "ADMIN sees the profile + badge", f"{code}")
         code, r = api("GET", "/agents?q=VerifyThrow", jwt=None)
         ok(not any(a["id"] == tagent["id"] for a in r.get("agents", [])), "agent gone from list/search while banned", "")
         code, r = api("GET", "/leaderboard", jwt=None)
@@ -503,14 +547,162 @@ def main():
         ok(code == 200, "banned poster still opens their own job", f"{code}")
         audit = rest(f"ex_admin_audit?target_user_id=eq.{tuid}&action=eq.shadow_ban&select=id")
         ok(len(audit) >= 1, "shadow ban written to the admin audit trail", "")
+        # the user IS told — exactly once: one notification + one email, both with the case ID
+        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_ban}&select=id,body")
+        ok(len(notifs) == 1 and case_code in (notifs[0].get("body") or ""),
+           "exactly ONE notification reaches the banned user: the ban notice with the case ID", str(notifs)[:220])
+        mails = rest(f"ex_outbox?to_email=eq.{temail}&created_at=gte.{t_ban}&select=id,kind,payload")
+        ok(len(mails) == 1 and mails[0]["kind"] == "shadow_ban_notice"
+           and (mails[0].get("payload") or {}).get("case_id") == case_code,
+           "exactly ONE email queued for the banned user: the notice with the case ID", str(mails)[:220])
+        notice_mail_id = mails[0]["id"]
+        cases = rest(f"ex_shadow_cases?user_id=eq.{tuid}&status=eq.active&select=case_code,trigger_rule,evidence_pack")
+        ok(len(cases) == 1 and cases[0]["case_code"] == case_code
+           and cases[0]["trigger_rule"] == "manual_admin"
+           and len((cases[0].get("evidence_pack") or {}).get("agents") or []) >= 1,
+           "evidence pack snapshotted on the case at ban time", str(cases)[:220])
+
+        # queue-time suppression: award a second job to the banned agent
+        jp2 = post_job(J1, {"title": "VERIFY shadow suppression (throwaway)", "description": "Throwaway.",
+                            "category": "research", "budget": 15, "mode": "bidding",
+                            "acceptance_checklist": ["deliverable file present"]})
+        created_jobs.append(jp2)
+        bid_t2 = rest("ex_bids", method="POST", body={
+            "job_id": jp2, "agent_id": tagent["id"], "bidder_user_id": tuid,
+            "amount_cents": AMOUNT, "eta_hours": 24, "pitch": "verify bid",
+            "status": "active", "created_at": int(time.time())})[0]
+        code, r = api("POST", f"/jobs/{jp2}/award", jwt=J1, body={"bid_id": bid_t2["id"]})
+        ok(code in (200, 201), "second award to the banned agent still processes (money in flight)", f"{code}")
         notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_ban}&select=id")
-        ok(len(notifs) == 0, "NO notification of any kind reached the banned user", str(notifs))
+        ok(len(notifs) == 1, "queue-time suppression: the award queued NO new notification", str(notifs))
+        mails = rest(f"ex_outbox?to_email=eq.{temail}&select=id")
+        ok(len(mails) == 2, "queue-time suppression: the award queued NO new email (pre-ban + notice only)", str(mails))
+        code, r = api("PUT", f"/admin/users/{tuid}", api_key=ADMIN_KEY, body={"verified_badge": True})
+        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_ban}&select=id")
+        ok(len(notifs) == 1, "even an admin badge-grant notification is suppressed while banned", str(notifs))
+        # release the two test escrows (the jobs themselves are swept in finally)
+        for jx in (jp, jp2):
+            sql(f"select ex_refund_escrow(1, {AMOUNT}, 'job:{jx}', 'verify cleanup refund', {int(time.time())});")
+            rest(f"ex_jobs?id=eq.{jx}", method="PATCH", body={"status": "refunded"})
+
+        # send-time suppression via the REAL mailer module (mailer is PAUSED;
+        # this drives its own checkAndSuppress against the live rows)
+        def send_time_check(row_id):
+            js = (
+                'import { SupabaseAdmin } from "file://' + str(ROOT) + '/mail-service/src/supabase.mjs";\n'
+                'import { checkAndSuppress } from "file://' + str(ROOT) + '/mail-service/src/suppression.mjs";\n'
+                'const db = new SupabaseAdmin({ url: process.env.SUPABASE_URL, serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY });\n'
+                f'const rows = await db.list("ex_outbox?id=eq.{row_id}&select=*");\n'
+                'const suppressed = await checkAndSuppress(db, rows[0]);\n'
+                f'const after = await db.list("ex_outbox?id=eq.{row_id}&select=status,attempts");\n'
+                'console.log(JSON.stringify({ suppressed, status: after[0].status, attempts: after[0].attempts }));\n')
+            Path("/tmp/suppress_check.mjs").write_text(js)
+            env = dict(__import__("os").environ)
+            env.update({"SUPABASE_URL": ENV["SUPABASE_URL"], "SUPABASE_SERVICE_ROLE_KEY": SRK})
+            r2 = subprocess.run(["node", "/tmp/suppress_check.mjs"], capture_output=True, text=True, env=env)
+            assert r2.returncode == 0, r2.stdout[-500:] + r2.stderr[-500:]
+            return json.loads(r2.stdout.strip().splitlines()[-1])
+        chk = send_time_check(pre_mail_id)
+        ok(chk["suppressed"] is True and chk["status"] == "suppressed_shadow_ban" and chk["attempts"] in (0, None),
+           "send-time suppression: pre-ban queued mail suppressed, no attempt burned", str(chk))
+        chk = send_time_check(notice_mail_id)
+        ok(chk["suppressed"] is False and chk["status"] == "queued",
+           "send-time check never suppresses the ban notice itself", str(chk))
+
+        # appeal via the agent API lands in the ONE admin queue, tied to the pack
+        code, r = api("POST", "/agent/shadow-appeal", agent_key=plain_key, body={
+            "case_code": case_code,
+            "evidence_text": "I did not scam anyone: the delivery was sent in full and the poster confirmed receipt in chat before going silent.",
+            "evidence_refs": ["delivery:sha256:verify", "chat:job-999"]})
+        ok(code == 200 and r.get("case_code") == case_code, "agent appeal accepted against the case ID", f"{code} {str(r)[:160]}")
+        code, r = api("GET", "/admin/reports", api_key=ADMIN_KEY)
+        ok(any(x.get("kind") == "shadow_appeal" and x.get("case_code") == case_code for x in r.get("reports", [])),
+           "appeal visible in the admin queue, linked to the case", "")
+        code, r = api("GET", "/admin/shadow-cases", api_key=ADMIN_KEY)
+        ok(any(x.get("case_code") == case_code for x in r.get("cases", [])),
+           "case visible in the admin shadow-case queue", "")
+
         code, r = api("POST", f"/admin/users/{tuid}/shadow-ban", api_key=ADMIN_KEY, body={"banned": False})
         ok(code == 200 and r.get("shadow_banned") is False, "admin unban endpoint", f"{code}")
         code, r = api("GET", f"/agents/{tagent['id']}", jwt=None)
-        ok(code == 200, "unban restores the public profile exactly", f"{code}")
+        ok(code == 200 and not (r.get("agent") or {}).get("shadow_banned"),
+           "unban restores the public profile exactly (no badge)", f"{code}")
         code, r = api("GET", "/jobs", jwt=None)
         ok(any(j["id"] == tjob for j in r.get("jobs", [])), "unban restores floor visibility exactly", "")
+        t_lift = int(time.time())
+        code, r = api("PUT", f"/admin/users/{tuid}", api_key=ADMIN_KEY, body={"verified_badge": True})
+        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_lift}&select=id")
+        ok(len(notifs) >= 1, "notifications resume after the lift", str(notifs))
+
+        # ---------- A2. auto shadow ban: 3 strikes (sweeper dispute default) ----------
+        print("== auto shadow ban: 3 strikes ==")
+        rest("ex_users?id=eq." + str(tuid), method="PATCH", body={"strikes": 2})
+        sql(f"select ex_move_balance({tuid}, 2000, 'test_fund', 'verify:autoban', 'e2e funding', {int(time.time())});")
+        now_s = int(time.time())
+        jf = rest("ex_jobs", method="POST", body={
+            "poster_user_id": tuid, "awarded_agent_id": 13, "title": "VERIFY autoban strikes (throwaway)",
+            "description": "throwaway", "category": "research", "mode": "bidding",
+            "budget_cents": AMOUNT, "agreed_cents": AMOUNT, "fee_cents": FEE, "status": "disputed",
+            "job_kind": "standard", "deliverable": "", "dispute_reason": "",
+            "delivered_at": now_s - 90000, "dispute_deadline": now_s - 80000,
+            "dispute_admin_deadline": now_s - 3600,
+            "acceptance_checklist": ["deliverable file present"], "checklist_frozen": ["deliverable file present"],
+            "created_at": now_s - 100000, "updated_at": now_s - 90000})[0]["id"]
+        foreign_settled.append(jf)
+        sql(f"select ex_hold_escrow({tuid}, {AMOUNT}, 'job:{jf}', 'verify hold', {now_s});")
+        t_auto = int(time.time())
+        sweeper_once()
+        ok(wallet(4)[0] == exp_w4 + (AMOUNT - FEE), "dispute default still pays the worker exactly", f"{wallet(4)} vs {exp_w4}")
+        exp_w4 += AMOUNT - FEE
+        exp_pool += 15
+        urow = user_row(tuid)
+        ok(urow.get("shadow_banned") is True and (urow.get("strikes") or 0) == 3,
+           "AUTO-BAN fired: the dispute-default strike took the poster to 3 and shadow-banned the account", str(urow)[:200])
+        cases = rest(f"ex_shadow_cases?user_id=eq.{tuid}&status=eq.active&select=case_code,trigger_rule,evidence_pack")
+        ok(len(cases) == 1 and cases[0]["trigger_rule"] == "auto_3_strikes"
+           and (cases[0].get("evidence_pack") or {}).get("user"),
+           "auto-ban case + evidence pack created by the system", str(cases)[:220])
+        auto_code = cases[0]["case_code"]
+        notifs = rest(f"ex_notifications?user_id=eq.{tuid}&created_at=gte.{t_auto}&select=id,body")
+        ok(len(notifs) == 1 and auto_code in (notifs[0].get("body") or ""),
+           "auto-ban sent exactly the one notice (dispute mails suppressed after it)", str(notifs)[:220])
+        mails = rest(f"ex_outbox?to_email=eq.{temail}&kind=eq.shadow_ban_notice&select=id")
+        ok(len(mails) == 2, "one notice email per ban (manual + auto), nothing else", str(mails))
+        code, r = api("POST", f"/admin/users/{tuid}/shadow-ban", api_key=ADMIN_KEY, body={"banned": False})
+        ok(code == 200 and not user_row(tuid).get("shadow_banned"), "auto-ban lifts like a manual ban", f"{code}")
+
+        # ---------- A3. auto shadow ban: bad-faith dispute vs verified delivery ----------
+        print("== auto shadow ban: bad-faith dispute ==")
+        now_s = int(time.time())
+        uid2 = rest("ex_users", method="POST", body={
+            "email": f"verify-throwaway2-{now_s}@example.com", "name": "Verify Throwaway Two",
+            "password_hash": "x", "role": "user", "created_at": now_s, "email_verified": True})[0]["id"]
+        throw["user2"] = uid2
+        rest("ex_wallets", method="POST", body={"user_id": uid2, "balance_cents": 0, "held_cents": 0})
+        sql(f"select ex_move_balance({uid2}, 2000, 'test_fund', 'verify:badfaith', 'e2e funding', {now_s});")
+        jg = rest("ex_jobs", method="POST", body={
+            "poster_user_id": uid2, "awarded_agent_id": 13, "title": "VERIFY autoban badfaith (throwaway)",
+            "description": "throwaway", "category": "research", "mode": "bidding",
+            "budget_cents": AMOUNT, "agreed_cents": AMOUNT, "fee_cents": FEE, "status": "disputed",
+            "job_kind": "standard", "deliverable": "delivered", "dispute_reason": "poster claims it never arrived",
+            "delivered_at": now_s - 90000,
+            "delivery_check": {"verdict": "passed", "score": 100},
+            "acceptance_checklist": ["deliverable file present"], "checklist_frozen": ["deliverable file present"],
+            "created_at": now_s - 100000, "updated_at": now_s - 90000})[0]["id"]
+        foreign_settled.append(jg)
+        sql(f"select ex_hold_escrow({uid2}, {AMOUNT}, 'job:{jg}', 'verify hold', {now_s});")
+        code, r = api("POST", f"/admin/jobs/{jg}/resolve", api_key=ADMIN_KEY, body={"resolution": "agent"})
+        ok(code in (200, 201), "admin resolves the dispute for the agent", f"{code} {str(r)[:160]}")
+        ok(wallet(4)[0] == exp_w4 + (AMOUNT - FEE), "bad-faith resolution pays the worker exactly", f"{wallet(4)} vs {exp_w4}")
+        exp_w4 += AMOUNT - FEE
+        exp_pool += 15
+        urow2 = user_row(uid2)
+        ok(urow2.get("shadow_banned") is True,
+           "AUTO-BAN fired: poster lost a dispute against a VERIFIED delivery", str(urow2)[:200])
+        cases = rest(f"ex_shadow_cases?user_id=eq.{uid2}&status=eq.active&select=case_code,trigger_rule")
+        ok(len(cases) == 1 and cases[0]["trigger_rule"] == "auto_bad_faith_dispute",
+           "bad-faith auto-ban case created with its trigger named", str(cases)[:200])
+        ok(not user_row(uid2).get("wallet_frozen"), "auto-ban does NOT auto-freeze the wallet (separate tools)", "")
 
         # ---------- B. wallet freeze ----------
         print("== wallet freeze ==")
@@ -573,8 +765,31 @@ def main():
             for jid in settled:
                 sql(f"select ex_move_balance(4, -{AMOUNT - FEE}, 'test_reversal', 'verify:fairness', 'reverse settlement job {jid}', {now_s});")
                 sql(f"select ex_move_balance(1, {AMOUNT}, 'test_reversal', 'verify:fairness', 'reverse escrow job {jid}', {now_s});")
+            # foreign-posted settlements (auto-ban sections): reverse the
+            # worker side only — the poster wallets are throwaway rows,
+            # deleted below with their trees.
+            for jid in foreign_settled:
+                sql(f"select ex_move_balance(4, -{AMOUNT - FEE}, 'test_reversal', 'verify:fairness', 'reverse foreign settlement job {jid}', {now_s});")
+                rest(f"ex_jobs?id=eq.{jid}", method="DELETE")
         except Exception as e:
             print("money reversal note:", e)
+        # second throwaway (bad-faith poster) tree + shadow case/report rows
+        try:
+            if throw.get("user2"):
+                rest(f"ex_ledger?user_id=eq.{throw['user2']}", method="DELETE")
+                rest(f"ex_notifications?user_id=eq.{throw['user2']}", method="DELETE")
+                rest(f"ex_admin_audit?target_user_id=eq.{throw['user2']}", method="DELETE")
+                rest(f"ex_wallets?user_id=eq.{throw['user2']}", method="DELETE")
+                rest(f"ex_users?id=eq.{throw['user2']}", method="DELETE")
+            for c in rest(f"ex_shadow_cases?created_at=gte.{T0}&select=id"):
+                rest(f"ex_shadow_cases?id=eq.{c['id']}", method="DELETE")
+            for rp in rest(f"ex_reports?created_at=gte.{T0}&select=id"):
+                rest(f"ex_reports?id=eq.{rp['id']}", method="DELETE")
+            if throw["user"]:
+                rest(f"ex_shadow_cases?user_id=eq.{throw['user']}", method="DELETE")
+                rest(f"ex_reports?reporter_user_id=eq.{throw['user']}", method="DELETE")
+        except Exception as e:
+            print("shadow cleanup note:", e)
         # guarantee pool back to baseline exactly
         try:
             d = pool() - pool0
