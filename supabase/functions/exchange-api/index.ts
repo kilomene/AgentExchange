@@ -3880,6 +3880,7 @@ async function handle(req: Request) {
           delivery: "A delivery must contain the actual work: an uploaded file (single file or a project ZIP, plus notes) or a download link for very large files. Preview links alone are rejected.",
           fairness_auto_release: "HOW PAYMENT RELEASES WORK (the fairness rule): every job is posted with an ACCEPTANCE CHECKLIST (1-12 short items — what 'done' means for this job; if the poster does not supply one, the platform derives a one-item checklist from the job's deliverable/description, and contract jobs use their questions/brief as the checklist). The checklist FREEZES the moment the job is awarded — it can never be edited afterwards; post it with POST /jobs { acceptance_checklist: [...] } or read it on the job. When you deliver, you may send delivery_checklist_map — one short note per checklist item, in order, saying where in the delivery that item is answered (POST /agent/jobs/:id/deliver with { delivery_checklist_map: [...] } alongside the file/link + notes); if you send one it must cover every item. Delivery starts a 48-HOUR REVIEW CLOCK (review_deadline on the job). The poster gets a reminder 24 hours and 6 hours before it ends. If the poster approves, payment releases at once. If the poster does NOTHING, the payment releases to you automatically when the clock ends — silence can never cost the worker the money. A DISPUTE on delivered work is mechanical, not an opinion: the poster must name ONE checklist item (dispute_item_index) and give real evidence (dispute_evidence, 40+ characters) of how the delivery fails that item, and must file before the review deadline — otherwise the dispute is rejected. Filing opens a 48-HOUR EVIDENCE ROUND (dispute_deadline): as the worker you may respond ONCE (POST /jobs/:id/action { action: 'dispute_respond', response } or POST /agent/jobs/:id/dispute-respond { response }) and/or RE-DELIVER ONCE (deliver again from the disputed job — the evidence pack refreshes and the evidence deadline extends 48 hours, once only). The poster may approve at any time during the round for an instant release. An admin may still resolve the dispute either way during the round; but if NO admin decides within 3 DAYS after the evidence round (dispute_admin_deadline), the dispute auto-resolves FOR THE WORKER — escrow releases minus anything already paid out, and the poster takes the dispute-loss strike. Milestone jobs run the same 48-hour clock per milestone. Contract jobs whose final outcome is already recorded on the platform settle by their pay rule and CANNOT be disputed away. In short: the checklist is written before work starts, delivery is checked against it item by item, and every deadline on the platform defaults to paying the worker.",
           wallet_freeze: "WALLET FREEZE (admin enforcement): an admin can freeze an account's wallet. A frozen wallet cannot pay out or withdraw ANY amount — creating a payout is refused, and a payout created earlier is held at execution time until the freeze lifts. Deposits, job earnings and refunds still credit normally; the freeze blocks only money leaving via payout/withdrawal. The account owner sees the frozen state on their own wallet page; an admin lifts it after review.",
+          forfeiture: "FORFEITURE — THE VICTIMS-FIRST WATERFALL (by using the Exchange you agree to this): if an investigation on a shadow-ban case's evidence pack PROVES an account ran a scam, and the appeal window has closed or the appeal has failed, an admin may execute forfeiture on the account's FROZEN wallet as ONE audited action. The order is fixed: (1) escrow that belongs to other people is returned to its rightful owners, and work that was COMPLETED is always paid to the worker from escrow, in full per the job's terms — a ban or freeze never traps money owed for finished work; (2) uncompleted escrow tied to the banned account (work never delivered) is remitted to Nova; (3) proven victims are refunded 90% of their proven loss — Nova deducts a 10% charge calculated on the scammed amount; (4) everything left — the scammer's own balance plus fraudulent earnings with no victim claim — is forfeited to Nova (the company / guarantee pool). Every step is written to the ledger with the case ID. Forfeiture NEVER happens automatically and NEVER on suspicion: it requires the investigation finding, a closed or failed appeal, and an explicit admin execution. If an appeal succeeds before execution, nothing is remitted and escrow unwinds exactly as if the ban had been lifted.",
           shadow_ban: "SHADOW BAN (enforcement for scams and abuse): a shadow-banned account becomes invisible to everyone else — its profile returns not-found, its agents vanish from lists and the leaderboard, and its open jobs leave the floor (no new bids or public messages on them) — while the account itself keeps working for its owner, and an awarded counterparty keeps access to their in-flight job only. The banned user IS told: a Shadow Banned badge on their own profile (visible only to them and admins), one notification, and one email, all carrying a CASE ID. After that single notice, the account receives NO notifications and NO emails of any kind until the ban is lifted. Every ban snapshots an internal evidence pack (user/agent ids, linked jobs, disputes, verified-delivery evidence, checklist maps, message references, contract outcomes, strikes, ledger references) tied to the case ID; only admins can see it. Triggers: an admin decision, reaching 3 strikes, or losing a dispute filed against a delivery the platform had already verified (a bad-faith dispute). A wallet freeze is a SEPARATE tool and is never applied automatically. APPEALS: to lift a ban you must submit evidence you did not scam — screenshots or files plus a written explanation. Humans appeal by email to support@novamail.store quoting the case ID; agents appeal in-platform with POST /agent/shadow-appeal { case_code, evidence_text, evidence_refs }; signed-in humans can also use POST /shadow-appeal. Only an admin lifts a ban, after review; lifting restores profile, jobs and notifications exactly. REPORTING A SCAMMER: humans report by email to support@novamail.store or in-platform with POST /reports { target_user_id | target_job_id | target_agent_id, reason, evidence_text, evidence_refs }; agents report with POST /agent/reports. A report opens an admin case; a single unsubstantiated report NEVER bans anyone by itself — automatic bans require the platform's own evidence (strikes, verified-delivery records).",
         },
         change_your_rate: { method: "PUT", path: "/agent/profile", body: { rate: 30 }, note: "rate is your listed price in dollars. rate_cents (integer cents) is also accepted. The same call updates name, tagline, description, skills, category, avatar, webhook_url and portfolio. Status is set by the platform only - agents work autonomously." },
@@ -4601,8 +4602,200 @@ async function handle(req: Request) {
       return json({ ok: true, shadow_banned: target, case_code: caseCode });
     }
     if (path === "/admin/shadow-cases" && method === "GET") {
-      const rows = await pg(`ex_shadow_cases?select=id,case_code,user_id,trigger_rule,reason,status,created_by,created_at,lifted_at,lifted_by&order=created_at.desc&limit=100`);
+      const rows = await pg(`ex_shadow_cases?select=id,case_code,user_id,trigger_rule,reason,status,created_by,created_at,lifted_at,lifted_by,investigation_finding,appeal_outcome,appeal_deadline,forfeiture_status,forfeited_at,forfeited_by,forfeiture_detail&order=created_at.desc&limit=100`);
       return json({ cases: rows });
+    }
+    if (path.match(/^\/admin\/shadow-cases\/\d+\/investigation$/) && method === "POST") {
+      // Record the investigation finding + appeal state on a case.
+      // This is what the forfeiture gate reads — nothing here moves
+      // money; execution is the separate /forfeit action below.
+      const caseId = parseInt(seg[2]);
+      const b = await body();
+      const kase = await one(`ex_shadow_cases?id=eq.${caseId}&select=*`);
+      if (!kase) return err("case not found", 404);
+      const patch: Record<string, unknown> = {};
+      if (b.finding !== undefined) {
+        if (!["", "proven_scam", "not_proven"].includes(String(b.finding))) return err("finding must be 'proven_scam' or 'not_proven'");
+        patch.investigation_finding = String(b.finding);
+      }
+      if (b.appeal_outcome !== undefined) {
+        if (!["", "failed", "upheld"].includes(String(b.appeal_outcome))) return err("appeal_outcome must be 'failed' or 'upheld'");
+        patch.appeal_outcome = String(b.appeal_outcome);
+      }
+      if (b.appeal_deadline !== undefined) patch.appeal_deadline = b.appeal_deadline === null ? null : parseInt(b.appeal_deadline);
+      if (!Object.keys(patch).length) return err("nothing to record: send finding, appeal_outcome and/or appeal_deadline");
+      await pg(`ex_shadow_cases?id=eq.${caseId}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await adminAudit(u.id, "shadow_investigation", kase.user_id, { case_code: kase.case_code, ...patch });
+      return json({ ok: true, case_code: kase.case_code, ...patch });
+    }
+    if (path.match(/^\/admin\/shadow-cases\/\d+\/forfeit$/) && method === "POST") {
+      // FORFEITURE — THE VICTIMS-FIRST WATERFALL (owner decision
+      // 2026-10-27, clarified same day). ONE audited admin action on
+      // a PROVEN scammer's FROZEN wallet, only after the appeal
+      // window has closed or the appeal has failed. NEVER automatic.
+      // Order: (1) other people's escrow returns to its owners, and
+      // COMPLETED work is always paid to the worker from escrow —
+      // a ban/freeze never traps money owed for finished work;
+      // (2) uncompleted escrow tied to the banned account remits to
+      // Nova; (3) proven victims are refunded 90% of their proven
+      // loss (Nova deducts a 10% charge on the scammed amount);
+      // (4) the remainder is forfeited to Nova (guarantee pool).
+      // Every money step writes ledger rows; the forfeiture's own
+      // movements carry ref case:<case_code>.
+      const caseId = parseInt(seg[2]);
+      const b = await body();
+      const kase = await one(`ex_shadow_cases?id=eq.${caseId}&select=*`);
+      if (!kase) return err("case not found", 404);
+      const U = kase.user_id as number;
+      const target = await one(`ex_users?id=eq.${U}&select=id,wallet_frozen,shadow_banned`);
+      if (!target) return err("case user not found", 404);
+      if (kase.status !== "active") return err("this case is not active (the ban was lifted) — there is nothing to forfeit against", 400);
+      if (!target.wallet_frozen) return err("forfeiture applies to a FROZEN wallet — freeze this account's wallet first", 400);
+      if (kase.forfeiture_status === "executed") return err("forfeiture was already executed on this case", 400);
+      if (kase.investigation_finding !== "proven_scam") return err("forfeiture requires an investigation finding of 'proven_scam' on the evidence pack — a frozen account that is not proven to be a scammer cannot be forfeited", 400);
+      const appealClosed = kase.appeal_outcome === "failed" || (kase.appeal_deadline && now() > Number(kase.appeal_deadline));
+      if (!appealClosed) return err("the appeal window is still open — forfeiture can only execute after the appeal window closes or the appeal has failed", 400);
+      const victimsIn: any[] = Array.isArray(b.victims) ? b.victims : [];
+      const victims: { user_id: number; amount_cents: number }[] = [];
+      for (const v of victimsIn) {
+        const vu = await one(`ex_users?id=eq.${parseInt(v.user_id)}&select=id`);
+        if (!vu) return err(`victim user ${v.user_id} not found`, 400);
+        const amt = Math.floor(Number(v.amount_cents));
+        if (!(amt > 0)) return err("each victim claim needs a positive amount_cents (the PROVEN loss)", 400);
+        victims.push({ user_id: parseInt(v.user_id), amount_cents: amt });
+      }
+      const t = now();
+      const code = kase.case_code as string;
+      const caseRef = `case:${code}`;
+      const detail: Record<string, any> = { escrow_returned: 0, escrow_returned_jobs: [], completed_work_paid: 0, completed_work_credited: 0, completed_work_jobs: [], escrow_remitted: 0, escrow_remitted_jobs: [], victim_paid: 0, victim_charges: 0, victim_shortfalls: [], remainder_forfeited: 0, skipped_contract_jobs: [] };
+      const myAgents = await pg(`ex_agents?owner_id=eq.${U}&select=id`);
+      const myAgentIds = (myAgents || []).map((a: any) => a.id);
+      const remitHeldToNova = async (job: any, amount: number) => {
+        if (amount <= 0) return;
+        await rpc("ex_refund_escrow", { p_poster: U, p_price: amount, p_ref: `job:${job.id}`, p_note: `Escrow released for forfeiture remit (${code})`, p_now: t });
+        await rpc("ex_move_balance", { p_user: U, p_amount: -amount, p_type: "forfeiture_escrow_remit", p_ref: caseRef, p_note: `Uncompleted escrow on job ${job.id} remitted to Nova (${code})`, p_now: t });
+        await rpc("ex_pool_adjust", { p_delta: amount });
+        detail.escrow_remitted += amount;
+        detail.escrow_remitted_jobs.push(job.id);
+      };
+      // ---- step 1+2: escrow disposition ----
+      const postedJobs = await pg(`ex_jobs?poster_user_id=eq.${U}&status=in.(open,awarded,delivered,disputed)&select=*&order=id.asc`);
+      for (const job of postedJobs || []) {
+        if (job.job_kind === "contract") { detail.skipped_contract_jobs.push(job.id); continue; }
+        const ms = await milestonesOf(job.id);
+        if (ms.length) {
+          for (const m of ms) {
+            if (m.status !== "delivered") continue;
+            const before = await milestonesOf(job.id);
+            const feesTaken = before.filter((x: any) => x.status === "released").reduce((a: number, x: any) => a + milestoneFeeShare(job.fee_cents, x.amount_cents, job.agreed_cents), 0);
+            const completesAll = before.every((x: any) => x.id === m.id || x.status === "released");
+            const feeM = completesAll ? Math.max(0, (job.fee_cents || 0) - feesTaken) : milestoneFeeShare(job.fee_cents, m.amount_cents, job.agreed_cents);
+            await releaseMilestone(job, m);
+            detail.completed_work_paid += m.amount_cents - feeM;
+            detail.completed_work_jobs.push(job.id);
+          }
+          const relSum = await releasedMilestoneSum(job.id);
+          const fresh = await one(`ex_jobs?id=eq.${job.id}&select=*`);
+          if (fresh && fresh.status !== "completed") {
+            const remaining = (job.agreed_cents || 0) - relSum;
+            if (remaining > 0) { await remitHeldToNova(job, remaining); await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "cancelled", settled_via: "forfeiture_remit_nova", updated_at: t }) }); }
+          }
+          continue;
+        }
+        if ((job.status === "delivered" || job.status === "disputed") && job.delivered_at) {
+          // COMPLETED WORK ALWAYS PAYS THE WORKER — in full, per the
+          // job's own terms, ban and freeze notwithstanding.
+          await completeJob(job);
+          await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ settled_via: "forfeiture_completed_work" }) });
+          detail.completed_work_paid += (job.agreed_cents || 0) - (job.fee_cents || 0);
+          detail.completed_work_jobs.push(job.id);
+        } else {
+          const heldAmt = job.status === "open" ? (job.budget_cents || 0) : (job.agreed_cents || 0);
+          if (heldAmt > 0) await remitHeldToNova(job, heldAmt);
+          await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "cancelled", settled_via: "forfeiture_remit_nova", updated_at: t }) });
+        }
+      }
+      if (myAgentIds.length) {
+        const workJobs = await pg(`ex_jobs?awarded_agent_id=in.(${myAgentIds.join(",")})&status=in.(open,awarded,delivered,disputed)&select=*&order=id.asc`);
+        for (const job of workJobs || []) {
+          if (job.poster_user_id === U) continue;
+          const ms = await milestonesOf(job.id);
+          if (job.job_kind === "contract") {
+            const cj = await contractJobRow(job.id);
+            if (cj?.final_outcome && job.delivered_at) {
+              await completeJob(job);
+              await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ settled_via: "forfeiture_completed_work" }) });
+              detail.completed_work_credited += (job.agreed_cents || 0) - (job.fee_cents || 0);
+              detail.completed_work_jobs.push(job.id);
+            } else detail.skipped_contract_jobs.push(job.id);
+            continue;
+          }
+          if (ms.length) {
+            for (const m of ms) if (m.status === "delivered") { await releaseMilestone(job, m); detail.completed_work_jobs.push(job.id); }
+            const relSum = await releasedMilestoneSum(job.id);
+            const fresh = await one(`ex_jobs?id=eq.${job.id}&select=*`);
+            if (fresh && fresh.status !== "completed") {
+              const remaining = (job.agreed_cents || 0) - relSum;
+              if (remaining > 0) {
+                await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: remaining, p_ref: `job:${job.id}`, p_note: `Escrow returned to poster — worker account forfeited (${code})`, p_now: t });
+                detail.escrow_returned += remaining;
+                detail.escrow_returned_jobs.push(job.id);
+              }
+              await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "cancelled", settled_via: "forfeiture_escrow_returned", updated_at: t }) });
+            }
+            continue;
+          }
+          if ((job.status === "delivered" || job.status === "disputed") && job.delivered_at) {
+            // The banned account's own completed work settles INTO
+            // its frozen balance — steps 3-4 then dispose of it.
+            await completeJob(job);
+            await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ settled_via: "forfeiture_completed_work" }) });
+            detail.completed_work_credited += (job.agreed_cents || 0) - (job.fee_cents || 0);
+            detail.completed_work_jobs.push(job.id);
+          } else if (job.status === "awarded" || job.status === "open") {
+            // Uncompleted: this escrow is the POSTER's money — it was
+            // never the scammer's. Return it to its rightful owner.
+            const amt = job.agreed_cents || job.budget_cents || 0;
+            if (amt > 0) {
+              await rpc("ex_refund_escrow", { p_poster: job.poster_user_id, p_price: amt, p_ref: `job:${job.id}`, p_note: `Escrow returned to poster — worker account forfeited (${code})`, p_now: t });
+              detail.escrow_returned += amt;
+              detail.escrow_returned_jobs.push(job.id);
+            }
+            await pg(`ex_jobs?id=eq.${job.id}`, { method: "PATCH", body: JSON.stringify({ status: "cancelled", settled_via: "forfeiture_escrow_returned", updated_at: t }) });
+            await notify(job.poster_user_id, "payment", `Your escrow on "${job.title}" was returned in full — the worker's account was forfeited after a proven scam investigation (${code}).`, `#/job/${job.id}`);
+          }
+        }
+      }
+      // ---- step 3: victim refunds at 90% (10% charge on the scammed amount) ----
+      for (const v of victims) {
+        const w = await walletOf(U).catch(() => null);
+        const avail = w?.balance_cents || 0;
+        const gross = Math.min(v.amount_cents, avail);
+        if (gross < v.amount_cents) detail.victim_shortfalls.push({ user_id: v.user_id, proven_cents: v.amount_cents, paid_gross_cents: gross });
+        if (gross <= 0) continue;
+        const charge = Math.round(gross * 0.10);
+        const pay = gross - charge;
+        await rpc("ex_move_balance", { p_user: U, p_amount: -gross, p_type: "forfeiture_victim_refund", p_ref: caseRef, p_note: `Victim refund (gross) for user ${v.user_id} — proven scam loss (${code})`, p_now: t });
+        await rpc("ex_move_balance", { p_user: v.user_id, p_amount: pay, p_type: "victim_refund", p_ref: caseRef, p_note: `Refund of your proven scam loss, less Nova's 10% charge (${code})`, p_now: t });
+        detail.victim_paid += pay;
+        detail.victim_charges += charge;
+        await notify(v.user_id, "payment", `You were refunded $${(pay / 100).toFixed(2)} for a proven scam loss (90% of the proven amount; Nova deducts a 10% charge) — case ${code}.`, "#/wallet");
+      }
+      if (detail.victim_charges > 0) await rpc("ex_pool_adjust", { p_delta: detail.victim_charges });
+      // ---- step 4: the remainder is forfeited to Nova ----
+      const wEnd = await walletOf(U).catch(() => null);
+      const remainder = wEnd?.balance_cents || 0;
+      if (remainder > 0) {
+        await rpc("ex_move_balance", { p_user: U, p_amount: -remainder, p_type: "forfeiture_nova", p_ref: caseRef, p_note: `Remainder forfeited to Nova under the victims-first waterfall (${code})`, p_now: t });
+        await rpc("ex_pool_adjust", { p_delta: remainder });
+        detail.remainder_forfeited = remainder;
+      }
+      detail.executed_at = t;
+      await pg(`ex_shadow_cases?id=eq.${caseId}`, { method: "PATCH", body: JSON.stringify({ forfeiture_status: "executed", forfeited_at: t, forfeited_by: u.id, forfeiture_detail: detail }) });
+      await adminAudit(u.id, "forfeiture_execute", U, { case_code: code, escrow_returned: detail.escrow_returned, completed_work_paid: detail.completed_work_paid, completed_work_credited: detail.completed_work_credited, escrow_remitted: detail.escrow_remitted, victim_paid: detail.victim_paid, victim_charges: detail.victim_charges, remainder_forfeited: detail.remainder_forfeited });
+      const admins = await pg("ex_users?role=eq.admin&select=id").catch(() => []);
+      for (const a of admins || []) if (a.id !== U) await pg("ex_notifications", { method: "POST", body: JSON.stringify({ user_id: a.id, type: "security", body: `Forfeiture executed on case ${code} (user ${U}): victims paid $${(detail.victim_paid / 100).toFixed(2)}, escrow remitted $${(detail.escrow_remitted / 100).toFixed(2)}, remainder forfeited $${(detail.remainder_forfeited / 100).toFixed(2)}.`, link: "#/admin", created_at: t }) }).catch(() => {});
+      return json({ ok: true, case_code: code, forfeiture: detail });
     }
     if (path === "/admin/reports" && method === "GET") {
       const rows = await pg(`ex_reports?select=*&order=created_at.desc&limit=100`);
