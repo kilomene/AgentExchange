@@ -15,15 +15,23 @@
 //     join the ban list, and the admins are notified. Admin accounts are
 //     never auto-suspended (a shared address must not lock out the owner).
 //  4. Housekeeping: prune ex_rate_counters windows older than a day.
-//  5. DELIVERED AUTO-RELEASE (poster-ghosting fix): a job sitting in
-//     'delivered' for 14 days with no approval and no dispute settles
-//     exactly like a completion - escrow releases to the worker (only
-//     the unreleased remainder on milestone jobs), stats and the
-//     guarantee pool are credited, both sides are notified + emailed.
-//     At 7 days the poster first gets ONE in-app reminder. CONTRACT
-//     jobs settle by their PAY RULE here (outcome / per-entry /
-//     per-minute math mirroring the backend's completeContractJob) -
-//     never the full agreed price.
+//  5. FAIRNESS AUTO-RELEASE (owner order 2026-10-27, the locked
+//     design): delivery starts a 48-HOUR review clock (review_deadline
+//     on the job). The poster is reminded once at 24h-left and once at
+//     6h-left (flag-guarded, in-app + email). When the clock ends with
+//     no approval and no dispute, the job settles exactly like a
+//     completion - escrow releases to the worker (only the unreleased
+//     remainder on milestone jobs), stats and the guarantee pool are
+//     credited, both sides are notified + emailed - marked
+//     settled_via='auto_release_silence'. CONTRACT jobs settle by
+//     their PAY RULE here (outcome / per-entry / per-minute math
+//     mirroring the backend's completeContractJob) - never the full
+//     agreed price. Each delivered MILESTONE runs the same 48h clock
+//     and releases individually the same way. DISPUTE DEFAULT: a
+//     disputed delivered job past dispute_admin_deadline with no
+//     admin resolution auto-resolves FOR THE WORKER (escrow
+//     remainder released, poster takes the dispute-loss strike).
+//     Legacy rows with no review_deadline keep the old 14-day rule.
 //  6. SCHEDULED CONTRACTS (Phase D): exempt from the +24h window
 //     refund and from deadline refunds - they run on the schedule
 //     clock. At schedule_end + 48h with the job still awarded, the
@@ -229,16 +237,36 @@ async function altScan() {
   }
 }
 
-// POSTER REMINDER (7 days): ONE in-app nudge while the poster can still
-// approve or dispute. Deduped against the notifications table itself:
-// a reminder for the same job inside the last 14 days suppresses a new
-// one. In-app only - no email for the reminder.
-async function posterReminder(job, t) {
-  const link = `#/job/${job.id}`;
-  const existing = await get(`ex_notifications?user_id=eq.${job.poster_user_id}&link=eq.${encodeURIComponent(link)}&body=like.*delivered%207%20days%20ago*&created_at=gt.${t - 14 * 86400}&select=id&limit=1`);
-  if (existing && existing.length) return;
-  await notify(job.poster_user_id, "delivery", `Your job "${job.title}" was delivered 7 days ago. Approve it, or dispute within 7 more days — after 14 days the escrow releases to the worker automatically.`, link);
-  console.log(`reminder: job ${job.id} poster reminded (delivered 7+ days ago, still unapproved)`);
+// FAIRNESS REMINDERS (owner order 2026-10-27): the poster gets ONE
+// reminder when 24 hours remain on the review clock and ONE when 6
+// hours remain — in-app notification + a queued email (kind
+// review_reminder). Each is guarded by a once-only flag ON THE JOB
+// ROW, claimed with a conditional PATCH before anything is sent, so
+// a reminder can never fire twice even across sweeper restarts.
+async function fairnessReminders() {
+  const t = nowSec();
+  const jobs = await get(`ex_jobs?status=eq.delivered&review_deadline=not.is.null&review_deadline=gt.${t}&review_deadline=lt.${t + 86400}&select=id,title,poster_user_id,review_deadline,reminder_24h_sent,reminder_6h_sent&limit=50`);
+  for (const job of jobs || []) {
+    const left = Number(job.review_deadline) - t;
+    const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
+    const hoursLeft = Math.max(1, Math.round(left / 3600));
+    if (!job.reminder_24h_sent && left <= 86400) {
+      const claimed = await patch(`ex_jobs?id=eq.${job.id}&reminder_24h_sent=eq.false`, { reminder_24h_sent: true }, "return=representation");
+      if (claimed && claimed.length) {
+        await notify(job.poster_user_id, "delivery", `24 hours left to review "${job.title}" — approve it, or dispute a specific checklist item. If you do nothing, the payment releases to the worker automatically when the review window ends.`, `#/job/${job.id}`);
+        if (poster) await queueMail("review_reminder", poster, { name: poster.name || "", title: job.title, hours_left: String(hoursLeft), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("review reminder mail failed", e.message));
+        console.log(`fairness reminder (24h): job ${job.id}`);
+      }
+    }
+    if (!job.reminder_6h_sent && left <= 21600) {
+      const claimed = await patch(`ex_jobs?id=eq.${job.id}&reminder_6h_sent=eq.false`, { reminder_6h_sent: true }, "return=representation");
+      if (claimed && claimed.length) {
+        await notify(job.poster_user_id, "delivery", `Only about ${hoursLeft} hours left to review "${job.title}" — approve it, or dispute a specific checklist item. When the window ends, the payment releases to the worker automatically.`, `#/job/${job.id}`);
+        if (poster) await queueMail("review_reminder", poster, { name: poster.name || "", title: job.title, hours_left: String(hoursLeft), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("review reminder mail failed", e.message));
+        console.log(`fairness reminder (6h): job ${job.id}`);
+      }
+    }
+  }
 }
 
 async function feePctSetting() {
@@ -327,7 +355,7 @@ async function autoReleaseJob(job, t) {
   const workerOwner = agent.owner_id;
   const milestones = await get(`ex_milestones?job_id=eq.${job.id}&select=*&order=idx.asc`);
   const isMs = !!(milestones && milestones.length);
-  const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { status: "completed", updated_at: t }, "return=representation");
+  const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.delivered`, { status: "completed", settled_via: "auto_release_silence", updated_at: t }, "return=representation");
   if (!claimed || !claimed.length) return; // someone else handled it
   // CONTRACT JOBS settle by their PAY RULE (Phase D) - outcome,
   // per-entry or per-minute math - never the flat full-price release
@@ -342,13 +370,13 @@ async function autoReleaseJob(job, t) {
         const net = s.due - s.fee;
         const sellerWallet = await walletOf(workerOwner).catch(() => null);
         const posterWallet = await walletOf(job.poster_user_id).catch(() => null);
-        await notify(job.poster_user_id, "payment", `"${job.title}" auto-completed - the delivery sat unapproved for 14 days, so the contract settled by its pay rule: ${money(s.due)} was due, ${money(net)} paid to the worker after the fee, ${money((job.agreed_cents || 0) - s.due)} refunded to you`, `#/job/${job.id}`);
-        await notify(workerOwner, "payment", `"${job.title}" auto-completed after the 14-day window - the contract settled by its pay rule and ${money(net)} landed in your wallet`, `#/job/${job.id}`);
+        await notify(job.poster_user_id, "payment", `"${job.title}" auto-released on silence - the 48-hour review window ended with no approval and no dispute, so the contract settled by its pay rule: ${money(s.due)} was due, ${money(net)} paid to the worker after the fee, ${money((job.agreed_cents || 0) - s.due)} refunded to you`, `#/job/${job.id}`);
+        await notify(workerOwner, "payment", `"${job.title}" auto-released on silence after the 48-hour review window - the contract settled by its pay rule and ${money(net)} landed in your wallet`, `#/job/${job.id}`);
         const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
         const owner = (await get(`ex_users?id=eq.${workerOwner}&select=id,email,name`))[0];
         if (owner && s.due > 0) await queueMail("payment_received", owner, { name: owner.name || "", title: job.title, amount: money(net), wallet_before: money((sellerWallet?.balance_cents || 0) - net), wallet_after: money(sellerWallet?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("auto-release worker mail failed", e.message));
         if (poster) await queueMail("payment_sent", poster, { name: poster.name || "", title: job.title, agent_name: agent.name || "The worker", amount: money(s.due), wallet_balance: money(posterWallet?.balance_cents || 0), escrow_held: money(posterWallet?.held_cents || 0), wallet_total: money((posterWallet?.balance_cents || 0) + (posterWallet?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("auto-release poster mail failed", e.message));
-        console.log(`auto-release: contract job ${job.id} settled by pay rule after 14 days unapproved, ${money(net)} released to worker owner ${workerOwner}`);
+        console.log(`auto-release: contract job ${job.id} settled by pay rule (auto-release on silence), ${money(net)} released to worker owner ${workerOwner}`);
       } catch (e) {
         await patch(`ex_jobs?id=eq.${job.id}`, { status: "delivered", updated_at: t }).catch(() => {});
         console.error(`auto-release FAILED for contract job ${job.id} (status reverted to delivered, will retry):`, e.message);
@@ -400,26 +428,150 @@ async function autoReleaseJob(job, t) {
   const net = job.agreed_cents - job.fee_cents;
   const sellerWallet = await walletOf(workerOwner).catch(() => null);
   const posterWallet = await walletOf(job.poster_user_id).catch(() => null);
-  await notify(job.poster_user_id, "payment", `"${job.title}" auto-completed — escrow released after the 14-day window. ${money(net)} was paid to the worker (agreed price minus the platform fee).`, `#/job/${job.id}`);
-  await notify(workerOwner, "payment", `"${job.title}" payment released — ${money(net)} landed in your wallet (auto-completed after the 14-day window).`, `#/job/${job.id}`);
+  await notify(job.poster_user_id, "payment", `"${job.title}" auto-released on silence — the 48-hour review window ended with no approval and no dispute, so the escrow released automatically. ${money(net)} was paid to the worker (agreed price minus the platform fee).`, `#/job/${job.id}`);
+  await notify(workerOwner, "payment", `"${job.title}" payment auto-released on silence — ${money(net)} landed in your wallet (the poster did not approve or dispute within the 48-hour review window).`, `#/job/${job.id}`);
   const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
   const owner = (await get(`ex_users?id=eq.${workerOwner}&select=id,email,name`))[0];
   if (owner) await queueMail("payment_received", owner, { name: owner.name || "", title: job.title, amount: money(net), wallet_before: money((sellerWallet?.balance_cents || 0) - net), wallet_after: money(sellerWallet?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("auto-release worker mail failed", e.message));
   if (poster) await queueMail("payment_sent", poster, { name: poster.name || "", title: job.title, agent_name: agent.name || "The worker", amount: money(job.agreed_cents), wallet_balance: money(posterWallet?.balance_cents || 0), escrow_held: money(posterWallet?.held_cents || 0), wallet_total: money((posterWallet?.balance_cents || 0) + (posterWallet?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("auto-release poster mail failed", e.message));
-  console.log(`auto-release: job ${job.id} completed after 14 days unapproved, ${money(net)} released to worker owner ${workerOwner}`);
+  console.log(`auto-release: job ${job.id} completed (auto-release on silence), ${money(net)} released to worker owner ${workerOwner}`);
 }
 
 async function deliveredAutoRelease() {
   const t = nowSec();
-  // Reminders first: delivered more than 7 days ago, still inside the
-  // 14-day window (older than that, the release below owns the job).
-  const remJobs = await get(`ex_jobs?status=eq.delivered&delivered_at=gt.${t - 14 * 86400}&delivered_at=lt.${t - 7 * 86400}&select=id,title,poster_user_id&limit=50`);
-  for (const job of remJobs || []) {
-    try { await posterReminder(job, t); } catch (e) { console.error(`reminder: job ${job.id} failed:`, e.message); }
-  }
-  const jobs = await get(`ex_jobs?status=eq.delivered&delivered_at=gt.0&delivered_at=lt.${t - 14 * 86400}&select=*&limit=50`);
+  // FAIRNESS (2026-10-27): the review clock is 48 hours. Any delivered
+  // job whose review_deadline has passed (and which carries no open
+  // dispute — disputed jobs are a different status entirely) settles
+  // through the completion path, marked auto-release on silence.
+  const jobs = await get(`ex_jobs?status=eq.delivered&review_deadline=not.is.null&review_deadline=lt.${t}&select=*&limit=50`);
   for (const job of jobs || []) {
     try { await autoReleaseJob(job, t); } catch (e) { console.error(`auto-release: job ${job.id} failed:`, e.message); }
+  }
+  // LEGACY fallback: delivered rows with NO review_deadline (delivered
+  // before the fairness migration existed) keep the old 14-day rule so
+  // nothing can sit unapproved forever.
+  const legacy = await get(`ex_jobs?status=eq.delivered&review_deadline=is.null&delivered_at=gt.0&delivered_at=lt.${t - 14 * 86400}&select=*&limit=50`);
+  for (const job of legacy || []) {
+    try { await autoReleaseJob(job, t); } catch (e) { console.error(`auto-release (legacy): job ${job.id} failed:`, e.message); }
+  }
+}
+
+// MILESTONE AUTO-RELEASE (fairness): each delivered milestone carries
+// its own 48h review clock. When it lapses with no release and no
+// dispute, that milestone releases exactly like a poster release
+// (same fee-share math as the backend's releaseMilestone: each
+// milestone's share of the job fee, the completing release absorbs
+// the rounding remainder). When the LAST milestone releases, the job
+// finalizes like the backend's finalizeMilestoneJob: guarantee pool
+// funded with 10% of the total fee, agent stats credited once, both
+// sides notified + emailed, a feed entry lands.
+async function milestoneAutoRelease() {
+  const t = nowSec();
+  const due = await get(`ex_milestones?status=eq.delivered&review_deadline=not.is.null&review_deadline=lt.${t}&select=*&limit=50`);
+  for (const m of due || []) {
+    try {
+      const job = (await get(`ex_jobs?id=eq.${m.job_id}&select=*`))[0];
+      if (!job || !["awarded", "delivered"].includes(job.status)) continue; // disputed/completed jobs are not touched here
+      const agent = job.awarded_agent_id ? (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=id,name,owner_id`))[0] : null;
+      if (!agent) continue;
+      const workerOwner = agent.owner_id;
+      const all = await get(`ex_milestones?job_id=eq.${job.id}&select=*&order=idx.asc`);
+      const agreed = Number(job.agreed_cents || 0);
+      const share = (amt) => (agreed > 0 ? Math.round((Number(job.fee_cents || 0) * Number(amt || 0)) / agreed) : 0);
+      const releasedBefore = (all || []).filter((x) => x.status === "released");
+      const releasedFeeSum = releasedBefore.reduce((a, x) => a + share(x.amount_cents), 0);
+      const isLast = releasedBefore.length === (all || []).length - 1;
+      const feeShare = isLast ? Math.max(0, Number(job.fee_cents || 0) - releasedFeeSum) : share(m.amount_cents);
+      const claimed = await patch(`ex_milestones?id=eq.${m.id}&status=eq.delivered`, { status: "released", released_at: t }, "return=representation");
+      if (!claimed || !claimed.length) continue;
+      try {
+        if (Number(m.amount_cents || 0) > 0) await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: workerOwner, p_price: m.amount_cents, p_fee: feeShare, p_ref: `job:${job.id}:m${m.idx + 1}`, p_now: t });
+      } catch (e) {
+        await patch(`ex_milestones?id=eq.${m.id}`, { status: "delivered", released_at: null }).catch(() => {});
+        console.error(`milestone auto-release FAILED for job ${job.id} milestone ${m.id} (reverted, will retry):`, e.message);
+        continue;
+      }
+      const net = Number(m.amount_cents || 0) - feeShare;
+      await notify(job.poster_user_id, "payment", `Milestone "${m.title}" on "${job.title}" auto-released on silence — the 48-hour review window ended with no release or dispute, so ${money(net)} was paid to the worker.`, `#/job/${job.id}`);
+      await notify(workerOwner, "payment", `Milestone "${m.title}" on "${job.title}" auto-released on silence — ${money(net)} landed in your wallet.`, `#/job/${job.id}`);
+      console.log(`milestone auto-release: job ${job.id} milestone ${m.idx + 1} released, ${money(net)} to worker owner ${workerOwner}`);
+      const fresh = await get(`ex_milestones?job_id=eq.${job.id}&select=status`);
+      if ((fresh || []).length && (fresh || []).every((x) => x.status === "released")) {
+        const jobClaim = await patch(`ex_jobs?id=eq.${job.id}&status=in.(awarded,delivered)`, { status: "completed", settled_via: "auto_release_silence", updated_at: t }, "return=representation");
+        if (jobClaim && jobClaim.length) {
+          await fundPool(job.fee_cents).catch((e) => console.error(`milestone auto-release: pool fund failed for job ${job.id}:`, e.message));
+          const freshAgent = (await get(`ex_agents?id=eq.${agent.id}&select=jobs_completed,earnings_cents`))[0];
+          if (freshAgent) await patch(`ex_agents?id=eq.${agent.id}`, { jobs_completed: (freshAgent.jobs_completed || 0) + 1, earnings_cents: (freshAgent.earnings_cents || 0) + (agreed - Number(job.fee_cents || 0)) });
+          await post("ex_feed", { kind: "completed", job_id: job.id, agent_id: job.awarded_agent_id, text: `${agent.name} completed "${job.title}" for ${money(agreed)}`, created_at: t }).catch(() => {});
+          const totalNet = agreed - Number(job.fee_cents || 0);
+          const sellerWallet = await walletOf(workerOwner).catch(() => null);
+          const posterWallet = await walletOf(job.poster_user_id).catch(() => null);
+          const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
+          const owner = (await get(`ex_users?id=eq.${workerOwner}&select=id,email,name`))[0];
+          if (owner) await queueMail("payment_received", owner, { name: owner.name || "", title: job.title, amount: money(totalNet), wallet_before: money((sellerWallet?.balance_cents || 0) - totalNet), wallet_after: money(sellerWallet?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("milestone auto-release worker mail failed", e.message));
+          if (poster) await queueMail("payment_sent", poster, { name: poster.name || "", title: job.title, agent_name: agent.name || "The worker", amount: money(agreed), wallet_balance: money(posterWallet?.balance_cents || 0), escrow_held: money(posterWallet?.held_cents || 0), wallet_total: money((posterWallet?.balance_cents || 0) + (posterWallet?.held_cents || 0)), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("milestone auto-release poster mail failed", e.message));
+          console.log(`milestone auto-release: job ${job.id} fully released and completed`);
+        }
+      }
+    } catch (e) {
+      console.error(`milestoneAutoRelease: milestone ${m.id} failed:`, e.message);
+    }
+  }
+}
+
+// DISPUTE DEFAULT (fairness, the admin backup): a disputed job whose
+// admin deadline has passed with NO admin resolution auto-resolves
+// FOR THE WORKER — admin absence can never cost the worker the
+// money. Mirrors the backend's admin resolve-for-agent exactly:
+// escrow remainder (agreed minus already-released milestones)
+// releases with the fee remainder, the guarantee pool is funded with
+// 10% of that fee remainder, the poster takes the dispute-loss
+// account strike, agent stats credit the full job once. Fires
+// regardless of whether the worker responded. Only jobs that were
+// actually DELIVERED carry an admin deadline — undelivered disputes
+// keep waiting for a human admin, as before.
+async function disputeDefaultResolve() {
+  const t = nowSec();
+  const jobs = await get(`ex_jobs?status=eq.disputed&dispute_admin_deadline=not.is.null&dispute_admin_deadline=lt.${t}&delivered_at=not.is.null&select=*&limit=50`);
+  for (const job of jobs || []) {
+    try {
+      const agent = job.awarded_agent_id ? (await get(`ex_agents?id=eq.${job.awarded_agent_id}&select=id,name,owner_id,jobs_completed,earnings_cents`))[0] : null;
+      if (!agent) { console.error(`dispute-default: job ${job.id} has no awarded agent on record; skipped`); continue; }
+      const claimed = await patch(`ex_jobs?id=eq.${job.id}&status=eq.disputed`, { status: "completed", settled_via: "dispute_default_no_admin", updated_at: t }, "return=representation");
+      if (!claimed || !claimed.length) continue;
+      const milestones = await get(`ex_milestones?job_id=eq.${job.id}&select=*`);
+      const agreed = Number(job.agreed_cents || 0);
+      const share = (amt) => (agreed > 0 ? Math.round((Number(job.fee_cents || 0) * Number(amt || 0)) / agreed) : 0);
+      const released = (milestones || []).filter((x) => x.status === "released");
+      const releasedSum = released.reduce((a, x) => a + Number(x.amount_cents || 0), 0);
+      const releasedFees = released.reduce((a, x) => a + share(x.amount_cents), 0);
+      const remainder = agreed - releasedSum;
+      const feeRemainder = Math.max(0, Number(job.fee_cents || 0) - releasedFees);
+      try {
+        if (remainder > 0) await rpc("ex_release_escrow", { p_poster: job.poster_user_id, p_seller: agent.owner_id, p_price: remainder, p_fee: feeRemainder, p_ref: `job:${job.id}`, p_now: t });
+      } catch (e) {
+        await patch(`ex_jobs?id=eq.${job.id}`, { status: "disputed", updated_at: t }).catch(() => {});
+        console.error(`dispute-default FAILED for job ${job.id} (status reverted to disputed, will retry):`, e.message);
+        continue;
+      }
+      if (remainder > 0) await fundPool(feeRemainder).catch((e) => console.error(`dispute-default: pool fund failed for job ${job.id}:`, e.message));
+      const posterRow = (await get(`ex_users?id=eq.${job.poster_user_id}&select=strikes`))[0];
+      await patch(`ex_users?id=eq.${job.poster_user_id}`, { strikes: (posterRow?.strikes || 0) + 1 });
+      const freshAgent = (await get(`ex_agents?id=eq.${agent.id}&select=jobs_completed,earnings_cents`))[0];
+      if (freshAgent) await patch(`ex_agents?id=eq.${agent.id}`, { jobs_completed: (freshAgent.jobs_completed || 0) + 1, earnings_cents: (freshAgent.earnings_cents || 0) + (agreed - Number(job.fee_cents || 0)) });
+      const reason = "No admin decision was made within 3 days after the dispute evidence round, so the verified delivery is presumed good and the payment released to the worker automatically (the fairness default).";
+      const net = remainder - feeRemainder;
+      await notify(agent.owner_id, "dispute", `Dispute on "${job.title}" auto-resolved in your favor — ${reason} ${money(net)} landed in your wallet.`, `#/job/${job.id}`);
+      await notify(job.poster_user_id, "dispute", `Dispute on "${job.title}" auto-resolved for the worker — ${reason} A dispute-loss strike was recorded on your account.`, `#/job/${job.id}`);
+      const poster = (await get(`ex_users?id=eq.${job.poster_user_id}&select=id,email,name`))[0];
+      const owner = (await get(`ex_users?id=eq.${agent.owner_id}&select=id,email,name`))[0];
+      const sellerWallet = await walletOf(agent.owner_id).catch(() => null);
+      if (owner) await queueMail("dispute_resolved", owner, { name: owner.name || "", title: job.title, summary: `The dispute was auto-resolved in your favor: ${reason}`, amount_label: "Amount received", amount: money(net), wallet_after: money(sellerWallet?.balance_cents || 0), link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("dispute-default worker mail failed", e.message));
+      if (poster) await queueMail("dispute_resolved", poster, { name: poster.name || "", title: job.title, summary: `The dispute was auto-resolved for the worker: ${reason} The escrow payment was released to the worker.`, link: `${SITE_URL}/#/job/${job.id}` }).catch((e) => console.error("dispute-default poster mail failed", e.message));
+      console.log(`dispute-default: job ${job.id} auto-resolved for the worker (no admin decision in time), ${money(net)} released, poster strike recorded`);
+    } catch (e) {
+      console.error(`disputeDefaultResolve: job ${job.id} failed:`, e.message);
+    }
   }
 }
 
@@ -588,8 +740,20 @@ async function contractScheduleExpiry() {
 }
 
 async function cycle() {
+  // SWEEPER_ONLY=fairness runs ONLY the fairness duties (used by the
+  // E2E so unrelated duties cannot fire side effects mid-test).
+  if (process.env.SWEEPER_ONLY === "fairness") {
+    try { await fairnessReminders(); } catch (e) { console.error("fairnessReminders:", e.message); }
+    try { await deliveredAutoRelease(); } catch (e) { console.error("deliveredAutoRelease:", e.message); }
+    try { await milestoneAutoRelease(); } catch (e) { console.error("milestoneAutoRelease:", e.message); }
+    try { await disputeDefaultResolve(); } catch (e) { console.error("disputeDefaultResolve:", e.message); }
+    return;
+  }
   try { await deadlineRefunds(); } catch (e) { console.error("deadlineRefunds:", e.message); }
+  try { await fairnessReminders(); } catch (e) { console.error("fairnessReminders:", e.message); }
   try { await deliveredAutoRelease(); } catch (e) { console.error("deliveredAutoRelease:", e.message); }
+  try { await milestoneAutoRelease(); } catch (e) { console.error("milestoneAutoRelease:", e.message); }
+  try { await disputeDefaultResolve(); } catch (e) { console.error("disputeDefaultResolve:", e.message); }
   try { await contractWindowOpening(); } catch (e) { console.error("contractWindowOpening:", e.message); }
   try { await contractWindowRefunds(); } catch (e) { console.error("contractWindowRefunds:", e.message); }
   try { await contractScheduleExpiry(); } catch (e) { console.error("contractScheduleExpiry:", e.message); }
@@ -600,4 +764,6 @@ async function cycle() {
 
 console.log("exchange-sweeper started (60s cycle)");
 await cycle();
+// SWEEPER_ONCE=1: run a single cycle and exit (E2E / manual runs).
+if (process.env.SWEEPER_ONCE === "1") { console.log("exchange-sweeper: single cycle done (SWEEPER_ONCE=1)"); process.exit(0); }
 setInterval(cycle, 60_000);
