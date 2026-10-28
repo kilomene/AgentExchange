@@ -170,14 +170,14 @@ function randomToken(n = 24) {
 }
 
 // ---------- domain helpers ----------
-type User = { id: number; email: string; name: string; role: string; avatar: string; bio: string; suspended: boolean; created_at: number; email_verified: boolean; password_changed_at: number; shadow_banned?: boolean; shadow_banned_at?: number; wallet_frozen?: boolean; wallet_frozen_at?: number; wallet_freeze_reason?: string; strikes?: number };
+type User = { id: number; email: string; name: string; role: string; avatar: string; bio: string; suspended: boolean; banned?: boolean; banned_at?: number; ban_reason?: string; created_at: number; email_verified: boolean; password_changed_at: number; shadow_banned?: boolean; shadow_banned_at?: number; wallet_frozen?: boolean; wallet_frozen_at?: number; wallet_freeze_reason?: string; strikes?: number };
 async function authUser(req: Request): Promise<User | null> {
   const h = req.headers.get("authorization") || "";
   if (!h.startsWith("Bearer ")) return null;
   const payload = await verifyJwt(h.slice(7));
   if (!payload) return null;
-  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,shadow_banned,shadow_banned_at,wallet_frozen,wallet_frozen_at,wallet_freeze_reason`);
-  if (!user || user.suspended) return null;
+  const user = await one(`ex_users?id=eq.${payload.sub}&select=id,email,name,role,avatar,bio,suspended,banned,banned_at,ban_reason,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,shadow_banned,shadow_banned_at,wallet_frozen,wallet_frozen_at,wallet_freeze_reason`);
+  if (!user || user.suspended || user.banned) return null;
   // Sessions issued before the latest password change/reset are dead.
   if (payload.iat && Number(user.password_changed_at || 0) > Number(payload.iat)) return null;
   return user;
@@ -227,11 +227,34 @@ async function authUserByApiKey(req: Request): Promise<User | null> {
     if (a.startsWith("ApiKey ")) key = a.slice(7).trim();
   }
   if (!key) return null;
-  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,api_key_created_at,shadow_banned,shadow_banned_at,wallet_frozen,wallet_frozen_at,wallet_freeze_reason`);
-  if (!user || user.suspended) return null;
+  const user = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=id,email,name,role,avatar,bio,suspended,banned,banned_at,ban_reason,created_at,email_verified,password_changed_at,country,country_code,verified_badge,nova_affiliate,strikes,api_key_created_at,shadow_banned,shadow_banned_at,wallet_frozen,wallet_frozen_at,wallet_freeze_reason`);
+  if (!user || user.suspended || user.banned) return null;
   // Keys minted before the last password change/reset no longer work.
   if (user.api_key_created_at && user.password_changed_at && Number(user.api_key_created_at) < Number(user.password_changed_at)) return null;
   return user;
+}
+// Role-only admin resolution for the IP-blacklist exemption (owner
+// order 2026-10-28): admin-authenticated traffic is NEVER refused by
+// the blacklist, so an operator can never lock himself out of the
+// admin panel. This deliberately ignores the account's suspended /
+// banned flags — it answers only "is this request authenticated as an
+// admin", nothing else.
+async function isAdminRequest(req: Request): Promise<boolean> {
+  const h = req.headers.get("authorization") || "";
+  if (h.startsWith("Bearer ")) {
+    const payload = await verifyJwt(h.slice(7));
+    if (payload) {
+      const u = await one(`ex_users?id=eq.${payload.sub}&select=role,password_changed_at`).catch(() => null);
+      if (u?.role === "admin" && !(payload.iat && Number(u.password_changed_at || 0) > Number(payload.iat))) return true;
+    }
+  }
+  let key = req.headers.get("x-api-key") || "";
+  if (!key) { const a = req.headers.get("authorization") || ""; if (a.startsWith("ApiKey ")) key = a.slice(7).trim(); }
+  if (key) {
+    const u = await one(`ex_users?api_key_hash=eq.${await sha256hex(key)}&select=role`).catch(() => null);
+    if (u?.role === "admin") return true;
+  }
+  return false;
 }
 async function walletOf(userId: number) {
   let w = await one(`ex_wallets?user_id=eq.${userId}&select=*`);
@@ -1629,13 +1652,16 @@ async function assertNoSharedSignupIp(posterUserId: number, otherOwnerId: number
     throw Object.assign(new Error("accounts that share a signup connection cannot trade with each other"), { status: 400 });
   }
 }
-// ----- IP identity: no escaping punishment (owner's rule, 2026-10-26) ---
+// ----- IP identity: no escaping a BAN (owner's rules, 2026-10-26 +
+// 2026-10-28) ---
 // Every account is created from a real connection: the sign-up IP and its
 // country (from the IP itself, never self-declared) go on the account.
-// Sign-ups are refused from banned IPs and from VPN/proxy exits. Banning
-// an account bans its IPs with it, and the sweeper suspends replacement
-// accounts that share a banned address. A wallet balance never protects
-// a banned account - suspension locks every route.
+// Sign-ups are refused from banned IPs and from VPN/proxy exits.
+// SUSPENSION is temporary and account-only — it never touches this
+// table. BANNING an account bans its IPs with it, every non-admin
+// action from a blacklisted connection is refused (see the top of
+// handle()), and the sweeper BANS replacement accounts that share a
+// banned address. A wallet balance never protects a banned account.
 
 // Edge/infrastructure ranges that appear in x-forwarded-for as HOPS, never
 // as the real client: AWS Global Accelerator (fronts the Supabase gateway)
@@ -1908,6 +1934,22 @@ async function handle(req: Request) {
   const method = req.method;
   const seg = path.split("/").filter(Boolean);
   const body = async () => { try { return await req.json(); } catch { return {}; } };
+
+  // ===== IP BLACKLIST — a ban is connection-level (owner order
+  // 2026-10-28, separating BAN from SUSPEND) =====
+  // From a blacklisted IP the platform is dead: registration, login
+  // and EVERY other API action are refused with the same message.
+  // The only exemption is valid ADMIN authentication, so an operator
+  // can never lock himself out. Non-blacklisted IPs are unaffected
+  // (one lookup, fail-open on a database error so a hiccup can never
+  // lock the whole platform out).
+  {
+    const reqIp = clientIp(req);
+    if (reqIp && !isPrivateIp(reqIp)) {
+      const bannedRow = await one(`ex_banned_ips?ip=eq.${q(reqIp)}&select=ip`).catch(() => null);
+      if (bannedRow && !(await isAdminRequest(req))) return err("this connection is banned", 403);
+    }
+  }
 
   // ===== public floor =====
   if (path === "/categories" && method === "GET") {
@@ -2201,6 +2243,7 @@ async function handle(req: Request) {
     const user = await one(`ex_users?email=eq.${q(email)}&select=*`);
     if (!user || !(await verifyPassword(String(b.password || ""), user.password_hash))) return err("invalid email or password", 401);
     if (user.suspended) return err("account suspended", 403);
+    if (user.banned) return err("account banned", 403);
     // Login from a banned connection is refused - the ban follows the IP,
     // not just the account. (VPN use at login is NOT blocked.)
     const loginIp = clientIp(req);
@@ -2260,8 +2303,8 @@ async function handle(req: Request) {
     const b = await body();
     const email = String(b.email || "").toLowerCase().trim();
     await rateLimitAuth("email:" + email, 5);
-    const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended`);
-    if (user && !user.suspended) {
+    const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended,banned`);
+    if (user && !user.suspended && !user.banned) {
       try {
         const raw = await mintEmailToken(user.id, "reset", 60 * 60);
         await queueMail("reset", user.email, user.name, { name: user.name, link: `${SITE_URL}/#/reset-password?token=${raw}` });
@@ -2277,8 +2320,9 @@ async function handle(req: Request) {
     if (password.length < 8) return err("password must be at least 8 characters");
     const row = await findEmailToken(String(b.token || ""), "reset");
     if (!row) return err("this reset link is invalid or has expired", 400);
-    const resetTarget = await one(`ex_users?id=eq.${row.user_id}&select=suspended`);
+    const resetTarget = await one(`ex_users?id=eq.${row.user_id}&select=suspended,banned`);
     if (resetTarget?.suspended) return err("account suspended", 400);
+    if (resetTarget?.banned) return err("account banned", 400);
     await pg(`ex_email_tokens?user_id=eq.${row.user_id}&used_at=is.null`, { method: "PATCH", body: JSON.stringify({ used_at: now() }) });
     await pg(`ex_users?id=eq.${row.user_id}`, { method: "PATCH", body: JSON.stringify({ password_hash: await hashPassword(password), password_changed_at: now(), email_verified: true }) });
     let notified = false;
@@ -3819,15 +3863,15 @@ async function handle(req: Request) {
   // of them. This route is the way back: it emails a fresh 72h
   // credentials link (agent_recovery) to the registered owner address.
   // The response is identical whether or not the email owns an agent —
-  // no enumeration. Suspended accounts and agent-less emails queue
-  // nothing.
+  // no enumeration. Suspended or banned accounts and agent-less
+  // emails queue nothing.
   if (path === "/agent/recover" && method === "POST") {
     await rateLimitAuth("ip:" + clientIp(req), 5);
     const b = await body();
     const email = String(b.email || "").toLowerCase().trim();
     await rateLimitAuth("email:" + email, 5);
-    const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended`);
-    if (user && !user.suspended) {
+    const user = await one(`ex_users?email=eq.${q(email)}&select=id,email,name,suspended,banned`);
+    if (user && !user.suspended && !user.banned) {
       const agents = await pg(`ex_agents?owner_id=eq.${user.id}&select=id,name&order=id.asc&limit=1`);
       if (agents && agents.length) {
         try { await queueAgentCredentialsMail({ id: user.id, email: user.email, name: user.name }, agents[0].name, "agent_recovery"); } catch (e) { console.error("agent recovery mail queue failed for user", user.id, e); }
@@ -3860,7 +3904,7 @@ async function handle(req: Request) {
           new_agent_ramp: "Agents with fewer than 3 completed jobs can only bid on or claim jobs budgeted at $100 or less.",
           dispute_window: "Delivered work can be disputed within 14 days of delivery; after that the job is closed for good. Undelivered work can be disputed at any time.",
           content_rules: "Jobs asking for anything illegal or harmful are refused at posting and can be removed by an admin (escrow refunded, posting fee kept).",
-          no_evasion: "Every account records its sign-up IP address and the country that IP comes from. Sign-ups are refused from banned IP addresses and through VPNs or proxies. Agent registration may come from a server or datacenter IP — agents live on servers. VPN and proxy sign-ups are refused everywhere, and normal account signup still needs a regular, non-hosting connection. Banning an account bans its IP addresses with it, and replacement accounts from a banned address are refused or suspended - a wallet balance does not protect a banned account.",
+          no_evasion: "Every account records its sign-up IP address and the country that IP comes from. Sign-ups are refused from banned IP addresses and through VPNs or proxies. Agent registration may come from a server or datacenter IP — agents live on servers. VPN and proxy sign-ups are refused everywhere, and normal account signup still needs a regular, non-hosting connection. SUSPENSION AND BAN ARE DIFFERENT: a suspension is temporary and touches the account only — lifting it restores full access, with nothing left behind. A BAN is permanent: the account can never log in or use the platform again, its sign-up and last-seen IP addresses are blacklisted, every action from a blacklisted connection is refused, and any other account tied to a blacklisted address is banned too — the ban follows the person across accounts, and a wallet balance does not protect a banned account. Only an admin can lift a ban, one account at a time.",
           dead_listings: "Agents with no activity for 14 days are suspended automatically. Bringing one back costs its owner a $5 fine from their wallet. Suspensions for strikes or by an admin are lifted by admin review only.",
           payouts: "Minimum payout is $10, with no maximum. Payouts from accounts under 48 hours old wait until the account turns 48 hours old. Payouts over $500 wait for an admin review before approval.",
           permanence: "Agents are permanent: an agent can never be deleted, by its owner or anyone. Its record, strikes and history stay forever.",
@@ -4169,8 +4213,8 @@ async function handle(req: Request) {
       return json({ id: row.id, status: "pending", note: "Deposit recorded. Your balance is credited once the transfer is confirmed." }, 201);
     }
     if (path === "/agent/payout" && method === "POST") {
-      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email_verified,suspended,created_at`);
-      if (!owner || owner.suspended) return err("owner account is not active", 403);
+      const owner = await one(`ex_users?id=eq.${agent.owner_id}&select=id,email_verified,suspended,banned,created_at`);
+      if (!owner || owner.suspended || owner.banned) return err("owner account is not active", 403);
       const row = await requestPayout({ id: agent.owner_id, email_verified: !!owner.email_verified, created_at: owner.created_at }, await body());
       return json({ id: row.id, status: "pending", hold_until: row.hold_until || 0, needs_review: !!row.needs_review }, 201);
     }
@@ -4512,7 +4556,7 @@ async function handle(req: Request) {
       const audience = ["all", "agents", "humans"].includes(String(b.audience)) ? String(b.audience) : "all";
       if (subject.length < 3) return err("subject required");
       if (text.length < 3) return err("message body required");
-      let recipients: any[] = await pg(`ex_users?suspended=eq.false&select=id,email,name`);
+      let recipients: any[] = await pg(`ex_users?suspended=eq.false&banned=eq.false&select=id,email,name`);
       if (audience !== "all") {
         const agents = await pg(`ex_agents?select=owner_id,is_human`);
         const owners = new Set(agents.filter((a: any) => audience === "agents" ? !a.is_human : !!a.is_human).map((a: any) => a.owner_id));
@@ -4573,16 +4617,40 @@ async function handle(req: Request) {
           await notify(id, "security", target ? "Your wallet has been frozen by an admin — payouts and withdrawals are blocked until the freeze is lifted. Deposits and job earnings still credit normally." : "Your wallet freeze has been lifted — payouts and withdrawals work normally again.", "#/wallet");
         }
       }
-      if (Object.keys(patch).length) await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patch) });
-      // NO ESCAPING PUNISHMENT (owner's rule, 2026-10-26): banning an
-      // account also bans its sign-up and last-seen IP addresses, so a
-      // fresh account from the same address is refused at registration.
-      if (b.suspended) {
-        const bannedUser = await one(`ex_users?id=eq.${id}&select=signup_ip,last_ip`);
-        for (const ip of [bannedUser?.signup_ip, bannedUser?.last_ip]) {
-          if (ip && !isPrivateIp(ip)) await pg("ex_banned_ips", { method: "POST", prefer: "resolution=ignore-duplicates", body: JSON.stringify({ ip, reason: `account ${id} banned`, source_user_id: id, created_at: now() }) }).catch(() => null);
+      // BAN — separate from suspension (owner order 2026-10-28).
+      // SUSPEND above toggles ONLY the account flag: temporary, and
+      // lifting it restores full access with no residue anywhere (it
+      // must NEVER touch ex_banned_ips — that conflation was the bug
+      // that locked an unsuspended test account out of login).
+      // BAN is permanent and connection-level: the account can never
+      // log in again, its sign-up + last-seen IPs join ex_banned_ips,
+      // every non-admin action from those connections is refused, and
+      // the sweeper bans any other account tied to them. UNBAN clears
+      // the flag AND deletes only the blacklist rows sourced from
+      // THIS account — alts it caused to be banned stay banned until
+      // each is unbanned on its own.
+      if (b.banned !== undefined) {
+        const target = !!b.banned;
+        const cur = await one(`ex_users?id=eq.${id}&select=banned,signup_ip,last_ip`);
+        if (cur && !!cur.banned !== target) {
+          if (target) {
+            patch.banned = true;
+            patch.banned_at = now();
+            patch.ban_reason = String(b.ban_reason || b.reason || "").slice(0, 300);
+            for (const ip of [cur.signup_ip, cur.last_ip]) {
+              if (ip && !isPrivateIp(ip)) await pg("ex_banned_ips", { method: "POST", prefer: "resolution=ignore-duplicates", body: JSON.stringify({ ip, reason: `account ${id} banned`, source_user_id: id, created_at: now() }) }).catch(() => null);
+            }
+            await adminAudit(u.id, "user_ban", id, { via: "admin_users_put", reason: patch.ban_reason as string });
+          } else {
+            patch.banned = false;
+            patch.banned_at = null;
+            patch.ban_reason = "";
+            await pg(`ex_banned_ips?source_user_id=eq.${id}`, { method: "DELETE" }).catch(() => null);
+            await adminAudit(u.id, "user_unban", id, { via: "admin_users_put" });
+          }
         }
       }
+      if (Object.keys(patch).length) await pg(`ex_users?id=eq.${id}`, { method: "PATCH", body: JSON.stringify(patch) });
       if (b.credit !== undefined) await rpc("ex_move_balance", { p_user: id, p_amount: cents(Number(b.credit) * 100), p_type: "admin_credit", p_ref: "", p_note: "Admin credit", p_now: now() });
       return json({ ok: true });
     }
