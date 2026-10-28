@@ -11,9 +11,11 @@
 //     the dashboard by paying a $5 fine. Activity = any agent-API call
 //     (last_active_at is stamped by the API), bids, contracts or chat.
 //  3. BAN-EVASION ALT SCAN: a non-admin account whose sign-up or last IP
-//     matches a banned account's address is suspended, its own addresses
-//     join the ban list, and the admins are notified. Admin accounts are
-//     never auto-suspended (a shared address must not lock out the owner).
+//     matches a BANNED account's address is BANNED itself, its own
+//     addresses join the ban list, and the admins are notified. The set
+//     is built from banned users + ex_banned_ips only — suspensions are
+//     temporary/account-only and never feed it. Admin accounts are
+//     never auto-banned (a shared address must not lock out the owner).
 //  4. Housekeeping: prune ex_rate_counters windows older than a day.
 //  5. FAIRNESS AUTO-RELEASE (owner order 2026-10-27, the locked
 //     design): delivery starts a 48-HOUR review clock (review_deadline
@@ -242,8 +244,15 @@ async function deadListings() {
 }
 
 async function altScan() {
+  // BAN propagation (owner order 2026-10-28): the blacklist is built
+  // from BANNED users + ex_banned_ips rows ONLY — never from suspended
+  // users (a suspension is temporary and account-only; it must leave
+  // no residue). A non-admin account tied to a blacklisted IP is
+  // BANNED itself (not merely suspended) and its own IPs join the
+  // blacklist, so the ban follows the person across accounts. Admin
+  // accounts are exempt, always.
   const t = nowSec();
-  const bannedUsers = await get("ex_users?suspended=eq.true&select=id,signup_ip,last_ip");
+  const bannedUsers = await get("ex_users?banned=eq.true&select=id,signup_ip,last_ip");
   const bannedRows = await get("ex_banned_ips?select=ip").catch(() => []);
   const bannedIps = new Set((bannedRows || []).map((r) => r.ip));
   for (const u of bannedUsers || []) {
@@ -253,17 +262,17 @@ async function altScan() {
   bannedIps.delete("");
   if (!bannedIps.size) return;
   const admins = await get("ex_users?role=eq.admin&select=id");
-  const users = await get("ex_users?suspended=eq.false&role=neq.admin&select=id,name,signup_ip,last_ip&limit=500");
+  const users = await get("ex_users?banned=eq.false&role=neq.admin&select=id,name,signup_ip,last_ip&limit=500");
   for (const u of users || []) {
    try {
     const hit = [u.signup_ip, u.last_ip].find((ip) => ip && bannedIps.has(ip));
     if (!hit) continue;
-    await patch(`ex_users?id=eq.${u.id}`, { suspended: true });
+    await patch(`ex_users?id=eq.${u.id}`, { banned: true, banned_at: t, ban_reason: `alt account of a banned user (matched ${hit})` });
     for (const ip of [u.signup_ip, u.last_ip]) {
       if (ip) await post("ex_banned_ips", { ip, reason: `alt account of a banned user (matched ${hit})`, source_user_id: u.id, created_at: t }, "resolution=ignore-duplicates").catch(() => {});
     }
-    for (const a of admins || []) await notify(a.id, "security", `Account ${u.id} (${u.name || ""}) was auto-suspended: it shares an IP address with a banned account`, "#/admin");
-    console.log(`alt-scan: user ${u.id} auto-suspended (shared banned IP ${hit})`);
+    for (const a of admins || []) await notify(a.id, "security", `Account ${u.id} (${u.name || ""}) was auto-banned: it shares an IP address with a banned account`, "#/admin");
+    console.log(`alt-scan: user ${u.id} auto-banned (shared banned IP ${hit})`);
    } catch (e) {
     // One bad account must not stop the scan of the remaining accounts.
     console.error(`altScan: user ${u.id} failed:`, e.message);
